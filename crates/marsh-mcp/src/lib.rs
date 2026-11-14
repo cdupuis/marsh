@@ -595,20 +595,45 @@ impl ExecutableIdentity {
         path: &Path,
         require_trusted_parents: bool,
     ) -> Result<Self, String> {
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|error| format!("cannot inspect executable identity: {error}"))?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            return Err(format!(
+        Self::capture_observed(path, require_trusted_parents, &mut || {})
+    }
+
+    /// Opens the executable once, without following a symlink, and takes the
+    /// metadata, the checks and the hash from that descriptor, so they describe
+    /// one file. `between_open_and_hash` runs where a swap of the path could land.
+    fn capture_observed(
+        path: &Path,
+        require_trusted_parents: bool,
+        between_open_and_hash: &mut dyn FnMut(),
+    ) -> Result<Self, String> {
+        let not_regular = || {
+            format!(
                 "configured executable is no longer a regular file: {}",
                 path.display()
-            ));
+            )
+        };
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+            .open(path)
+            .map_err(|error| {
+                if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+                    not_regular()
+                } else {
+                    format!("cannot open executable for verification: {error}")
+                }
+            })?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot inspect executable identity: {error}"))?;
+        if !metadata.file_type().is_file() {
+            return Err(not_regular());
         }
         validate_executable_metadata(path, &metadata, "configured executable")?;
         if require_trusted_parents {
             validate_trusted_parent_chain(path)?;
         }
-        let mut file = fs::File::open(path)
-            .map_err(|error| format!("cannot open executable for verification: {error}"))?;
+        between_open_and_hash();
         let mut digest = Sha256::new();
         let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
         loop {
@@ -619,6 +644,35 @@ impl ExecutableIdentity {
                 break;
             }
             digest.update(&buffer[..count]);
+        }
+        let after = file
+            .metadata()
+            .map_err(|error| format!("cannot recheck executable identity: {error}"))?;
+        let named = fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot recheck executable path: {error}"))?;
+        let same = |left: &fs::Metadata, right: &fs::Metadata| {
+            (left.dev(), left.ino()) == (right.dev(), right.ino())
+        };
+        if !same(&metadata, &named)
+            || !same(&metadata, &after)
+            || (
+                metadata.size(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            ) != (
+                after.size(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+            )
+        {
+            return Err(format!(
+                "executable was replaced or modified while it was verified: {}",
+                path.display()
+            ));
         }
         Ok(Self {
             device: metadata.dev(),
@@ -4632,6 +4686,35 @@ mod tests {
         }
         for pinned in ["MARSH_HOME", "MARSH_SBX", "USER", "LOGNAME", "PATH"] {
             assert!(names.iter().any(|name| name == pinned), "{pinned} missing");
+        }
+    }
+
+    /// The identity pins one file: the bytes hashed and the inode, mode and
+    /// times recorded come from the same object, whatever replaces the path
+    /// while it is being verified.
+    #[test]
+    fn an_executable_identity_never_mixes_two_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tool");
+        let other = root.path().join("other");
+        executable(&path, "#!/bin/sh\necho original\n");
+        executable(&other, "#!/bin/sh\necho replacement, longer\n");
+        let digest = |file: &Path| -> [u8; 32] { Sha256::digest(fs::read(file).unwrap()).into() };
+        let (original_hash, replacement_hash) = (digest(&path), digest(&other));
+        let original_inode = fs::metadata(&path).unwrap().ino();
+        let replacement_inode = fs::metadata(&other).unwrap().ino();
+
+        let result = ExecutableIdentity::capture_observed(&path, false, &mut || {
+            fs::rename(&other, &path).unwrap();
+        });
+
+        if let Ok(identity) = result {
+            let consistent = (identity.inode == original_inode && identity.sha256 == original_hash)
+                || (identity.inode == replacement_inode && identity.sha256 == replacement_hash);
+            assert!(
+                consistent,
+                "inode and hash name different files: {identity:?}"
+            );
         }
     }
 

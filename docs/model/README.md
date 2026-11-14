@@ -420,8 +420,18 @@ Capturing a parent waits for its child returns, which hold workspace leases.
 `CallerEdit` races with per-path `Apply`. Deltas intentionally overwrite changed
 paths without a content comparison. Only changed paths participate, and import
 is neither a merge nor an atomic multi-file transaction. The model permits
-partial apply before restart and independent sibling returns. It does not
-assert that overlapping caller edits survive. Absence is the abstract value -1.
+partial apply before restart and independent sibling returns. Absence is the
+abstract value -1.
+
+Writers the daemon runs into one destination take the root's import lock (a
+detached write-back, an attached return, `cloud sync`, `apply`), and a detached
+write-back holds it from its base check until its return is applied
+(`LockedBy`/`LockFree`). `NoStaleApply` is judged on the destination's state at
+each detached write: the entry is the base one or already the run's own result.
+The user's editor takes no lock. The model keeps `CallerEdit` out of the window
+of a detached write-back (that window is only narrowed in the code, never
+closed, so docs/cloud.md does not promise more), and the control `editInWindow`
+shows what is left when it is let in.
 
 | Invariant | Negative control | What must be caught |
 |---|---|---|
@@ -437,6 +447,8 @@ assert that overlapping caller edits survive. Absence is the abstract value -1.
 | `SharedBudget` | `noCap` | Provision beyond the shared local/cloud pool |
 | `ParentCaptureSettled` | `pendingReturn` | Capture a parent view while any descendant return is pending, including before child capture |
 | `NoStaleApply` | `noBaseCheck` | Apply a detached return over a path changed here since the run started |
+| `NoStaleApply` | `checkOutsideLock` | Check, then wait for the lock: another writer lands in between and is overwritten |
+| `NoStaleApply` | `editInWindow` | The user's edit between the check and the write (the residual the daemon cannot lock out) |
 | `DetachedSurvives` | `restartDetached` | Make a detached run uncertain at restart while its sandbox still exists |
 | `DetachedBudget` | `noDetachCap` | Detach beyond the separate detached cap |
 
@@ -498,7 +510,7 @@ Assumptions/gaps, not checked platform guarantees:
 | `Complete` (return + verified cleanup) | `Settlement::finish` after capture, retire, and apply (`ReturnBeforeComplete`); the client's exit follows that frame |
 | `Detach` | `cloud/detach.rs` `start_detached`: durable record and base manifest, `CloudSbx::mark_detached` (detached cap), the at-most-once `run --detached`, `CloudSbx::detach`, `DaemonStore::detach_cloud_job` (`Detached` receipt, out of the pool) |
 | `Collect` / `Capture` | `cloud/detach.rs` `collect_job` (`state`, `tail`, `fetch`; the supervisor in `cloud_helper/detached.rs` writes the status and the delta before `done`), retire before write-back (`retire_settled`) |
-| `BaseCheck` / `Apply` / `SettleKept` | `cloud/detach.rs` `write_back` (`conflicts` against `JOB.base`; `apply_delta` only when none; otherwise `kept-as-patch`) |
+| `BaseCheck` / `Apply` / `SettleKept` | `cloud/detach.rs` `write_back` and `import_checked` (under the root's `import_lock`: `conflicts` against `JOB.base`; `apply_delta` only when none; otherwise `kept-as-patch`) |
 | `Vanish` / `DetachedLost` | `collect_job`: absent from a complete inventory, then `lost` |
 
 Before changing the Rust lifecycle, extend the existing six modules and their

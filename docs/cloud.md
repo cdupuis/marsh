@@ -327,6 +327,10 @@ marsh cloud collect 42      # check on it now
   written back: `marsh cloud diff 42` shows the patch, `marsh cloud apply 42`
   applies it anyway, and `marsh cloud discard 42` drops it. A split fork that
   is gone, or a project directory that was replaced, also keeps the patch.
+  The check and the write happen together, one write-back into a project at a
+  time, so another marsh write-back, `marsh cloud sync` or `apply` cannot slip
+  in between. A save from your own editor in the moment between the check of a
+  file and its write is not excluded, only made very short.
 - **The time limit pauses, it doesn't kill.** A detached run's `--ttl`
   defaults to 2 hours of running without your laptop. When it runs out, the
   sandbox is suspended with the run inside it; the next check resumes it

@@ -212,11 +212,16 @@ impl Record {
             }
             _ => io_error(error),
         })?;
-        let record: Self = serde_json::from_slice(&bytes).map_err(io_error)?;
+        let mut record: Self = serde_json::from_slice(&bytes).map_err(io_error)?;
         if record.version != RECORD_VERSION || record.job_id != job {
             return Err(DaemonError::InvalidState(format!(
                 "cloud: the detached record of {job} is not readable by this marsh"
             )));
+        }
+        // A list stored for a run with no coordinator (by an older build that
+        // kept the workload's own report) is never acted on.
+        if record.delegate.is_none() {
+            record.child_sandboxes.clear();
         }
         Ok(record)
     }
@@ -260,6 +265,15 @@ impl Record {
         self.truncated |= dropped;
         *self.offset_mut(stream) = start.saturating_add(data.len() as u64);
         Ok(())
+    }
+
+    /// The agent sandboxes the run reports owning, kept for deletion only
+    /// when a coordinator (root, with a delegate) wrote the report: in a Kit
+    /// run the workload writes that list itself.
+    fn note_reported_sandboxes(&mut self, reported: &[ChildSandbox]) {
+        if self.delegate.is_some() {
+            self.child_sandboxes = reported.to_vec();
+        }
     }
 
     pub(super) fn save(&self, paths: &Paths) -> Result<(), DaemonError> {
@@ -981,7 +995,7 @@ impl StockDaemonBackend {
             );
         }
         Self::tail_output(&adapter, &id, ctl, &paths, &mut record, &remote);
-        record.child_sandboxes.clone_from(&remote.sandboxes);
+        record.note_reported_sandboxes(&remote.sandboxes);
         record.save(&paths)?;
         if !remote.children.is_empty() {
             store.set_cloud_children(
@@ -2026,7 +2040,8 @@ fn delete_children(adapter: &CloudSbx, children: &[ChildSandbox]) -> Result<(), 
     let mut failures = Vec::new();
     for child in children {
         // A create that never reported its ID is found by name (the record
-        // is the coordinator's own, root-only), or it never happened.
+        // is a root coordinator's own: lists of runs without one are never
+        // kept, see `collect_job`), or it never happened.
         let id = match child.id.clone().map(CloudSandboxId::parse) {
             Some(Ok(id)) => id,
             Some(Err(_)) => {
@@ -2553,6 +2568,58 @@ mod tests {
         );
         assert!(!paths.payload(old).exists());
         assert!(paths.payload(unreadable).exists() && paths.payload(bare).exists());
+    }
+
+    /// An older build stored the workload's own sandbox list for a Kit run;
+    /// loading that record drops it, so no deletion path can use it.
+    #[test]
+    fn a_stored_sandbox_list_of_a_run_without_a_coordinator_is_dropped_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        fs::create_dir_all(&paths.detached).unwrap();
+        fs::create_dir_all(&paths.results).unwrap();
+        let job = "0000aaaa-0000-0000-0000-000000000001";
+        let mut record = stored(&paths, job, "running", false, 0);
+        record.child_sandboxes = vec![ChildSandbox {
+            name: "marsh-s-aaaaaaaa".into(),
+            id: None,
+            image: "docker.io/library/alpine@sha256:".to_owned() + &"a".repeat(64),
+            agent: None,
+        }];
+        record.save(&paths).unwrap();
+        assert_eq!(Record::load(&paths, job).unwrap().child_sandboxes, []);
+        assert_eq!(Record::all(&paths)[0].child_sandboxes, []);
+        record.delegate = Some("someone".into());
+        record.save(&paths).unwrap();
+        assert_eq!(Record::load(&paths, job).unwrap().child_sandboxes.len(), 1);
+    }
+
+    /// C-05: only a run with a coordinator is believed about its agent
+    /// sandboxes; a Kit run's list is the workload's own.
+    #[test]
+    fn a_runs_sandbox_list_is_kept_only_when_a_coordinator_wrote_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        fs::create_dir_all(&paths.detached).unwrap();
+        fs::create_dir_all(&paths.results).unwrap();
+        let mut record = stored(
+            &paths,
+            "0000aaaa-0000-0000-0000-000000000001",
+            "running",
+            false,
+            0,
+        );
+        let listed = [ChildSandbox {
+            name: "marsh-s-aaaaaaaa".into(),
+            id: None,
+            image: "docker.io/library/alpine@sha256:".to_owned() + &"a".repeat(64),
+            agent: None,
+        }];
+        record.note_reported_sandboxes(&listed);
+        assert_eq!(record.child_sandboxes, []);
+        record.delegate = Some("someone".into());
+        record.note_reported_sandboxes(&listed);
+        assert_eq!(record.child_sandboxes.len(), 1);
     }
 
     #[test]

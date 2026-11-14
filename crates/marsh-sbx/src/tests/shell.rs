@@ -736,3 +736,35 @@ fn an_owned_shell_vm_without_its_own_marker_still_fails_closed() {
     assert_eq!(model.vm(SHELL).unwrap().id, id);
     assert_eq!(model.count("rm"), 0);
 }
+
+/// Review of B-03/B9: `reset_shell_vm` passes a day-long deadline, and its
+/// wait for the VM's fence must still end at the fence cap.
+#[test]
+fn a_shell_reset_with_a_distant_deadline_stops_waiting_for_the_fence() {
+    let model = StockModel::new();
+    let adapter = Arc::new(
+        model
+            .adapter()
+            .with_preparation_timeouts(PreparationTimeouts {
+                fence: Duration::from_millis(100),
+                ..PreparationTimeouts::default()
+            }),
+    );
+    let shell = ShellFixture::new();
+    let (fence, _cleanup) =
+        weak_rw_transition_lock(&adapter.grant_vm_transition_locks, shell.spec.name.clone());
+    let _held = fence.read().unwrap();
+    let (send, receive) = mpsc::channel();
+    {
+        let adapter = Arc::clone(&adapter);
+        let spec = shell.spec.clone();
+        thread::spawn(move || {
+            let _ = send.send(adapter.reset_shell_vm(&spec));
+        });
+    }
+    let result = receive.recv_timeout(Duration::from_secs(10));
+    assert!(
+        matches!(result, Ok(Err(SbxError::ShellMountAdmissionBusy))),
+        "{result:?}"
+    );
+}

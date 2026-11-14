@@ -42,6 +42,27 @@ fn state_path() -> PathBuf {
     PathBuf::from(if privileged() { STATE } else { USER_STATE })
 }
 
+/// Just before a workload is spawned: it cannot gain privilege by executing a
+/// setuid or file-capability binary of the image (the Kit user's workload has
+/// had this since it was added; a root helper's workload did not). Inherited
+/// and irreversible, and so also the helper's own from here on, which only
+/// starts the workload and relays. An image whose workload user needs a setuid
+/// helper (`ping`, `su`) does not work for a cloud run.
+fn lock_privileges() -> io::Result<()> {
+    lock_privileges_if(privileged())
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
+fn lock_privileges_if(root: bool) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if root {
+        nix::sys::prctl::set_no_new_privs().map_err(io::Error::from)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = root;
+    Ok(())
+}
+
 /// The helper the workload runs (its shell) and command links name.
 fn helper_path() -> PathBuf {
     if privileged() {
@@ -759,6 +780,7 @@ fn run() -> i32 {
                 .process_group(0);
             None
         };
+        lock_privileges()?;
         let child = command.spawn()?;
         let group = i32::try_from(child.id()).unwrap_or(i32::MAX);
         // The workload runs from here on; a failed record only weakens INT

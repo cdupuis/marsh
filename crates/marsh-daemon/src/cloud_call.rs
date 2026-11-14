@@ -342,6 +342,37 @@ impl marsh_runtime::AttachedProcess for Exited {
     }
 }
 
+/// One attempt's copy of a step's input (it may carry the delegation token),
+/// overwritten when the attempt ends rather than freed as it is.
+struct Scrubbed {
+    bytes: Vec<u8>,
+    at: usize,
+}
+
+impl Scrubbed {
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.to_vec(),
+            at: 0,
+        }
+    }
+}
+
+impl Read for Scrubbed {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let count = buf.len().min(self.bytes.len() - self.at);
+        buf[..count].copy_from_slice(&self.bytes[self.at..self.at + count]);
+        self.at += count;
+        Ok(count)
+    }
+}
+
+impl Drop for Scrubbed {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+    }
+}
+
 /// [`small_step`] for steps that are safe to repeat when the stock CLI
 /// failed before starting them; `input` is replayed whole.
 pub fn retried_step<S: AsRef<str>>(
@@ -354,8 +385,7 @@ pub fn retried_step<S: AsRef<str>>(
 ) -> Result<Step, String> {
     let mut attempt = 0;
     loop {
-        let feed =
-            input.map(|bytes| Box::new(io::Cursor::new(bytes.to_vec())) as Box<dyn Read + Send>);
+        let feed = input.map(|bytes| Box::new(Scrubbed::new(bytes)) as Box<dyn Read + Send>);
         let step = small_step(adapter, id, program, args, feed, timeout)?;
         attempt += 1;
         if attempt >= 4 || !failed_before_start(&step) {
@@ -1249,5 +1279,28 @@ pub fn apply_report(stdout: &[u8], ok: bool, diagnostic: &str) -> Result<String,
         None if !ok => Err(diagnostic.to_owned()),
         None if applied.total() == 0 && applied.kept.is_empty() => Ok(String::new()),
         None => Ok(summary(&applied)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_retried_steps_input_is_replayed_whole_from_a_scrubbed_copy() {
+        let mut copy = Scrubbed::new(b"someone\ndckr_pat_x\n");
+        let mut got = Vec::new();
+        let mut chunk = [0_u8; 4];
+        loop {
+            let count = copy.read(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            got.extend_from_slice(&chunk[..count]);
+        }
+        assert_eq!(got, b"someone\ndckr_pat_x\n");
+        // What the drop overwrites with.
+        copy.bytes.fill(0);
+        assert!(copy.bytes.iter().all(|byte| *byte == 0));
     }
 }

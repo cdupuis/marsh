@@ -406,9 +406,20 @@ calls. `marsh jobs show JOB` lists each call (`agent call: codex exec ...
 **What the token can do.** Docker's sandbox access is all or nothing: the
 token can create, use, and delete every cloud sandbox on your account and
 spend its quota. marsh uploads it into each such run's sandbox, into a file
-only root can read; the run's commands run as an unprivileged user without
-`sudo` and can't read it. They can only ask the run's supervisor to start a
-call. If you don't want a token in your sandboxes, leave delegation off.
+only root can read; the supervisor signs in with it and deletes the file
+(overwriting it first) before the workload starts. The run's commands run as
+an unprivileged user and can only ask the run's supervisor to start a call.
+Before it reads the token the supervisor checks that user: not root, no groups
+besides its own, no `sudo` rule, no access to `/var/run/docker.sock` (asked of the kernel as that
+user, so ACLs count), not root's group. These checks ask the image's own `id`, `sudo` and `test`, so
+they guard against a careless image, not a hostile one (an image can fake the
+answers). A check that cannot run or ends abnormally counts as a failure. An image
+where any of those fails refuses the run. The workload also runs with
+`no_new_privs`, so a setuid or file-capability binary in the image cannot raise
+its privileges (and an image whose workload user needs one, such as `su` or
+`ping`, will not work). The token file is deleted when any of this fails, too. The signed-in Docker CLI's session
+stays in a root-only directory of the sandbox for the life of the sandbox. If
+you don't want a token in your sandboxes, leave delegation off.
 
 **marsh's limits on a run's calls**, enforced by the supervisor:
 
@@ -425,7 +436,7 @@ call. If you don't want a token in your sandboxes, leave delegation off.
   links), as in an attached block.
 
 Delegation needs the marsh cloud shell (the default image, or an `--image`
-with `curl`, `tar` and `sudo`): the supervisor installs a pinned Docker
+with `curl`, `tar` and `sudo` that passes the check above): the supervisor installs a pinned Docker
 Sandboxes CLI in the sandbox and signs in with the token.
 
 ## Jobs, Ctrl-C, and cleanup

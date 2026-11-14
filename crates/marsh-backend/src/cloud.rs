@@ -1293,6 +1293,7 @@ impl StockDaemonBackend {
             &attachment,
             &relay,
             calls.clone().map(|calls| calls as Arc<dyn CallHost>),
+            cloud_call::carrier_deadline(options.ttl),
         );
         // Children first: cancel and settle calls still running, so their
         // changes land before this block is captured.
@@ -1626,6 +1627,7 @@ fn run_attached(
     attachment: &ServerAttachment,
     relay: &Relay,
     calls: Option<Arc<dyn CallHost>>,
+    deadline: Instant,
 ) -> cloud_call::Carried {
     fn take<T>(slot: &Mutex<Option<T>>) -> Option<T> {
         slot.lock()
@@ -1640,6 +1642,7 @@ fn run_attached(
         queue,
         resize,
         calls,
+        Some(deadline),
     )
 }
 

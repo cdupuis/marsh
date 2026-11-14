@@ -269,19 +269,36 @@ pub fn failed_before_start(step: &Step) -> bool {
 /// marker), so a repeat can never run the command twice.
 pub fn spawn_run(adapter: &CloudSbx, id: &CloudSandboxId, ctl: Ctl) -> Result<Attachment, String> {
     let (program, words) = ctl.step(&["--internal-cloud", "run"]);
+    spawn_run_with(
+        || {
+            adapter
+                .spawn(id, &program, &os_args(&words))
+                .map_err(|error| actionable(&error))
+        },
+        ACK_TIMEOUT,
+    )
+}
+
+/// [`spawn_run`] with the stock exec started by `spawn`, and every wait on it
+/// (the acknowledgement, the end of an exec that closed its output, the
+/// diagnostics it left) bounded by `bound`.
+fn spawn_run_with(
+    mut spawn: impl FnMut() -> Result<Attachment, String>,
+    bound: Duration,
+) -> Result<Attachment, String> {
     let mut attempt = 0;
     loop {
         attempt += 1;
         let Attachment {
             stdin,
             mut stdout,
-            mut stderr,
+            stderr,
             mut process,
             control,
-        } = adapter
-            .spawn(id, &program, &os_args(&words))
-            .map_err(|error| actionable(&error))?;
-        match run_frame::read(&mut stdout) {
+        } = spawn()?;
+        let (read, returned) = read_ack(stdout, &mut *process, bound);
+        stdout = returned;
+        match read {
             Ok(Some((run_frame::ACK, payload))) if payload == 0_u64.to_be_bytes() => {
                 return Ok(Attachment {
                     stdin,
@@ -292,9 +309,7 @@ pub fn spawn_run(adapter: &CloudSbx, id: &CloudSandboxId, ctl: Ctl) -> Result<At
                 });
             }
             Ok(None) => {
-                let mut diagnostic = Vec::new();
-                let _ = read_bounded(&mut stderr, &mut diagnostic, 64 * 1024);
-                let code = process.wait().ok();
+                let (code, diagnostic) = end_unacked_exec(stderr, &mut *process, bound);
                 let step = Step {
                     code,
                     stdout: Vec::new(),
@@ -325,6 +340,71 @@ pub fn spawn_run(adapter: &CloudSbx, id: &CloudSandboxId, ctl: Ctl) -> Result<At
         }
     }
 }
+
+type AckRead = io::Result<Option<(u8, Vec<u8>)>>;
+
+/// The first frame of the carrier, within `timeout`: past it the stock exec is
+/// ended (the read then fails) and the caller confirms from the sandbox.
+fn read_ack(
+    mut stdout: Box<dyn Read + Send>,
+    process: &mut dyn marsh_runtime::AttachedProcess,
+    timeout: Duration,
+) -> (AckRead, Box<dyn Read + Send>) {
+    let (send, receive) = mpsc::channel();
+    thread::spawn(move || {
+        let read = run_frame::read(&mut stdout);
+        let _ = send.send((read, stdout));
+    });
+    if let Ok(done) = receive.recv_timeout(timeout) {
+        return done;
+    }
+    let _ = process.terminate();
+    receive
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|_| {
+            (
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no acknowledgement",
+                )),
+                Box::new(io::empty()),
+            )
+        })
+}
+
+/// The carrier closed its output without the start signal: let the stock
+/// exec finish, but never past `grace` (it may be alive with its pipes closed;
+/// an exec that outlives the grace is ended), then read what it said.
+fn end_unacked_exec(
+    mut stderr: Box<dyn Read + Send>,
+    process: &mut dyn marsh_runtime::AttachedProcess,
+    bound: Duration,
+) -> (Option<i32>, Vec<u8>) {
+    let code = wait_until(process, Some(Instant::now() + bound));
+    // The diagnostics are read on their own thread: a descriptor the exec
+    // handed on can keep the pipe open long after the exec itself is gone.
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let (done, finished) = mpsc::channel();
+    {
+        let kept = Arc::clone(&kept);
+        thread::spawn(move || {
+            let _ = read_bounded(&mut stderr, SharedBuffer(kept), 64 * 1024);
+            let _ = done.send(());
+        });
+    }
+    if finished.recv_timeout(bound).is_err() {
+        let _ = process.cancel_io();
+    }
+    let diagnostic = std::mem::take(
+        &mut *kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    (code, diagnostic)
+}
+
+/// How long an exec that was told to end may take to be reaped.
+const REAP_GRACE: Duration = Duration::from_secs(10);
 
 /// A stock exec that already ended, handed on with its exit code.
 pub struct Exited(Option<i32>);
@@ -629,14 +709,29 @@ pub trait CallHost: Send + Sync + 'static {
 /// helper's framed output back to the caller, acknowledging each delivered
 /// output frame (the stock channel drops output a slow reader leaves behind).
 /// Agent calls from the workload go to `calls`.
-#[allow(clippy::too_many_lines)] // Cooperating stream threads and one join.
-#[allow(clippy::needless_pass_by_value)] // Cloned into each stream thread.
 pub fn run_carrier(
     carrier: Attachment,
     caller: Arc<dyn Caller>,
     queue: Option<mpsc::Receiver<Option<Vec<u8>>>>,
     resize: Option<mpsc::Receiver<(u16, u16)>>,
     calls: Option<Arc<dyn CallHost>>,
+    deadline: Option<Instant>,
+) -> Carried {
+    run_carrier_within(carrier, caller, queue, resize, calls, deadline, REAP_GRACE)
+}
+
+/// [`run_carrier`], with the teardown after the exec ends (the stream
+/// threads' joins) bounded by `teardown`.
+#[allow(clippy::too_many_lines)] // Cooperating stream threads and one join.
+#[allow(clippy::needless_pass_by_value)] // Cloned into each stream thread.
+fn run_carrier_within(
+    carrier: Attachment,
+    caller: Arc<dyn Caller>,
+    queue: Option<mpsc::Receiver<Option<Vec<u8>>>>,
+    resize: Option<mpsc::Receiver<(u16, u16)>>,
+    calls: Option<Arc<dyn CallHost>>,
+    deadline: Option<Instant>,
+    teardown: Duration,
 ) -> Carried {
     let Attachment {
         stdin,
@@ -793,18 +888,113 @@ pub fn run_carrier(
             }
         })
     };
-    let code = process.wait().ok();
-    let output_complete = frames.join().unwrap_or(false);
-    let _ = delivery.join();
-    let _ = diagnostics.join();
+    let code = wait_until(&mut *process, deadline);
+    // A stream thread can be held by a descriptor the exec handed on, so each
+    // join is bounded; past it the attachment is told to cancel its I/O and
+    // what has not finished is left behind (the output is then incomplete).
+    let mut until = Instant::now() + teardown;
+    let mut left_behind = false;
+    let mut cancel = |finished: bool, until: &mut Instant| {
+        if !finished && !left_behind {
+            left_behind = true;
+            let _ = process.cancel_io();
+            *until = Instant::now() + Duration::from_millis(500);
+        }
+    };
+    let frames_done = join_within(frames, until);
+    cancel(frames_done.is_some(), &mut until);
+    cancel(join_within(delivery, until).is_some(), &mut until);
+    cancel(join_within(diagnostics, until).is_some(), &mut until);
+    let output_complete = frames_done.unwrap_or(false);
     window.close();
-    // Release the carrier's stdin so nothing keeps the exec session open.
-    if let Ok(mut input) = input.lock() {
-        *input = Box::new(io::sink());
+    // Release the carrier's stdin so nothing keeps the exec session open. A
+    // writer that is stuck holds this lock, so its I/O is cancelled first and
+    // the lock is waited for only as long as the teardown bound.
+    let _ = process.cancel_io();
+    let lock_until = Instant::now() + teardown;
+    loop {
+        match input.try_lock() {
+            Ok(mut input) => {
+                *input = Box::new(io::sink());
+                break;
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                *poisoned.into_inner() = Box::new(io::sink());
+                break;
+            }
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < lock_until => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => break,
+        }
     }
     Carried {
         code,
         output_complete,
+    }
+}
+
+/// How long past a sandbox's own time limit the carrier is waited for.
+pub const CARRIER_GRACE: Duration = Duration::from_mins(2);
+/// How long the helper's acknowledgement of a run may take.
+pub const ACK_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// The deadline of a carrier whose sandbox lives `ttl` from now.
+#[must_use]
+pub fn carrier_deadline(ttl: Duration) -> Instant {
+    Instant::now() + ttl + CARRIER_GRACE
+}
+
+/// Join a thread, but not past `until`:
+/// `None` when it had not finished (its thread is left to end by itself).
+fn join_within<T>(handle: thread::JoinHandle<T>, until: Instant) -> Option<T> {
+    while !handle.is_finished() {
+        if Instant::now() >= until {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    handle.join().ok()
+}
+
+/// Wait for the stock exec; at `deadline` end it (the sandbox's own limit has
+/// passed and the CLI never noticed, e.g. a half-open connection). The caller
+/// then confirms the run's end from the sandbox, which handles an end it
+/// cannot confirm.
+fn wait_until(
+    process: &mut dyn marsh_runtime::AttachedProcess,
+    deadline: Option<Instant>,
+) -> Option<i32> {
+    wait_until_with(process, deadline, REAP_GRACE)
+}
+
+fn wait_until_with(
+    process: &mut dyn marsh_runtime::AttachedProcess,
+    deadline: Option<Instant>,
+    reap: Duration,
+) -> Option<i32> {
+    let Some(deadline) = deadline else {
+        return process.wait().ok();
+    };
+    loop {
+        match process.try_wait() {
+            Ok(Some(code)) => return Some(code),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if Instant::now() >= deadline {
+            let _ = process.terminate();
+            // Not an unbounded wait: a process that will not die is left.
+            let reaped = Instant::now() + reap;
+            while Instant::now() < reaped {
+                if let Ok(Some(code)) = process.try_wait() {
+                    return Some(code);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -1134,7 +1324,14 @@ pub fn run_child(
         Ok(carrier) => carrier,
         Err(message) => return setup_failed(message),
     };
-    let delivered = run_carrier(carrier, Arc::clone(&caller), Some(input), None, None);
+    let delivered = run_carrier(
+        carrier,
+        Arc::clone(&caller),
+        Some(input),
+        None,
+        None,
+        Some(carrier_deadline(call.ttl)),
+    );
     let Some(exit_code) = confirm_status(adapter, &id, child) else {
         note(
             &*caller,
@@ -1285,6 +1482,328 @@ pub fn apply_report(stdout: &[u8], ok: bool, diagnostic: &str) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stock exec that never exits until it is terminated, whose output
+    /// pipe stays open (a half-open connection).
+    struct Hung {
+        ended: Arc<std::sync::atomic::AtomicBool>,
+        writer: Option<io::PipeWriter>,
+        /// Set by `cancel_io` (the stub supports it, as the real exec does).
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl marsh_runtime::AttachedProcess for Hung {
+        fn wait(&mut self) -> io::Result<i32> {
+            loop {
+                if let Some(code) = self.try_wait()? {
+                    return Ok(code);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fn try_wait(&mut self) -> io::Result<Option<i32>> {
+            Ok(self
+                .ended
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then_some(137))
+        }
+        fn terminate(&mut self) -> io::Result<()> {
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.writer.take();
+            Ok(())
+        }
+        fn supports_io_cancellation(&self) -> bool {
+            true
+        }
+        fn cancel_io(&self) -> io::Result<()> {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct Quiet;
+
+    impl Caller for Quiet {
+        fn deliver(&self, _tag: u8, _bytes: Vec<u8>) {}
+        fn forwarded(&self, _len: u64) {}
+        fn input_closed(&self) {}
+        fn diagnostic(&self, _bytes: Vec<u8>) {}
+    }
+
+    fn hung() -> (Attachment, Arc<std::sync::atomic::AtomicBool>) {
+        let (reader, writer) = io::pipe().unwrap();
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Attachment {
+                stdin: Box::new(io::sink()),
+                stdout: Box::new(reader),
+                stderr: Box::new(io::empty()),
+                process: Box::new(Hung {
+                    ended: Arc::clone(&ended),
+                    writer: Some(writer),
+                    cancelled: Arc::default(),
+                }),
+                control: marsh_runtime::no_attachment_control(),
+            },
+            ended,
+        )
+    }
+
+    /// C-04: a carrier that never ends is ended at its deadline, and the
+    /// run's end is then left to the caller's status confirmation.
+    #[test]
+    fn a_carrier_that_outlives_its_deadline_is_ended() {
+        let (exec, ended) = hung();
+        let started = Instant::now();
+        let carried = run_carrier(
+            exec,
+            Arc::new(Quiet),
+            None,
+            None,
+            None,
+            Some(Instant::now() + Duration::from_millis(100)),
+        );
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(carried.code, Some(137));
+        assert!(!carried.output_complete);
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    /// An exec whose output closed at once (EOF before the start signal) but
+    /// which stays alive, and whose stderr pipe a retained descriptor holds
+    /// open: `spawn_run`'s path returns within its bound, ends the exec, and
+    /// does not wait for the pipe. (Reverting `spawn_run_with`'s EOF arm to an
+    /// unbounded wait or drain makes this hang.)
+    #[test]
+    fn eof_before_the_acknowledgement_does_not_wait_for_a_live_exec_or_its_pipes() {
+        let (held_stderr, _writer_kept_open) = io::pipe().unwrap();
+        let (exec, ended) = hung();
+        let Attachment { process, .. } = exec;
+        let mut parts = Some((process, held_stderr));
+        let started = Instant::now();
+        let attachment = spawn_run_with(
+            || {
+                let (process, stderr) = parts.take().unwrap();
+                Ok(Attachment {
+                    stdin: Box::new(io::sink()),
+                    stdout: Box::new(io::empty()),
+                    stderr: Box::new(stderr),
+                    process,
+                    control: marsh_runtime::no_attachment_control(),
+                })
+            },
+            Duration::from_millis(150),
+        )
+        .unwrap();
+        assert!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            "the exec was not ended"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        // The caller gets the exit the exec ended with and no output.
+        let mut process = attachment.process;
+        assert_eq!(process.wait().unwrap(), 137);
+    }
+
+    /// The pieces: the diagnostics of an exec that is gone are read for at most
+    /// the bound even when their pipe stays open.
+    #[test]
+    fn the_diagnostics_of_an_ended_exec_are_read_for_at_most_the_bound() {
+        let (mut stderr_reader, mut stderr_writer) = io::pipe().unwrap();
+        io::Write::write_all(&mut stderr_writer, b"boom").unwrap();
+        let (exec, _) = hung();
+        let Attachment { mut process, .. } = exec;
+        let started = Instant::now();
+        let (code, diagnostic) = end_unacked_exec(
+            Box::new(std::mem::replace(&mut stderr_reader, io::pipe().unwrap().0)),
+            &mut *process,
+            Duration::from_millis(150),
+        );
+        assert_eq!(code, Some(137));
+        assert_eq!(diagnostic, b"boom");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        drop(stderr_writer);
+    }
+
+    /// Teardown after the deadline is bounded too: the exec is gone but a
+    /// descriptor it handed on keeps the carrier's output open, so the stream
+    /// threads cannot finish; `run_carrier` still returns, output incomplete.
+    #[test]
+    fn a_retained_output_pipe_does_not_hold_the_carrier_past_its_teardown_bound() {
+        // Both output pipes stay open (a descriptor the exec handed on), and
+        // stderr has something to read: the diagnostics thread is held too.
+        let (reader, _stdout_kept_open) = io::pipe().unwrap();
+        let (stderr_reader, mut stderr_writer) = io::pipe().unwrap();
+        io::Write::write_all(&mut stderr_writer, b"diagnostic").unwrap();
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exec = Attachment {
+            stdin: Box::new(io::sink()),
+            stdout: Box::new(reader),
+            stderr: Box::new(stderr_reader),
+            process: Box::new(Hung {
+                ended: Arc::clone(&ended),
+                writer: None,
+                cancelled: Arc::clone(&cancelled),
+            }),
+            control: marsh_runtime::no_attachment_control(),
+        };
+        let started = Instant::now();
+        let carried = run_carrier_within(
+            exec,
+            Arc::new(Quiet),
+            None,
+            None,
+            None,
+            Some(Instant::now() + Duration::from_millis(50)),
+            Duration::from_millis(100),
+        );
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+        // Past the join bound the attachment's I/O was cancelled.
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(carried.code, Some(137));
+        assert!(!carried.output_complete);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(stderr_writer);
+    }
+
+    /// A stdin writer stuck inside a write holds the carrier's input lock; the
+    /// teardown does not wait for it past its bound (it would otherwise block
+    /// on the lock for as long as the write stalls).
+    #[test]
+    fn a_stuck_stdin_writer_does_not_hold_the_carrier_teardown() {
+        struct Stuck;
+        impl io::Write for Stuck {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                thread::sleep(Duration::from_secs(6));
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exec = Attachment {
+            stdin: Box::new(Stuck),
+            stdout: Box::new(io::empty()),
+            stderr: Box::new(io::empty()),
+            process: Box::new(Hung {
+                ended: Arc::clone(&ended),
+                writer: None,
+                cancelled: Arc::default(),
+            }),
+            control: marsh_runtime::no_attachment_control(),
+        };
+        let (queue, input) = mpsc::channel();
+        queue.send(Some(b"typed".to_vec())).unwrap();
+        // Let the stdin thread take the lock and stall inside the write.
+        let stalled = Instant::now();
+        let carried = thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                run_carrier_within(
+                    exec,
+                    Arc::new(Quiet),
+                    Some(input),
+                    None,
+                    None,
+                    Some(Instant::now() + Duration::from_millis(300)),
+                    Duration::from_millis(100),
+                )
+            });
+            run.join().unwrap()
+        });
+        assert_eq!(carried.code, Some(137));
+        assert!(
+            stalled.elapsed() < Duration::from_secs(4),
+            "teardown waited for the stuck writer: {:?}",
+            stalled.elapsed()
+        );
+        drop(queue);
+    }
+
+    /// An exec that ignores `terminate` is not waited for forever.
+    #[test]
+    fn an_exec_that_ignores_terminate_is_left_after_the_reap_bound() {
+        struct Stubborn;
+        impl marsh_runtime::AttachedProcess for Stubborn {
+            fn wait(&mut self) -> io::Result<i32> {
+                loop {
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+            fn try_wait(&mut self) -> io::Result<Option<i32>> {
+                Ok(None)
+            }
+            fn terminate(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let started = Instant::now();
+        let code = wait_until_with(
+            &mut Stubborn,
+            Some(Instant::now() + Duration::from_millis(50)),
+            Duration::from_millis(100),
+        );
+        assert_eq!(code, None);
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    /// The acknowledgement bound at its call site: an exec whose output stays
+    /// open and silent is ended and returned by `spawn_run_with` within the
+    /// bound (replacing its `read_ack` by a plain read hangs this).
+    #[test]
+    fn a_silent_exec_is_ended_by_the_spawn_path_within_its_bound() {
+        let (exec, ended) = hung();
+        let mut parts = Some(exec);
+        let started = Instant::now();
+        let attachment =
+            spawn_run_with(|| Ok(parts.take().unwrap()), Duration::from_millis(150)).unwrap();
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(started.elapsed() < Duration::from_secs(20));
+        drop(attachment);
+    }
+
+    /// The deadlines at their call sites: an agent call's carrier and a
+    /// block's carrier are both run with `carrier_deadline` (a deadline of
+    /// `None` is an unbounded wait; this reads the source, since both sites
+    /// need a real sandbox to run).
+    #[test]
+    fn the_carrier_callers_pass_a_deadline() {
+        // Only the production part of each file: this test's own text must not
+        // be what it finds.
+        let production = |source: &'static str| -> &'static str {
+            &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()]
+        };
+        let child = production(include_str!("cloud_call.rs"));
+        assert!(child.contains("Some(carrier_deadline(call.ttl))"));
+        // The backend file is another crate's: nothing here can match itself.
+        let backend = include_str!("../../marsh-backend/src/cloud.rs");
+        assert!(backend.contains("cloud_call::carrier_deadline(options.ttl)"));
+        assert!(backend.contains("Some(deadline),"));
+    }
+
+    /// C-04: a helper that never acknowledges the run is given up on.
+    #[test]
+    fn a_missing_acknowledgement_ends_the_exec_instead_of_hanging() {
+        let (carrier, ended) = hung();
+        let Attachment {
+            stdout,
+            mut process,
+            ..
+        } = carrier;
+        let (read, _) = read_ack(stdout, &mut *process, Duration::from_millis(100));
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!matches!(read, Ok(Some(_))));
+    }
 
     #[test]
     fn a_retried_steps_input_is_replayed_whole_from_a_scrubbed_copy() {

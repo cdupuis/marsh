@@ -653,6 +653,82 @@ fn retained_terminal_follows_all_output_and_joined_carrier() {
     drop(client);
     serving.join().unwrap().unwrap();
 }
+/// Panics on its first capture (a defect inside an attempt), then grants.
+struct PanicsOnce(AtomicBool);
+impl GrantVerifier for PanicsOnce {
+    fn capture(&self, _: &JobSpec) -> io::Result<Box<dyn GrantSnapshot>> {
+        assert!(
+            self.0.swap(true, Ordering::SeqCst),
+            "injected attempt defect"
+        );
+        Ok(Box::new(Granted))
+    }
+}
+
+/// E-07: a panic in an attempt's thread loses neither the attempt's slot nor
+/// the worker: the daemon gets a terminal that quarantines, and the next
+/// attempt runs in the single slot.
+#[test]
+fn a_panicking_attempt_reports_a_terminal_and_frees_its_slot() {
+    let fixture = Fixture::new(42, false);
+    let worker = Arc::new(Worker::with_grant_verifier(
+        fixture.runtime.clone(),
+        Arc::new(ThreadSupervisor {
+            termination_grace: GRACE,
+        }),
+        Arc::new(PanicsOnce(AtomicBool::new(false))),
+    ));
+    let (mut client, peer) = UnixStream::pair().unwrap();
+    client.set_read_timeout(Some(CONDITION_DEADLINE)).unwrap();
+    let transport = WorkerTransport::from_socket(peer).unwrap();
+    let serving = thread::spawn(move || serve_retained(&worker, 1, 1, transport));
+    assert!(matches!(
+        read_frame::<WorkerResponse>(&mut client).unwrap(),
+        WorkerResponse::Ready { .. }
+    ));
+    let start = |client: &mut UnixStream, attempt: &str| {
+        write_frame(
+            client,
+            &WorkerRequest::Start {
+                attempt: attempt.into(),
+                generation: 1,
+                spec: super::tests::job(),
+            },
+        )
+        .unwrap();
+    };
+    let terminal = |client: &mut UnixStream| loop {
+        match read_frame::<WorkerResponse>(client).unwrap() {
+            WorkerResponse::Terminal { attempt, report } => break (attempt, report),
+            WorkerResponse::Rejected { attempt, message } => {
+                panic!("{attempt} was rejected: {message}")
+            }
+            _ => {}
+        }
+    };
+
+    start(&mut client, "defective");
+    let (attempt, report) = terminal(&mut client);
+    assert_eq!(attempt, "defective");
+    assert_eq!(report.execution, ExecutionOutcome::SupervisionFailed);
+    assert_eq!(report.cleanup, CleanupOutcome::Uncertain);
+    assert!(report.quarantine);
+
+    start(&mut client, "next");
+    write_frame(
+        &mut client,
+        &WorkerRequest::CloseInput {
+            attempt: "next".into(),
+        },
+    )
+    .unwrap();
+    let (attempt, report) = terminal(&mut client);
+    assert_eq!(attempt, "next");
+    assert_eq!(report.execution, ExecutionOutcome::Exited { code: 42 });
+    drop(client);
+    serving.join().unwrap().unwrap();
+}
+
 #[test]
 fn start_failure_preserves_local_cleanup_uncertainty_after_verified_deletion() {
     for uncertain in [false, true] {

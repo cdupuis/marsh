@@ -612,9 +612,15 @@ impl ExecutableIdentity {
                 path.display()
             )
         };
+        // NONBLOCK: opening a FIFO for reading must not wait for a writer; the
+        // descriptor is checked to be a regular file before anything is read.
         let mut file = fs::OpenOptions::new()
             .read(true)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK)
+                    .bits()
+                    .cast_signed(),
+            )
             .open(path)
             .map_err(|error| {
                 if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
@@ -4708,14 +4714,61 @@ mod tests {
             fs::rename(&other, &path).unwrap();
         });
 
-        if let Ok(identity) = result {
-            let consistent = (identity.inode == original_inode && identity.sha256 == original_hash)
-                || (identity.inode == replacement_inode && identity.sha256 == replacement_hash);
-            assert!(
-                consistent,
-                "inode and hash name different files: {identity:?}"
-            );
+        // The path no longer names the file that was hashed: fail closed, never
+        // a half-and-half identity.
+        let error = result.expect_err("a replaced path must fail the check");
+        assert!(error.contains("replaced or modified"), "{error}");
+        assert_ne!(original_inode, replacement_inode);
+        assert_ne!(original_hash, replacement_hash);
+    }
+
+    #[test]
+    fn an_executable_changed_in_place_while_verified_fails_the_check() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tool");
+        executable(&path, "#!/bin/sh\necho original\n");
+        let error = ExecutableIdentity::capture_observed(&path, false, &mut || {
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(b"# appended\n").unwrap();
+        })
+        .expect_err("a file that changes while hashed must fail the check");
+        assert!(error.contains("replaced or modified"), "{error}");
+
+        // Untouched, the identity is the file's own.
+        let identity = ExecutableIdentity::capture_observed(&path, false, &mut || {}).unwrap();
+        assert_eq!(identity.inode, fs::metadata(&path).unwrap().ino());
+        assert_eq!(
+            identity.sha256,
+            <[u8; 32]>::from(Sha256::digest(fs::read(&path).unwrap()))
+        );
+    }
+
+    /// A pinned executable replaced by a FIFO is refused at once; opening it
+    /// for reading must not wait for a writer.
+    #[test]
+    fn a_fifo_in_place_of_a_pinned_executable_is_refused_not_waited_on() {
+        let (_root, config) = fixture();
+        fs::remove_file(&config.marsh).unwrap();
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&config.marsh)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (done, finished) = std::sync::mpsc::channel();
+        let checking = config.clone();
+        let worker = std::thread::spawn(move || {
+            let _ = done.send(checking.validate_host_executables());
+        });
+        let result = finished.recv_timeout(Duration::from_secs(10));
+        if result.is_err() {
+            // Release a blocked open so the thread ends, then fail.
+            let _ = fs::OpenOptions::new().write(true).open(&config.marsh);
         }
+        worker.join().unwrap();
+        let error = result
+            .expect("validation waited for a writer on a FIFO")
+            .expect_err("a FIFO is not the pinned executable");
+        assert!(error.contains("regular file"), "{error}");
     }
 
     #[tokio::test]

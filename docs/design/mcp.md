@@ -138,7 +138,7 @@ permissions are not treated as marsh-managed trust state.
 Each check opens the executable once (no symlink followed) and takes the
 metadata, the permission checks and the hash from that one descriptor; a path
 that stops naming the file that was hashed, or a file that changes while it is
-hashed, fails the check. The check is not an exec guard: the host child is
+hashed, fails the check; it opens without waiting, so a FIFO put in the executable's place is refused rather than waited on. The check is not an exec guard: the host child is
 started by path after the check, and macOS has no `fexecve` (marsh also finds
 its sibling `marshd` through its own path). Someone who can write the
 executable's directory chain (the same user, root, or the admin group that owns

@@ -9,8 +9,10 @@
 //! - Names are looked up by `(purpose, key)`; a missing entry gets a fresh
 //!   random name persisted as an *intent* (no UUID) before `sbx create`.
 //! - After create the observed UUID is recorded. An intent whose name later
-//!   appears in inventory is adopted; an intent loaded at startup whose name
-//!   is absent from the first inventory is dropped.
+//!   appears in inventory is adopted. An intent whose name is absent is never
+//!   dropped: an `sbx create` outlives the daemon that submitted it (its CLI
+//!   child, or the request inside sandboxd), so no timer proves it will not
+//!   land. A later use of the same `(purpose, key)` reuses the name.
 //! - A VM is usable only if its name exists with the recorded UUID. A name
 //!   present with a different UUID, or not in the map, is foreign: refuse.
 //! - Stop/remove only ever target a recorded UUID that is currently present.
@@ -152,8 +154,6 @@ struct LegacyOwnershipFile {
 #[derive(Default)]
 struct State {
     entries: BTreeMap<String, Entry>,
-    /// Intents loaded from disk that no in-process caller has claimed yet.
-    unclaimed_intents: BTreeSet<String>,
     /// Purpose/key of names removed in this process. A caller still holding
     /// such a name (e.g. the daemon's fixed shell spec) that recreates it
     /// keeps its lookup identity instead of becoming unkeyed.
@@ -278,17 +278,11 @@ impl VmOwnership {
             Err(error) => return Err(error.into()),
         };
         let migrated = retire_dev_vms(&mut entries, grants);
-        let unclaimed_intents = entries
-            .iter()
-            .filter(|(_, entry)| entry.uuid.is_none())
-            .map(|(name, _)| name.clone())
-            .collect();
         let ownership = Self {
             path: Some(path),
             mirror: None,
             state: Mutex::new(State {
                 entries,
-                unclaimed_intents,
                 retired: BTreeMap::new(),
             }),
             view: Mutex::new(None),
@@ -353,7 +347,6 @@ impl VmOwnership {
             .find(|(_, entry)| entry.purpose == purpose.label() && entry.key == key)
             .map(|(name, _)| name.clone())
         {
-            state.unclaimed_intents.remove(&name);
             return Ok(name);
         }
         let name = loop {
@@ -496,7 +489,6 @@ impl VmOwnership {
 
     pub(crate) fn record(&self, name: &str, uuid: &str) -> Result<(), SbxError> {
         let mut state = self.lock();
-        state.unclaimed_intents.remove(name);
         let retired = state.retired.remove(name);
         let entry = state.entries.entry(name.to_owned()).or_insert_with(|| {
             retired.unwrap_or_else(|| Entry {
@@ -512,9 +504,18 @@ impl VmOwnership {
         self.persist(&state)
     }
 
+    /// Drop the record of a VM that is gone. An intent that was never adopted
+    /// (no UUID) is not a removal: its create may still land, and the intent
+    /// is the only authority to clean that VM up, so it stays.
     pub(crate) fn forget(&self, name: &str) -> Result<(), SbxError> {
         let mut state = self.lock();
-        state.unclaimed_intents.remove(name);
+        if state
+            .entries
+            .get(name)
+            .is_some_and(|entry| entry.uuid.is_none())
+        {
+            return Ok(());
+        }
         if let Some(mut entry) = state.entries.remove(name) {
             self.persist(&state)?;
             entry.uuid = None;
@@ -580,7 +581,7 @@ impl VmOwnership {
     }
 
     /// Store a fresh view and reconcile intents against it: adopt any intent
-    /// whose random name is present; drop startup intents whose name is absent.
+    /// whose random name is present. An absent intent is kept (see the rules).
     pub(crate) fn store_view(
         &self,
         inventory: StockInventory,
@@ -588,13 +589,6 @@ impl VmOwnership {
         {
             let mut state = self.lock();
             let mut changed = false;
-            let unclaimed = std::mem::take(&mut state.unclaimed_intents);
-            for name in unclaimed {
-                if inventory.get(&name).is_none() {
-                    state.entries.remove(&name);
-                    changed = true;
-                }
-            }
             for (name, entry) in &mut state.entries {
                 if entry.uuid.is_none()
                     && let Some(vm) = inventory.get(name)

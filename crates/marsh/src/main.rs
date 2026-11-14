@@ -15,6 +15,7 @@ use marsh::{
     registered_commands::{RegisteredCommandExecutor, invocation_from_environment},
     session::{EphemeralHomeGuard, SessionConfig},
 };
+use marsh_contracts::terminal::display_safe_text;
 use marsh_mcp::{StdinBinding, ToolBindings, ToolDeclaration, WorkspaceIdentity};
 use nix::{
     sys::signal::{Signal, killpg},
@@ -1624,7 +1625,7 @@ fn print_detached_notices(client: &marsh_daemon::Client) {
         client.cloud_detached(marsh_daemon::cloud_detached::CloudDetachedRequest::Notices)
     {
         for notice in reply.notices {
-            eprintln!("{notice}");
+            eprintln!("{}", display_safe_text(&notice));
         }
     }
 }
@@ -1658,9 +1659,11 @@ fn detached_command(action: &str, arguments: &[OsString]) -> i32 {
         };
         eprintln!(
             "marsh: {}",
-            message
-                .strip_prefix("cloud: ")
-                .map_or(message.clone(), |rest| format!("cloud: {rest}"))
+            display_safe_text(
+                &message
+                    .strip_prefix("cloud: ")
+                    .map_or(message.clone(), |rest| format!("cloud: {rest}"))
+            )
         );
         1
     };
@@ -1669,6 +1672,10 @@ fn detached_command(action: &str, arguments: &[OsString]) -> i32 {
         "diff" => {
             let mut offset = 0;
             let mut stdout = std::io::stdout().lock();
+            // A patch piped to `git apply` stays exact; on a terminal, the
+            // run's own bytes cannot act on it.
+            let mut filter = std::io::IsTerminal::is_terminal(&stdout)
+                .then(marsh_contracts::terminal::DisplayFilter::default);
             loop {
                 let reply = match client.cloud_detached(Request::Diff {
                     job: job.clone(),
@@ -1677,11 +1684,18 @@ fn detached_command(action: &str, arguments: &[OsString]) -> i32 {
                     Ok(reply) => reply,
                     Err(error) => return fail(error),
                 };
-                if stdout.write_all(&reply.bytes).is_err() {
+                let written = match &mut filter {
+                    Some(filter) => stdout.write_all(filter.push(&reply.bytes).as_bytes()),
+                    None => stdout.write_all(&reply.bytes),
+                };
+                if written.is_err() {
                     return 141;
                 }
                 offset += reply.bytes.len() as u64;
                 if reply.bytes.is_empty() || offset >= reply.total {
+                    if let Some(filter) = &mut filter {
+                        let _ = stdout.write_all(filter.finish().as_bytes());
+                    }
                     let _ = stdout.flush();
                     return 0;
                 }
@@ -1694,7 +1708,7 @@ fn detached_command(action: &str, arguments: &[OsString]) -> i32 {
     };
     match client.cloud_detached(request) {
         Ok(reply) => {
-            println!("{}", reply.message);
+            println!("{}", display_safe_text(&reply.message));
             0
         }
         Err(error) => fail(error),
@@ -1740,7 +1754,7 @@ fn sync_command(arguments: &[OsString]) -> i32 {
                 | marsh_daemon::DaemonError::Refused(message) => message,
                 other => other.to_string(),
             };
-            let message = message.strip_prefix("cloud: ").unwrap_or(&message);
+            let message = display_safe_text(message.strip_prefix("cloud: ").unwrap_or(&message));
             if json {
                 println!("{}", serde_json::json!({"synced": [], "error": message}));
             }
@@ -1752,10 +1766,10 @@ fn sync_command(arguments: &[OsString]) -> i32 {
         println!("{}", serde_json::json!({"synced": reply.synced}));
     }
     if !reply.message.is_empty() {
-        eprintln!("marsh: cloud: {}", reply.message);
+        eprintln!("marsh: cloud: {}", display_safe_text(&reply.message));
     }
     for report in &reply.synced {
-        eprintln!("marsh: cloud: {}", report.message);
+        eprintln!("marsh: cloud: {}", display_safe_text(&report.message));
     }
     i32::from(reply.synced.iter().any(|report| report.error.is_some()))
 }

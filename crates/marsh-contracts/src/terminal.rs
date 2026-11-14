@@ -70,6 +70,72 @@ fn plain_value(value: &str) -> bool {
         })
 }
 
+/// Whether `character` could act on a terminal or hide text in a line:
+/// C0 and C1 controls (ESC, CSI, OSC, BEL, CR, DEL...), the Unicode line and
+/// paragraph separators, and the bidirectional overrides and isolates.
+#[must_use]
+pub fn is_terminal_unsafe(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// `text` for one line on the user's terminal: every character
+/// [`is_terminal_unsafe`] becomes `?`. The one filter for every string a
+/// workload, a Kit or a remote run chose that the Mac prints (receipt and job
+/// fields, daemon error text).
+#[must_use]
+pub fn display_safe(text: &str) -> String {
+    text.chars()
+        .map(|c| if is_terminal_unsafe(c) { '?' } else { c })
+        .collect()
+}
+
+/// Like [`display_safe`] for text of several lines: newlines and tabs stay.
+#[must_use]
+pub fn display_safe_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if is_terminal_unsafe(c) && !matches!(c, '\n' | '\t') {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// [`display_safe_text`] for bytes that arrive in chunks, such as a patch a
+/// cloud run produced and the Mac shows on a terminal. A character that a
+/// chunk boundary splits is held back for the next call.
+#[derive(Debug, Default)]
+pub struct DisplayFilter {
+    held: Vec<u8>,
+}
+
+impl DisplayFilter {
+    /// The safe text for the bytes so far, without a split character's tail.
+    pub fn push(&mut self, chunk: &[u8]) -> String {
+        self.held.extend_from_slice(chunk);
+        let end = match std::str::from_utf8(&self.held) {
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            _ => self.held.len(),
+        };
+        let text = display_safe_text(&String::from_utf8_lossy(&self.held[..end]));
+        self.held.drain(..end);
+        text
+    }
+
+    /// What is left at the end of the stream.
+    pub fn finish(&mut self) -> String {
+        let text = display_safe_text(&String::from_utf8_lossy(&self.held));
+        self.held.clear();
+        text
+    }
+}
+
 /// The longest link a job may hand to the Mac.
 pub const MAX_URL_BYTES: usize = 4096;
 
@@ -122,6 +188,31 @@ pub fn hyperlink(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_filter_holds_a_split_character_and_hides_controls() {
+        let bytes = "é\u{1b}[2Jü\u{9b}x".as_bytes();
+        for split in 0..=bytes.len() {
+            let mut filter = DisplayFilter::default();
+            let mut shown = filter.push(&bytes[..split]);
+            shown += &filter.push(&bytes[split..]);
+            shown += &filter.finish();
+            assert_eq!(shown, "é?[2Jü?x", "split at {split}");
+        }
+        assert_eq!(DisplayFilter::default().push(&[0xff, b'a']), "\u{fffd}a");
+    }
+
+    #[test]
+    fn display_safe_removes_everything_a_terminal_could_act_on() {
+        let hostile =
+            "a\u{1b}]52;c;AAAA\u{7}b\u{1b}[2Jc\u{9b}31md\rE\u{7f}f\u{202e}g\u{2066}h\u{85}i\nj\tk";
+        let shown = display_safe(hostile);
+        assert!(!shown.chars().any(is_terminal_unsafe), "{shown:?}");
+        assert_eq!(shown, "a?]52;c;AAAA?b?[2Jc?31md?E?f?g?h?i?j?k");
+        assert_eq!(display_safe("plain ünïcode / text"), "plain ünïcode / text");
+        let text = display_safe_text(hostile);
+        assert_eq!(text, "a?]52;c;AAAA?b?[2Jc?31md?E?f?g?h?i\nj\tk");
+    }
 
     #[test]
     fn identity_keeps_only_listed_plain_terminal_variables() {

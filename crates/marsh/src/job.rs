@@ -6,6 +6,7 @@
 use marsh_contracts::process::{
     self as contract, CONTEXT, JOB_JSON, JobDocument, LinkDecision, SOCKET,
 };
+use marsh_contracts::terminal::{display_safe_text, is_terminal_unsafe};
 use marsh_daemon::{DaemonError, ExecuteSpec, PublicReply, PublicRequest, SessionSpec};
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -814,7 +815,7 @@ pub fn render_jobs(
             if tree { " --tree" } else { "" }
         );
     }
-    out
+    display_safe_text(&out)
 }
 
 /// One listing line (`render_jobs`): a job, a split, or a split branch.
@@ -984,7 +985,7 @@ fn printable(command: &str) -> String {
         previous = Some(next.to_owned());
     }
     line.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if is_terminal_unsafe(c) { ' ' } else { c })
         .collect()
 }
 
@@ -1163,7 +1164,7 @@ fn command_line(node: &serde_json::Value) -> String {
 fn quote(argument: &str) -> String {
     let argument = argument
         .chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| if is_terminal_unsafe(c) { '?' } else { c })
         .collect::<String>();
     let plain = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
     if !argument.is_empty() && argument.chars().all(plain) {
@@ -1221,6 +1222,34 @@ mod tests {
     }
 
     const NOW: i64 = 10_000_000_000;
+
+    #[test]
+    fn listing_prints_no_terminal_control_from_any_workload_field() {
+        let evil = "x\u{1b}]52;c;AAAA\u{7}y\u{202e}z";
+        let mut root = serde_json::json!({
+            "job_id": evil, "session_id": "s1", "command": evil, "args": [evil],
+            "state": "finished", "cleanup": "verified", "detached": evil,
+            "exit_code": 0, "created_unix_ms": NOW - 5000, "finished_unix_ms": NOW,
+            "children": [],
+        });
+        root["children"] = serde_json::json!([
+            {"node": "split", "split_id": evil, "state": evil, "children": [
+                {"node": "branch", "label": evil, "state": evil, "command": evil}
+            ]},
+            {"node": "fanout", "fanout_id": evil, "state": evil, "children": [
+                {"node": "branch", "label": evil, "state": evil, "command": evil}
+            ]},
+        ]);
+        let document = serde_json::json!({"jobs": [root]});
+        for tree in [true, false] {
+            let out = render_jobs(&document, JobScope::All, tree, NOW);
+            let bad: Vec<char> = out
+                .chars()
+                .filter(|c| marsh_contracts::terminal::is_terminal_unsafe(*c) && *c != '\n')
+                .collect();
+            assert!(bad.is_empty(), "{out:?}");
+        }
+    }
 
     fn node(
         id: &str,

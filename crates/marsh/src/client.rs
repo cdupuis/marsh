@@ -58,7 +58,7 @@ pub struct ClientError(pub String);
 
 impl fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&marsh_contracts::terminal::display_safe_text(&self.0))
     }
 }
 

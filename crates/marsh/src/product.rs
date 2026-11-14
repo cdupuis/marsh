@@ -7,6 +7,7 @@ use crate::{
     registered_commands::{RegisteredCommands, install_registered_commands},
     session::SessionConfig,
 };
+use marsh_contracts::terminal::{display_safe, display_safe_text};
 use serde_json::Value;
 use std::{ffi::OsString, fmt, io::Write, sync::Arc};
 
@@ -132,7 +133,9 @@ pub enum ProductOutcome {
 impl fmt::Display for ProductError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Operation(message) | Self::ShellDelivery(message) => formatter.write_str(message),
+            Self::Operation(message) | Self::ShellDelivery(message) => {
+                formatter.write_str(&display_safe_text(message))
+            }
         }
     }
 }
@@ -466,7 +469,7 @@ pub fn print_cloud_notices(client: &dyn DaemonClient, stderr: &mut impl Write) {
         client.cloud_detached(marsh_daemon::cloud_detached::CloudDetachedRequest::Notices)
     {
         for notice in reply.notices {
-            let _ = writeln!(stderr, "{notice}");
+            let _ = writeln!(stderr, "{}", display_safe_text(&notice));
         }
     }
 }
@@ -717,7 +720,7 @@ pub fn write_lifecycle_report(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> Result<ProductOutcome, ProductError> {
-    stderr.write_all(lifecycle_summary(report, home).as_bytes())?;
+    stderr.write_all(display_safe_text(&lifecycle_summary(report, home)).as_bytes())?;
     if json {
         let value = serde_json::to_value(report).map_err(|error| {
             ProductError::Operation(format!("cannot encode lifecycle report: {error}"))
@@ -908,6 +911,14 @@ fn write_services(
     request: &marsh_daemon::ServicesRequest,
     document: &Value,
 ) -> Result<(), ProductError> {
+    write_safe(stdout, |out| write_services_lines(out, request, document))
+}
+
+fn write_services_lines(
+    stdout: &mut impl Write,
+    request: &marsh_daemon::ServicesRequest,
+    document: &Value,
+) -> Result<(), ProductError> {
     use marsh_daemon::ServicesRequest as Request;
     let text = |value: &Value, key: &str| {
         value
@@ -1007,6 +1018,13 @@ fn write_gc_report(
     writer: &mut impl Write,
     report: &marsh_daemon::VmGcReport,
 ) -> Result<(), ProductError> {
+    write_safe(writer, |out| write_gc_report_lines(out, report))
+}
+
+fn write_gc_report_lines(
+    writer: &mut impl Write,
+    report: &marsh_daemon::VmGcReport,
+) -> Result<(), ProductError> {
     let order = ["removed", "would_remove", "failed", "kept", "not_ours"];
     let mut entries = report.entries.iter().collect::<Vec<_>>();
     entries.sort_by_key(|entry| order.iter().position(|action| *action == entry.action));
@@ -1070,6 +1088,19 @@ fn ensure_session(
     Ok(())
 }
 
+/// Renders into memory, then writes it with every character the terminal
+/// could act on replaced: for views that print names and reasons that a
+/// workload, a Kit or a worker supplied.
+fn write_safe(
+    writer: &mut impl Write,
+    render: impl FnOnce(&mut Vec<u8>) -> Result<(), ProductError>,
+) -> Result<(), ProductError> {
+    let mut buffer = Vec::new();
+    render(&mut buffer)?;
+    writer.write_all(display_safe_text(&String::from_utf8_lossy(&buffer)).as_bytes())?;
+    Ok(())
+}
+
 fn write_json(writer: &mut impl Write, value: &serde_json::Value) -> Result<(), ProductError> {
     serde_json::to_writer(&mut *writer, value).map_err(|error| {
         ProductError::Operation(format!("cannot encode daemon response: {error}"))
@@ -1120,6 +1151,13 @@ fn write_update_notes(
 }
 
 fn write_status(writer: &mut impl Write, value: serde_json::Value) -> Result<(), ProductError> {
+    write_safe(writer, |out| write_status_lines(out, value))
+}
+
+fn write_status_lines(
+    writer: &mut impl Write,
+    value: serde_json::Value,
+) -> Result<(), ProductError> {
     let status: marsh_daemon::StatusDocument = serde_json::from_value(value).map_err(|error| {
         ProductError::Operation(format!("cannot decode daemon status: {error}"))
     })?;
@@ -1496,8 +1534,8 @@ fn write_results(writer: &mut impl Write, value: serde_json::Value) -> Result<()
             writer,
             "{:<7} {:<36}  {:<23} {:<10} {:<12} {:<13} {:>8}  {:<6}  {}",
             job.cursor,
-            job.job_id,
-            truncate(&job.command, 23),
+            display_safe(&job.job_id),
+            truncate(&display_safe(&job.command), 23),
             if job.detached.is_some() {
                 "cloud -d"
             } else {
@@ -1505,7 +1543,7 @@ fn write_results(writer: &mut impl Write, value: serde_json::Value) -> Result<()
             },
             job.detached
                 .as_deref()
-                .unwrap_or_else(|| state_name(job.state)),
+                .map_or_else(|| state_name(job.state).to_owned(), display_safe),
             cleanup_name(job.cleanup),
             duration,
             result,
@@ -1525,6 +1563,7 @@ fn write_result(writer: &mut impl Write, value: serde_json::Value) -> Result<(),
             children
                 .iter()
                 .filter_map(serde_json::Value::as_str)
+                .map(display_safe)
                 .collect::<Vec<_>>()
                 .join(" ")
         })
@@ -1533,10 +1572,12 @@ fn write_result(writer: &mut impl Write, value: serde_json::Value) -> Result<(),
         ProductError::Operation(format!("cannot decode daemon result: {error}"))
     })?;
     writeln!(writer, "Result {}", receipt.cursor).map_err(ProductError::from)?;
-    writeln!(writer, "  job:        {}", receipt.job_id).map_err(ProductError::from)?;
-    writeln!(writer, "  command:    {}", receipt.command).map_err(ProductError::from)?;
+    writeln!(writer, "  job:        {}", display_safe(&receipt.job_id))
+        .map_err(ProductError::from)?;
+    writeln!(writer, "  command:    {}", display_safe(&receipt.command))
+        .map_err(ProductError::from)?;
     if let Some(model) = &receipt.model {
-        writeln!(writer, "  model:      {model}").map_err(ProductError::from)?;
+        writeln!(writer, "  model:      {}", display_safe(model)).map_err(ProductError::from)?;
     }
     writeln!(
         writer,
@@ -1549,11 +1590,12 @@ fn write_result(writer: &mut impl Write, value: serde_json::Value) -> Result<(),
         }
     )?;
     if let Some(detached) = &receipt.detached {
-        writeln!(writer, "  detached:   {detached}")?;
+        writeln!(writer, "  detached:   {}", display_safe(detached))?;
     }
     for call in &receipt.cloud_children {
         let words = std::iter::once(call.kit.as_str())
             .chain(call.args.iter().map(String::as_str))
+            .map(display_safe)
             .collect::<Vec<_>>()
             .join(" ");
         writeln!(
@@ -1563,7 +1605,7 @@ fn write_result(writer: &mut impl Write, value: serde_json::Value) -> Result<(),
             if call.summary.is_empty() {
                 String::new()
             } else {
-                format!("; {}", call.summary)
+                format!("; {}", display_safe(&call.summary))
             }
         )?;
     }
@@ -1598,24 +1640,34 @@ fn write_result(writer: &mut impl Write, value: serde_json::Value) -> Result<(),
     )
     .map_err(ProductError::from)?;
     if let Some(worker) = receipt.worker_id {
-        writeln!(writer, "  worker:     {worker}").map_err(ProductError::from)?;
+        writeln!(writer, "  worker:     {}", display_safe(&worker)).map_err(ProductError::from)?;
     }
     if let Some(vm) = receipt.vm_id {
-        writeln!(writer, "  VM:         {vm}")?;
+        writeln!(writer, "  VM:         {}", display_safe(&vm))?;
     }
     if let Some(container) = receipt.container_id {
-        writeln!(writer, "  container:  {container}").map_err(ProductError::from)?;
+        writeln!(writer, "  container:  {}", display_safe(&container))
+            .map_err(ProductError::from)?;
     }
     if let Some(lineage) = &receipt.lineage {
-        writeln!(writer, "  parent:     {}", lineage.parent)?;
+        writeln!(writer, "  parent:     {}", display_safe(&lineage.parent))?;
         if !lineage.root.is_empty() {
-            writeln!(writer, "  root:       {}", lineage.root)?;
+            writeln!(writer, "  root:       {}", display_safe(&lineage.root))?;
         }
         writeln!(writer, "  depth:      {}", lineage.depth)?;
-        writeln!(writer, "  spawn:      {}", lineage.spawn.join(","))?;
+        writeln!(
+            writer,
+            "  spawn:      {}",
+            display_safe(&lineage.spawn.join(","))
+        )?;
         if let Some(split) = &lineage.split {
             let label = lineage.label.as_deref().unwrap_or("");
-            writeln!(writer, "  split:      {split} {label}")?;
+            writeln!(
+                writer,
+                "  split:      {} {}",
+                display_safe(split),
+                display_safe(label)
+            )?;
         }
     }
     if !children.is_empty() {
@@ -1733,6 +1785,73 @@ mod tests {
     use super::*;
     use crate::{cli::LoadSelection, client::ExecuteRequest};
     use serde_json::json;
+
+    #[test]
+    fn a_receipt_prints_no_terminal_control_from_the_workload() {
+        let evil = "x\u{1b}]52;c;AAAA\u{7}\u{1b}[2J\u{202e}y";
+        let receipt = json!({
+            "schema": "marsh.job-receipt.v1", "cursor": 1, "job_id": evil,
+            "attempt_id": "a", "session_id": "s", "command": evil,
+            "state": "finished", "kit_profile": "k", "image": "i", "mounts": [],
+            "worker_id": evil, "vm_id": evil, "container_id": evil,
+            "exit": null, "output_complete": true, "cleanup": "verified",
+            "timing": {"durations_ms": {}, "milestones_unix_ms": {}, "wall_ms": 1, "orchestration_ms": 0},
+            "created_unix_ms": 0, "finished_unix_ms": null,
+            "model": evil, "detached": evil, "children": [evil],
+            "lineage": {"parent": evil, "root": evil, "depth": 1, "spawn": [evil], "split": evil, "label": evil},
+            "cloud_children": [{"kit": evil, "args": [evil, "\u{9b}31m"], "exit": 0, "summary": evil}],
+        });
+        let mut out = Vec::new();
+        write_result(&mut out, receipt).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("agent call: x?]52;c;AAAA??[2J?y"), "{out:?}");
+        let unsafe_found: Vec<char> = out
+            .chars()
+            .filter(|c| marsh_contracts::terminal::is_terminal_unsafe(*c) && *c != '\n')
+            .collect();
+        assert!(unsafe_found.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn the_results_list_prints_no_terminal_control_from_the_workload() {
+        let evil = "x\u{1b}[2Jy";
+        let document = json!({"schema": "marsh.jobs.v1", "jobs": [{
+            "cursor": 1, "job_id": "j", "command": evil, "placement": "cloud",
+            "state": "finished", "cleanup": "verified", "wall_ms": 1,
+            "exit_code": 0, "parent": null, "detached": evil,
+        }]});
+        let mut out = Vec::new();
+        write_results(&mut out, document).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains('\u{1b}'), "{out:?}");
+    }
+
+    #[test]
+    fn errors_from_the_daemon_print_no_terminal_control() {
+        let error = ProductError::from(ClientError("failed: x\u{1b}]0;t\u{7}\nline two".into()));
+        assert_eq!(error.to_string(), "failed: x?]0;t?\nline two");
+        assert_eq!(ClientError("a\u{1b}[2J".into()).to_string(), "a?[2J");
+    }
+
+    #[test]
+    fn views_of_daemon_state_print_no_terminal_control() {
+        let evil = "x\u{1b}[2Jy\u{7}";
+        let report = marsh_daemon::VmGcReport {
+            entries: vec![marsh_daemon::VmGcEntry {
+                vm: evil.into(),
+                purpose: evil.into(),
+                action: "kept".into(),
+                reason: evil.into(),
+                unix_ms: 0,
+            }],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        write_gc_report(&mut out, &report).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("x?[2Jy?"), "{out:?}");
+        assert!(!out.contains('\u{1b}'));
+    }
 
     #[test]
     fn status_lists_the_skills_the_mirror_changed() {

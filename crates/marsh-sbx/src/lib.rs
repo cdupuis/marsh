@@ -3462,6 +3462,9 @@ impl StockSbx {
         environment: &[(&str, &str)],
         extra_flags: &[&str],
     ) -> Result<(), SbxError> {
+        // Never submit a create while the intent that authorizes cleaning up
+        // after it may not be durable (a failed directory sync).
+        self.ownership.confirm_durable()?;
         self.ownership.invalidate();
         // `environment` and `extra_flags` reach this one `sbx create` only.
         let mut invocation =
@@ -5626,6 +5629,9 @@ impl StockSbx {
         before: &AdmittedHostGrant,
     ) -> Result<(), SbxError> {
         self.preflight_host_grants(std::slice::from_ref(before))?;
+        // Never submit a create while the intent that authorizes cleaning up
+        // after it may not be durable (a failed directory sync).
+        self.ownership.confirm_durable()?;
         self.ownership.invalidate();
         let outcome = (|| {
             let mut selected_home_environment = OsString::from("MARSH_SELECTED_HOME=");
@@ -5731,6 +5737,9 @@ impl StockSbx {
         rebuild: bool,
     ) -> Result<CommandOutput, SbxError> {
         self.preflight_host_grants(std::slice::from_ref(before))?;
+        // Never submit a create while the intent that authorizes cleaning up
+        // after it may not be durable (a failed directory sync).
+        self.ownership.confirm_durable()?;
         self.ownership.invalidate();
         let outcome = (|| {
             let mut selected_home_environment = OsString::from("MARSH_SELECTED_HOME=");

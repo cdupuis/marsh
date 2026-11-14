@@ -476,9 +476,11 @@ enum Imported<R> {
     Done(R),
 }
 
-/// The last check and the import, one step under the root's import lock:
-/// nothing is written when the run's lane split was cancelled first or a
-/// touched path changed here.
+/// The base check, the last cancel check and the import, one step under the
+/// root's import lock, so a write-back, attached return, sync or `apply` that
+/// lands first is seen by the check instead of overwritten. Nothing is
+/// written when the run's lane split was cancelled first or a touched path
+/// changed here.
 fn import_checked<R>(
     store: &DaemonStore,
     job: &str,
@@ -488,10 +490,10 @@ fn import_checked<R>(
     result: &[(Vec<u8>, Entry)],
     import: impl FnOnce() -> R,
 ) -> Imported<R> {
-    let changed = conflicts(root, base, result);
     let _held = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let changed = conflicts(root, base, result);
     if !changed.is_empty() {
         return Imported::Conflicts(changed);
     }
@@ -2167,6 +2169,69 @@ mod tests {
             Imported::Cancelled
         ));
         assert_eq!(ran.get(), 2);
+    }
+
+    #[test]
+    fn an_edit_that_lands_while_the_import_waits_for_the_lock_is_kept_not_overwritten() {
+        use marsh_daemon::{NewJob, SessionAuthority, process::ProcessLink};
+        let home = tempfile::tempdir().unwrap();
+        let store = DaemonStore::new(home.path());
+        let session = store.attach_shell(
+            1,
+            SessionAuthority {
+                username: "alice".into(),
+                uid: 501,
+                gid: 20,
+                launch_directory: "/Users/example/project".into(),
+                guest_home: "/Users/example".into(),
+                home_backing: home.path().join("home"),
+                ephemeral_home: false,
+            },
+        );
+        let (job, _, _) = store
+            .begin_cloud_job(
+                NewJob {
+                    label: None,
+                    session_id: session,
+                    command: "cloud".into(),
+                    kit_ref: "cloud-shell".into(),
+                    workload_image: format!("fixture@sha256:{}", "a".repeat(64)),
+                    mounts: Vec::new(),
+                },
+                &ProcessLink::default(),
+                &[],
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f"), b"base").unwrap();
+        let digest = |bytes: &[u8]| Sha256::digest(bytes).to_vec();
+        let base = BTreeMap::from([(b"f".to_vec(), Entry::File(0o644, digest(b"base")))]);
+        let result = vec![(b"f".to_vec(), Entry::File(0o644, digest(b"cloud")))];
+        let root = Dir::open_root(dir.path()).unwrap();
+        let lock = Mutex::new(());
+        let applied = std::sync::atomic::AtomicBool::new(false);
+        // Another write-back into the root holds the lock while this one
+        // starts; it lands `f` (as a sibling job or an attached return would)
+        // and releases the lock.
+        let held = lock.lock().unwrap();
+        let outcome = thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                import_checked(&store, &job, &lock, &root, &base, &result, || {
+                    applied.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+            });
+            // Let the import reach the lock (it checks, or waits, first).
+            thread::sleep(Duration::from_millis(300));
+            fs::write(dir.path().join("f"), b"local").unwrap();
+            drop(held);
+            waiting.join().unwrap()
+        });
+        assert!(
+            matches!(&outcome, Imported::Conflicts(paths) if paths == &["f"]),
+            "the edit that landed first must be kept"
+        );
+        assert!(!applied.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(fs::read(dir.path().join("f")).unwrap(), b"local");
     }
 
     #[test]

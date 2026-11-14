@@ -804,13 +804,13 @@ impl ExportMcp {
         }
 
         // MCP-02: Option injection prevention
-        // Validate that positional or option argument values do not start with '-'
+        // Validate that no positional or option value renders (as argv will carry it,
+        // whatever its JSON type) with a leading '-'
         for binding in &self.config.declaration.bindings.argv {
             match binding {
                 ArgBinding::Positional { field } => {
                     if let Some(val) = args.get(field)
-                        && let Some(s) = val.as_str()
-                        && s.starts_with('-')
+                        && format_arg_value(val).starts_with(b"-")
                     {
                         return Err(format!(
                             "positional argument for field '{field}' cannot start with '-' (option injection prevented)"
@@ -819,8 +819,7 @@ impl ExportMcp {
                 }
                 ArgBinding::NamedOption { option, field } => {
                     if let Some(val) = args.get(field)
-                        && let Some(s) = val.as_str()
-                        && s.starts_with('-')
+                        && format_arg_value(val).starts_with(b"-")
                     {
                         return Err(format!(
                             "value for option '{option}' (field '{field}') cannot start with '-' (option injection prevented)"
@@ -2104,6 +2103,59 @@ mod tests {
             .replace("\"option\": \"--filter\"", "\"option\": \"--bad option\"");
         let err2 = ToolDeclaration::load_from_str(&json2, None).unwrap_err();
         assert!(err2.contains("contains invalid characters"));
+    }
+
+    fn numeric_declaration() -> ExportMcp {
+        let decl = ToolDeclaration::load_from_str(
+            r#"{
+                "schema_version": "marsh.published_tool/v1",
+                "tool_name": "count_tool",
+                "description": "Counts",
+                "command": "test-report",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "count": { "type": "integer" },
+                        "ratio": { "type": "number" }
+                    },
+                    "additionalProperties": false
+                },
+                "bindings": { "argv": [
+                    { "type": "positional", "field": "count" },
+                    { "type": "named_option", "option": "--ratio", "field": "ratio" }
+                ] },
+                "max_output_bytes": 1024,
+                "timeout_ms": 5000
+            }"#,
+            None,
+        )
+        .unwrap();
+        ExportMcp::new(ExportConfig {
+            host_config: fake_host_config(),
+            declaration: decl,
+            declaration_path: None,
+        })
+    }
+
+    #[test]
+    fn negative_numbers_cannot_become_options() {
+        let export_mcp = numeric_declaration();
+        for input in [
+            json!({"count": -1}),
+            json!({"ratio": -0.5}),
+            json!({"ratio": -1e100}),
+            json!({"count": -9_223_372_036_854_775_808_i64}),
+        ] {
+            let err = export_mcp.prepare_arguments(&input).unwrap_err();
+            assert!(
+                err.contains("cannot start with '-' (option injection prevented)"),
+                "{input}: {err}"
+            );
+        }
+        let (argv, _) = export_mcp
+            .prepare_arguments(&json!({"count": 7, "ratio": 0.25}))
+            .unwrap();
+        assert_eq!(argv, [b"7".to_vec(), b"--ratio".to_vec(), b"0.25".to_vec()]);
     }
 
     #[test]

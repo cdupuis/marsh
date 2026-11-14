@@ -164,6 +164,26 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// A Kit cannot take a name the dispatcher or the shell choice handles
+    /// itself: the shell VM puts registered names first on `PATH`.
+    #[test]
+    fn names_the_dispatcher_and_shell_choice_handle_are_not_registrable() {
+        let shells = ["marsh", "msh", "brush", "bash", "zsh", "sh"];
+        for name in SHELL_BUILTINS.into_iter().chain(shells) {
+            assert!(CommandName::parse(name).is_err(), "{name} is registrable");
+        }
+        for name in shells {
+            if let Some(choice) = crate::shell_choice::ShellChoice::parse(name) {
+                assert!(CommandName::parse(choice.name()).is_err());
+            }
+        }
+        // `xdg-open` and `open` stay open to a Kit on purpose (it replaces the
+        // `marsh open` link).
+        for name in marsh_contracts::process::OPEN_LINKS {
+            assert!(CommandName::parse(name).is_ok(), "{name}");
+        }
+    }
+
     #[test]
     fn links_and_live_lookup_share_the_authoritative_command_name_policy() {
         for name in [

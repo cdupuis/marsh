@@ -27,7 +27,7 @@ The loader and live `kit install` use the same declaration rules in
 `crates/marsh-contracts/src/command_registry_rules.json` and embedded by Rust. A registry
 has at most 251 commands, and each registry file is at most 1 MiB. Names are 1–128 ASCII bytes,
 containing letters, digits, `_` or `-`, and cannot start with `-`. Reserved names
-are `marsh`, `msh`, `sh`, `bash`, `fanout`, `collect`, `acp`, `mcp`, `ps`, and `top`. Job
+are `marsh`, `msh`, `brush`, `sh`, `bash`, `zsh`, `fanout`, `collect`, `acp`, `mcp`, `ps`, and `top`. Job
 command links follow these rules exactly (`valid_link`).
 Public MCP tool/publication names are a different semantic type; their dot
 syntax does not make dots valid Kit command names.

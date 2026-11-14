@@ -442,7 +442,7 @@ fn kit_context(body: &KitContext) -> Option<String> {
 }
 
 fn valid_link(name: &str) -> bool {
-    name.len() <= 64 && marsh_contracts::command_registry::CommandName::parse(name).is_ok()
+    marsh_contracts::command_registry::CommandName::parse(name).is_ok()
 }
 
 /// One blocking accept loop for one of the attempt's sockets.
@@ -750,7 +750,8 @@ mod tests {
     fn job_links_follow_the_registry_name_rules() {
         let rules = marsh_contracts::command_registry::rules();
         for name in rules.reserved_names.iter().map(String::as_str).chain([
-            "msh", "sh", "bash", "marsh", "with.dot", "x y", "-x", "claude", "codex", "my_kit-2",
+            "msh", "zsh", "brush", "sh", "bash", "marsh", "with.dot", "x y", "-x", "claude",
+            "codex", "my_kit-2",
         ]) {
             assert_eq!(
                 valid_link(name),
@@ -758,7 +759,10 @@ mod tests {
                 "{name}"
             );
         }
-        assert!(!valid_link(&"k".repeat(65)));
+        // The registry's own length cap, not a second one.
+        let longest = marsh_contracts::command_registry::rules().max_name_bytes;
+        assert!(valid_link(&"k".repeat(longest)));
+        assert!(!valid_link(&"k".repeat(longest + 1)));
     }
 
     #[test]

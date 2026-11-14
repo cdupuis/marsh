@@ -52,6 +52,8 @@ fn invalid_declarations_cannot_be_hidden_by_overlay_or_update() {
         "sh".into(),
         "bash".into(),
         "msh".into(),
+        "zsh".into(),
+        "brush".into(),
         "-option".into(),
         "with space".into(),
         "path/like".into(),

@@ -226,7 +226,8 @@ class HostMcpBlackBoxTests(unittest.TestCase):
 
     def broker_state_dir(self) -> Path:
         scope_root = Path(self.tempdir.name) / "broker-root"
-        key = hashlib.sha256(os.fsencode(scope_root)).hexdigest()[:16]
+        # The endpoint is keyed on the canonical scope root.
+        key = hashlib.sha256(os.fsencode(os.path.realpath(scope_root))).hexdigest()[:16]
         return Path("/tmp") / f"marsh-mcp-{os.geteuid()}-{key}"
 
     def call(self, tool: str, arguments: dict | None = None) -> dict:

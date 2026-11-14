@@ -104,17 +104,37 @@ impl BrokerOptions {
         Ok(marsh_contracts::process::hex(&digest.finalize()))
     }
 
+    /// The broker's socket, in an owner-only directory no other user can
+    /// pre-create: beside the scope root, in the generated scope base
+    /// (`~/Library/Application Support/marsh-mcp-scopes`, which
+    /// `prepare_home` makes 0700). A scope root elsewhere, or a base too
+    /// deep for a socket path, keeps the checked per-user `/tmp` directory.
     fn endpoint(&self) -> PathBuf {
+        let key = self.endpoint_key();
+        let root = self.canonical_scope_root();
+        if let Some(base) = root
+            .parent()
+            .filter(|base| base.file_name() == Some(std::ffi::OsStr::new(crate::MCP_SCOPES_DIR)))
+        {
+            let socket = base.join(format!("b-{}", &key[..12])).join("broker.sock");
+            if socket.as_os_str().len() < MAX_SOCKET_PATH_BYTES {
+                return socket;
+            }
+        }
+        legacy_endpoint(self)
+    }
+
+    fn canonical_scope_root(&self) -> PathBuf {
+        self.scope_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.scope_root.clone())
+    }
+
+    /// Keyed on the canonical scope root, so every spelling of it agrees.
+    fn endpoint_key(&self) -> String {
         let mut digest = Sha256::new();
-        digest.update(self.scope_root.as_os_str().as_encoded_bytes());
-        let key = marsh_contracts::process::hex(&digest.finalize());
-        PathBuf::from("/tmp")
-            .join(format!(
-                "marsh-mcp-{}-{}",
-                rustix::process::geteuid().as_raw(),
-                &key[..16]
-            ))
-            .join("broker.sock")
+        digest.update(self.canonical_scope_root().as_os_str().as_encoded_bytes());
+        marsh_contracts::process::hex(&digest.finalize())
     }
 
     fn token_path(&self) -> PathBuf {
@@ -922,6 +942,20 @@ fn hash_path(path: &Path, digest: &mut Sha256) -> Result<(), String> {
     Ok(())
 }
 
+/// The longest socket path `sockaddr_un` holds on macOS, less the NUL.
+const MAX_SOCKET_PATH_BYTES: usize = 100;
+
+/// The earlier endpoint: a directory under `/tmp` named for the user and scope.
+fn legacy_endpoint(options: &BrokerOptions) -> PathBuf {
+    PathBuf::from("/tmp")
+        .join(format!(
+            "marsh-mcp-{}-{}",
+            rustix::process::geteuid().as_raw(),
+            &options.endpoint_key()[..16]
+        ))
+        .join("broker.sock")
+}
+
 fn prepare_private_root(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path)
         .map_err(|error| format!("cannot create owner-only broker directory: {error}"))?;
@@ -1078,6 +1112,50 @@ mod tests {
             sbx: root.join("missing-sbx"),
             allow_full_sbx_control: false,
         }
+    }
+
+    fn options_for(scope_root: PathBuf, root: &Path) -> BrokerOptions {
+        first_start_options(scope_root, root)
+    }
+
+    #[test]
+    fn the_endpoint_of_a_generated_scope_lives_in_the_private_scope_base() {
+        // Short, like a real home: a socket path is limited to about 100 bytes.
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let base = root
+            .path()
+            .join("Library/Application Support/marsh-mcp-scopes");
+        let scope = base.join("0123456789abcdef");
+        fs::create_dir_all(&scope).unwrap();
+        let endpoint = options_for(scope.clone(), root.path()).endpoint();
+        assert!(
+            endpoint.starts_with(fs::canonicalize(&base).unwrap()) && !endpoint.starts_with("/tmp"),
+            "{}",
+            endpoint.display()
+        );
+        assert!(endpoint.as_os_str().len() < 104, "fits sockaddr_un");
+        // Spellings of one scope root name one endpoint.
+        let slash = PathBuf::from(format!("{}/", scope.display()));
+        let dotted = scope.join("..").join("0123456789abcdef");
+        for spelling in [slash, dotted] {
+            assert_eq!(
+                options_for(spelling, root.path()).endpoint(),
+                endpoint,
+                "one scope, one endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn another_users_directory_under_tmp_cannot_block_a_generated_scope() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let scope = root
+            .path()
+            .join("Library/Application Support/marsh-mcp-scopes/aaaaaaaaaaaaaaaa");
+        fs::create_dir_all(&scope).unwrap();
+        let options = options_for(scope, root.path());
+        let squatted = legacy_endpoint(&options).parent().unwrap().to_path_buf();
+        assert_ne!(options.endpoint().parent().unwrap(), squatted);
     }
 
     #[tokio::test]

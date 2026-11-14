@@ -95,6 +95,15 @@ load the same SBX registration concurrently without starting competing scope
 owners. Legacy `--home` mode has no managed root registry or broker; its
 lifecycle state lasts only for that direct MCP process.
 
+The broker's socket, token, pid and log sit in `b-<key>/` beside a generated
+scope root, in the owner-only `marsh-mcp-scopes` directory, keyed on the
+canonical scope root (every spelling of it names one broker). A scope root
+elsewhere, or a path too long for a socket, uses `/tmp/marsh-mcp-<uid>-<key>`,
+which another local user can still squat (a denial of service, not access).
+A broker started by an earlier build listens under `/tmp`: stop it
+(`marsh mcp stop`) before the first start of this build, or it keeps the scope
+lease.
+
 Before creating or using a scope home, the server binds every managed root to
 the canonical path and filesystem identity of the configured workspace. A
 later process can reuse that root only for that exact workspace identity. This

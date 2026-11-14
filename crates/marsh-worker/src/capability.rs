@@ -442,12 +442,7 @@ fn kit_context(body: &KitContext) -> Option<String> {
 }
 
 fn valid_link(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && !matches!(name, "marsh" | "bash" | "sh" | "." | "..")
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    name.len() <= 64 && marsh_contracts::command_registry::CommandName::parse(name).is_ok()
 }
 
 /// One blocking accept loop for one of the attempt's sockets.
@@ -749,6 +744,22 @@ impl Drop for Capability {
 mod tests {
     use super::*;
     use marsh_contracts::kit_assets::KitAssets;
+
+    /// A job links exactly the names the registry accepts: one policy.
+    #[test]
+    fn job_links_follow_the_registry_name_rules() {
+        let rules = marsh_contracts::command_registry::rules();
+        for name in rules.reserved_names.iter().map(String::as_str).chain([
+            "msh", "sh", "bash", "marsh", "with.dot", "x y", "-x", "claude", "codex", "my_kit-2",
+        ]) {
+            assert_eq!(
+                valid_link(name),
+                marsh_contracts::command_registry::CommandName::parse(name).is_ok(),
+                "{name}"
+            );
+        }
+        assert!(!valid_link(&"k".repeat(65)));
+    }
 
     #[test]
     fn publishes_kit_instructions() {

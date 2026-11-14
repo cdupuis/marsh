@@ -307,8 +307,9 @@ names the file.
 ### Rules for names and sources
 
 - Names are 1 to 128 letters, digits, `_`, or `-`, and do not start with `-`.
-- These names are reserved: `marsh`, `fanout`, `collect`, `acp`, `mcp`, `ps`,
-  `top`.
+- These names are reserved: `marsh`, `msh`, `sh`, `bash`, `fanout`, `collect`,
+  `acp`, `mcp`, `ps`, `top`. (`xdg-open` and `open` are not: a Kit with one of
+  those names replaces the `marsh open` link.)
 - A source directory must be outside your project and guest home, so the
   normal project and home mounts do not expose it to guest code.
 - Running a Kit from source needs Docker Desktop with Buildx on the Mac.

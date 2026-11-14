@@ -127,6 +127,14 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: make lint
         run: make lint
+      # The release guards that refuse the test-support harness compile marsh-sbx
+      # (tests/release/test_provenance_features.py); the tooling job has no Rust
+      # toolchain and skips them, so they run here, where the pinned one is
+      # installed, and may not be skipped.
+      - name: release guard probes (test-support is refused at compile time)
+        env:
+          MARSH_REQUIRE_RUST_PROBES: '1'
+        run: python3 tests/release/test_provenance_features.py -v CompileTimeRefusal
 
   linux-unit:
     name: Linux arm64 (workspace tests)

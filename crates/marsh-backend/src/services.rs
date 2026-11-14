@@ -667,7 +667,14 @@ impl StockDaemonBackend {
                     refused.message()
                 ))
             })?;
-        self.close_relay(root, "the Docker VM is being stopped");
+        if !self.close_relay(root, "the Docker VM is being stopped") {
+            self.services_stop_abort(root, &plan);
+            return Err(DaemonError::Refused(
+                "marsh: docker stop deferred: the engine start for this VM is still inside a \
+                 command; the VM keeps running (try again)"
+                    .into(),
+            ));
+        }
         let stopped = match self
             .sbx
             .stop_services_vm(root, Instant::now() + OPERATION_TIMEOUT)
@@ -807,7 +814,7 @@ impl StockDaemonBackend {
         let _operation = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.close_relay(root, "the Docker VM is being removed");
+        let _ = self.close_relay(root, "the Docker VM is being removed");
         let removed = self
             .sbx
             .remove_services_vm(root, Instant::now() + OPERATION_TIMEOUT)
@@ -1148,11 +1155,15 @@ impl StockDaemonBackend {
             .collect()
     }
 
-    /// Revokes the project's relay and closes every channel on it.
-    fn close_relay(&self, root: &Path, reason: &str) {
-        if let Some(relays) = &self.services.relays {
-            relays.close(root, reason);
-        }
+    /// Revokes the project's relay and closes every channel on it. Returns
+    /// whether the engine worker behind it is gone: `false` means an `sbx`
+    /// call it admitted may still reach the VM and start it again once
+    /// stopped, so a caller about to stop the VM must defer.
+    fn close_relay(&self, root: &Path, reason: &str) -> bool {
+        self.services
+            .relays
+            .as_ref()
+            .is_none_or(|relays| relays.close(root, reason))
     }
 
     /// One tick of the idle timer and lease expiry.
@@ -1293,7 +1304,13 @@ impl StockDaemonBackend {
                 return;
             }
         };
-        self.close_relay(root, "the Docker VM went idle and is being stopped");
+        if !self.close_relay(root, "the Docker VM went idle and is being stopped") {
+            self.services_stop_abort(root, &plan);
+            self.services.with_project(root, |project| {
+                project.idle_deadline = Some(Instant::now() + Duration::from_secs(60));
+            });
+            return;
+        }
         let result = self
             .sbx
             .stop_services_vm(root, Instant::now() + OPERATION_TIMEOUT);
@@ -1370,9 +1387,14 @@ impl StockDaemonBackend {
             }
         }
         if let Some(relays) = &self.services.relays {
-            for (root, _) in &plans {
-                relays.close(root, "the daemon is stopping");
-            }
+            // A VM whose engine worker is still inside an admitted `sbx` call
+            // is not stopped now: that call could start it again afterwards.
+            plans = keep_quiesced(
+                std::mem::take(&mut plans),
+                |root| relays.close(root, "the daemon is stopping"),
+                |root, plan| self.services_stop_abort(root, plan),
+                &mut deferred,
+            );
             if deferred.is_empty() {
                 relays.close_all("the daemon is stopping");
             }
@@ -1463,7 +1485,7 @@ impl StockDaemonBackend {
         }
         let confirmed = confirmed.iter().cloned().collect::<BTreeSet<_>>();
         for root in &confirmed {
-            self.close_relay(Path::new(root), "the Docker VM is being removed");
+            let _ = self.close_relay(Path::new(root), "the Docker VM is being removed");
         }
         let components = self
             .sbx
@@ -1638,9 +1660,184 @@ fn classify(
     (state, reason, Some(view.clone()))
 }
 
+/// The daemon-stop teardown's deferral decision: close each planned VM's
+/// relay; a VM whose engine worker is not gone (`close` is false) has its stop
+/// plan aborted and is recorded in `deferred` instead of being stopped, since
+/// that worker's admitted `sbx` call could start it again afterwards.
+fn keep_quiesced<P>(
+    plans: Vec<(PathBuf, P)>,
+    mut close: impl FnMut(&Path) -> bool,
+    mut abort: impl FnMut(&Path, &P),
+    deferred: &mut BTreeMap<String, String>,
+) -> Vec<(PathBuf, P)> {
+    let mut kept = Vec::new();
+    for (root, plan) in plans {
+        if close(&root) {
+            kept.push((root, plan));
+        } else {
+            abort(&root, &plan);
+            deferred.insert(
+                root.to_string_lossy().into_owned(),
+                "its engine start is still inside a command".into(),
+            );
+        }
+    }
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon-stop teardown defers a VM whose worker is not gone, and only
+    /// that one; the decision is driven here with closures because a stuck
+    /// engine start needs a services harness the repository does not have.
+    #[test]
+    fn the_daemon_stop_defers_exactly_the_vms_whose_worker_is_not_gone() {
+        let plans = vec![
+            (PathBuf::from("/p/quiet"), 1),
+            (PathBuf::from("/p/stuck"), 2),
+        ];
+        let mut aborted = Vec::new();
+        let mut deferred = BTreeMap::new();
+        let kept = keep_quiesced(
+            plans,
+            |root| root != Path::new("/p/stuck"),
+            |root, plan| aborted.push((root.to_owned(), *plan)),
+            &mut deferred,
+        );
+        assert_eq!(kept, [(PathBuf::from("/p/quiet"), 1)]);
+        assert_eq!(aborted, [(PathBuf::from("/p/stuck"), 2)]);
+        assert_eq!(deferred.keys().collect::<Vec<_>>(), ["/p/stuck"]);
+    }
+
+    /// A backend whose project has an owned services VM and an engine worker
+    /// stuck inside an admitted `sbx` call that the relays know about.
+    struct Stuck {
+        _home: tempfile::TempDir,
+        backend: StockDaemonBackend,
+        engine: marsh_sbx::stuck_engine::StuckEngine,
+        root: PathBuf,
+        vm: String,
+    }
+
+    fn stuck() -> Stuck {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap().join("project");
+        fs::create_dir(&root).unwrap();
+        let engine = marsh_sbx::stuck_engine::StuckEngine::start();
+        let mut backend = crate::tests::backend_with_runner(
+            &home.path().canonicalize().unwrap(),
+            BTreeMap::new(),
+            engine.runner(),
+        );
+        let relays = ServicesRelays::new(
+            Arc::clone(&backend.sbx),
+            None,
+            marsh_sbx::services_relay::DaemonBudget::new(8),
+            None,
+        )
+        .with_detach_wait(Duration::from_millis(50));
+        assert!(
+            !engine.stick_in(&relays, &root),
+            "the worker is inside its call"
+        );
+        backend.services.relays = Some(Arc::new(relays));
+        let vm = backend.sbx.own_services_vm_for_test(&root);
+        Stuck {
+            _home: home,
+            backend,
+            engine,
+            root,
+            vm,
+        }
+    }
+
+    /// `close_relay` is the answer to "may this VM be stopped": false while a
+    /// worker is inside a call, true once it is gone (and with no relays).
+    #[test]
+    fn close_relay_says_false_while_a_worker_is_inside_a_call() {
+        let stuck = stuck();
+        assert!(!stuck.backend.close_relay(&stuck.root, "stop"));
+        stuck.engine.release();
+        assert!(stuck.backend.close_relay(&stuck.root, "stop"));
+        let none = crate::tests::backend_for_kit_identity(stuck.root.as_path(), BTreeMap::new());
+        assert!(none.close_relay(&stuck.root, "stop"));
+    }
+
+    /// `marsh docker stop` refuses while the worker is inside a call, and goes
+    /// on to the stop (which fails here, there being no real VM) once it is gone.
+    #[test]
+    fn the_explicit_stop_defers_while_a_worker_is_inside_a_call() {
+        let stuck = stuck();
+        let error = stuck.backend.services_stop(&stuck.root).unwrap_err();
+        assert!(error.to_string().contains("deferred"), "{error}");
+
+        stuck.engine.release();
+        let error = stuck.backend.services_stop(&stuck.root).unwrap_err();
+        assert!(!error.to_string().contains("deferred"), "{error}");
+    }
+
+    /// The idle stop leaves the VM running and re-arms its timer about a
+    /// minute out while the worker is inside a call; once it is gone it stops.
+    #[test]
+    fn the_idle_stop_re_arms_while_a_worker_is_inside_a_call() {
+        let stuck = stuck();
+        let settings = stuck.backend.services_settings().unwrap();
+        let due = |stuck: &Stuck| {
+            stuck.backend.services.with_project(&stuck.root, |project| {
+                project.idle_deadline = Some(Instant::now());
+            });
+        };
+        due(&stuck);
+        stuck.backend.services_idle_stop(&stuck.root, &settings);
+        let (deadline, failure) = stuck.backend.services.with_project(&stuck.root, |project| {
+            (project.idle_deadline, project.failure.clone())
+        });
+        let deadline = deadline.expect("the timer is re-armed");
+        assert!(deadline > Instant::now() + Duration::from_secs(30));
+        assert_eq!(failure, None, "no stop was attempted");
+
+        stuck.engine.release();
+        due(&stuck);
+        stuck.backend.services_idle_stop(&stuck.root, &settings);
+        let (deadline, failure) = stuck.backend.services.with_project(&stuck.root, |project| {
+            (project.idle_deadline, project.failure.clone())
+        });
+        assert_eq!(deadline, None);
+        assert!(failure.is_some_and(|why| why.contains("idle stop failed")));
+    }
+
+    /// `marsh stop` reports a VM whose worker is inside a call as not stopped
+    /// and still running; once the worker is gone the stop is attempted.
+    #[test]
+    fn the_daemon_stop_leaves_a_vm_whose_worker_is_inside_a_call_running() {
+        let stuck = stuck();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let components = stuck
+            .backend
+            .services_scope_teardown(ScopeLifecycleAction::Stop, deadline);
+        let mine = |components: &[ScopeCleanupComponent]| {
+            components
+                .iter()
+                .find(|component| component.vm.as_deref() == Some(stuck.vm.as_str()))
+                .and_then(|component| component.detail.clone())
+                .unwrap()
+        };
+        assert!(
+            mine(&components).contains("still running"),
+            "{components:?}"
+        );
+
+        stuck.engine.release();
+        let components = stuck
+            .backend
+            .services_scope_teardown(ScopeLifecycleAction::Stop, deadline);
+        assert!(
+            mine(&components).contains("could not be stopped"),
+            "{components:?}"
+        );
+    }
 
     fn scope(config: Option<&str>) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();

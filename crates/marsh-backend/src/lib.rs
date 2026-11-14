@@ -7714,13 +7714,22 @@ mod tests {
         daemon_home: &std::path::Path,
         commands: BTreeMap<String, RegisteredKit>,
     ) -> StockDaemonBackend {
+        backend_with_runner(daemon_home, commands, Arc::new(NeverRunner))
+    }
+
+    /// The same backend over a chosen stock command runner.
+    pub(crate) fn backend_with_runner(
+        daemon_home: &std::path::Path,
+        commands: BTreeMap<String, RegisteredKit>,
+        runner: Arc<dyn marsh_runtime::CommandRunner>,
+    ) -> StockDaemonBackend {
         let shell_image = marsh_contracts::OciImage::parse(format!(
             "dhi.example/shell@sha256:{}",
             "f".repeat(64)
         ))
         .unwrap();
         StockDaemonBackend::new(
-            Arc::new(test_stock(Arc::new(NeverRunner))),
+            Arc::new(test_stock(runner)),
             commands,
             BackendConfig {
                 worker_binary: daemon_home.join("worker"),

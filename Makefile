@@ -374,13 +374,13 @@ site:
 site-check: site
 	$(PYTHON) scripts/check-links.py --markdown .
 
-# Release packaging refuses the test-breaks feature (docs/design/test-breaks.md).
+# Release packaging refuses the test-breaks and test-support features (docs/design/test-breaks.md).
 # This fails fast on the feature inputs this Makefile passes to cargo. The
 # compile-time refusal (MARSH_RELEASE_PACKAGING=1) and the packaged-binary check
 # in scripts/dist.sh are the backstops.
 .PHONY: check-release-features
 check-release-features:
-	@case " $(HOST_FEATURES) $(ACCEPTANCE_HOST_FEATURES) $(DEV_FEATURES) " in *test-breaks*) echo 'make: test-breaks is a test-build feature; release packaging refuses it (drop it from HOST_FEATURES, ACCEPTANCE_HOST_FEATURES and DEV_FEATURES)' >&2; exit 1;; esac
+	@case " $(HOST_FEATURES) $(ACCEPTANCE_HOST_FEATURES) $(DEV_FEATURES) " in *test-breaks*|*test-support*) echo 'make: test-breaks and test-support are test-build features; release packaging refuses them (drop them from HOST_FEATURES, ACCEPTANCE_HOST_FEATURES and DEV_FEATURES)' >&2; exit 1;; esac
 
 # Release packaging. CI (.github/workflows/release.yml) builds the inputs:
 # host binaries, guest artifacts, published Kit digests, and the shell image.

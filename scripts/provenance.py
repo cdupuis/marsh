@@ -27,10 +27,15 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 
-FORBIDDEN_FEATURES = ("test-breaks", "test_breaks")
+# Test-only features no release may enable on any crate: `test-breaks` (deliberate
+# behavior breaks) and `test-support` (host-only seams and harnesses such as
+# marsh-sbx's stuck-engine fake, which must not ship).
+FORBIDDEN_FEATURES = ("test-breaks", "test_breaks", "test-support", "test_support")
 VERSION = 2
 
 
@@ -47,8 +52,80 @@ def group_id(units):
     return "g-" + hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
+# The build's rustc flags are recorded in the receipt under this pseudo-unit (it
+# cannot collide with a crate name), so they are part of the content-addressed
+# group: a feature switched on by hand (`--cfg feature="test-support"`) leaves
+# Cargo's own feature list empty but shows here.
+FLAGS_UNIT = "@rustflags"
+CFG_FEATURE = re.compile(r"--cfg[\s=\"',\[\]\\]*feature\s*=\s*\\?[\"']?\\?[\"']?(test[-_]breaks|test[-_]support)\b")
+
+
+def forbidden_cfgs(flags):
+    """The forbidden features that `--cfg feature="..."` among these flags turns on."""
+    return sorted({match.group(1).replace("_", "-") for match in CFG_FEATURE.finditer(" ".join(flags))})
+
+
 def forbidden_in(units):
-    return sorted(f"{name}/{feature}" for name, features in units.items() for feature in features if feature in FORBIDDEN_FEATURES)
+    found = [f"{name}/{feature}" for name, features in units.items() if name != FLAGS_UNIT for feature in features if feature in FORBIDDEN_FEATURES]
+    found += [f"{FLAGS_UNIT}/--cfg feature={feature}" for feature in forbidden_cfgs(units.get(FLAGS_UNIT, []))]
+    return sorted(found)
+
+
+def toml_flags(table):
+    """rustflags values (a list or a string) under `build` and every `target.*` of a cargo config."""
+    values = []
+    for section in [table.get("build", {})] + [t for t in table.get("target", {}).values() if isinstance(t, dict)]:
+        flags = section.get("rustflags") if isinstance(section, dict) else None
+        values += flags if isinstance(flags, list) else shlex.split(flags) if isinstance(flags, str) else []
+    return values
+
+
+def config_files(start):
+    directory = os.path.abspath(start)
+    while True:
+        for name in (".cargo/config.toml", ".cargo/config"):
+            yield os.path.join(directory, name)
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+    home = os.environ.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
+    for name in ("config.toml", "config"):
+        yield os.path.join(home, name)
+
+
+def build_flags(command, environment=None, cwd="."):
+    """Every rustc flag input of the build: the environment (`RUSTFLAGS`,
+    `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, `CARGO_TARGET_*_RUSTFLAGS`),
+    `--config` arguments of the cargo command, and cargo config files."""
+    environment = os.environ if environment is None else environment
+    flags = []
+    for name, value in sorted(environment.items()):
+        if name == "CARGO_ENCODED_RUSTFLAGS":
+            flags += value.split("\x1f")
+        elif name in ("RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS") or (name.startswith("CARGO_TARGET_") and name.endswith("_RUSTFLAGS")):
+            flags += shlex.split(value)
+    for index, argument in enumerate(command):
+        if argument.startswith("--config="):
+            flags.append(argument[len("--config=") :])
+        elif argument == "--config" and index + 1 < len(command):
+            flags.append(command[index + 1])
+    try:
+        import tomllib
+    except ImportError:  # Python before 3.11: only the environment and arguments
+        return flags
+    for path in config_files(cwd):
+        try:
+            with open(path, "rb") as handle:
+                flags += toml_flags(tomllib.load(handle))
+        except (OSError, ValueError):
+            continue
+    return flags
+
+
+def subject(forbidden):
+    """What a refusal names: `test-breaks` when it is among them, else a test-only feature."""
+    return "test-breaks" if any(item.rsplit("/", 1)[-1] in ("test-breaks", "test_breaks") for item in forbidden) else "a test-only feature"
 
 
 def package_name(package_id):
@@ -100,6 +177,9 @@ def build(arguments, command):
     if not units or not executables:
         sys.exit("provenance: the build reported no units or no executables; no receipt written")
     units = {name: sorted(features) for name, features in sorted(units.items())}
+    flags = build_flags(command)
+    if flags:
+        units[FLAGS_UNIT] = flags
     gid = group_id(units)
     manifest["groups"].setdefault(gid, {"label": arguments.label or "", "command": " ".join(command), "units": units})
     for binary, path, package in executables:
@@ -194,7 +274,7 @@ def verify(arguments):
             continue
         forbidden = forbidden_in(units)
         if forbidden:
-            print(f"provenance: {path} was built with test-breaks (build group {entry['group']}: {', '.join(forbidden)}); refusing to package it", file=sys.stderr)
+            print(f"provenance: {path} was built with {subject(forbidden)} (build group {entry['group']}: {', '.join(forbidden)}); refusing to package it", file=sys.stderr)
             failed = True
         else:
             print(f"provenance: ok {path}")

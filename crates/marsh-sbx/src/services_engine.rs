@@ -84,7 +84,7 @@ pub struct EnginePin {
     pub archive_bytes: u64,
 }
 
-const PIN_SCHEMA: &str = "marsh.svc-engine-image/v1";
+pub(crate) const PIN_SCHEMA: &str = "marsh.svc-engine-image/v1";
 
 /// The guest artifacts the engine needs.
 #[derive(Clone, Debug)]
@@ -352,7 +352,7 @@ pub struct RelayTarget {
 const BOOT_ENGINE_SOCKET: &str = "/var/run/docker.sock";
 /// How long `detach` waits for the startup worker before leaving it to stop on
 /// its own at its next cancellation check.
-const DETACH_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const DETACH_WAIT: Duration = Duration::from_secs(5);
 
 struct Shared {
     started: Instant,
@@ -467,6 +467,9 @@ impl Shared {
 pub struct EngineHandle {
     shared: Arc<Shared>,
     worker: Mutex<Option<(thread::JoinHandle<()>, mpsc::Receiver<()>)>>,
+    /// Held for a whole `detach`: a second caller must not find the worker
+    /// taken by the first and report it gone while it is still running.
+    detaching: Mutex<()>,
 }
 
 impl EngineHandle {
@@ -614,27 +617,48 @@ impl EngineHandle {
     /// that has leaves the container running (the VM owns its life, and the next
     /// generation replaces it). Waits at most a few seconds for the worker: a
     /// worker inside a long `sbx` command ends at its next cancellation check.
-    pub fn detach(&self) {
+    ///
+    /// Returns whether the worker is gone. `false` means an `sbx` call it had
+    /// already admitted is still running and may reach the VM later (an exec
+    /// into a stopped VM starts it): the caller must not stop the VM yet.
+    /// The worker stays owned, so a later `detach` waits for it again.
+    pub fn detach(&self) -> bool {
+        self.detach_within(DETACH_WAIT)
+    }
+
+    pub(crate) fn detach_within(&self, wait: Duration) -> bool {
+        let _serial = self
+            .detaching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.shared.cancel();
         let worker = self
             .worker
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some((handle, done)) = worker {
-            match done.recv_timeout(DETACH_WAIT) {
-                Err(mpsc::RecvTimeoutError::Timeout) => drop(handle),
-                _ => {
-                    let _ = handle.join();
-                }
-            }
+        let Some((handle, done)) = worker else {
+            return true;
+        };
+        if let Err(mpsc::RecvTimeoutError::Timeout) = done.recv_timeout(wait) {
+            *self
+                .worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((handle, done));
+            return false;
         }
+        let _ = handle.join();
+        true
     }
 }
 
 impl Drop for EngineHandle {
     fn drop(&mut self) {
-        self.detach();
+        // A handle already cancelled whose worker is still inside a call has
+        // been waited for once; dropping it does not wait again.
+        if !self.shared.is_cancelled() {
+            self.detach();
+        }
     }
 }
 
@@ -646,6 +670,10 @@ pub struct ServicesEngine {
     /// Where each generation's container id is recorded, when the daemon's
     /// adapter owns the record ([`StockSbx::services_engine`]).
     engine_ids: Option<Arc<Mutex<BTreeMap<String, String>>>>,
+    /// The generation this copy runs for (set by [`Self::start`]): once it is
+    /// cancelled no `sbx exec` is issued, because an exec into a VM that is
+    /// stopping or stopped starts it again.
+    generation: Option<Arc<Shared>>,
 }
 
 impl StockSbx {
@@ -699,6 +727,7 @@ impl ServicesEngine {
             sbx,
             runner,
             engine_ids: None,
+            generation: None,
         }
     }
 
@@ -728,7 +757,8 @@ impl ServicesEngine {
             relay_boot_engine: Breaks(&settings.breaks).active("relay-dial-boot-engine"),
             raw_reasons: Breaks(&settings.breaks).active("engine-watch-unbounded"),
         });
-        let engine = self.clone();
+        let mut engine = self.clone();
+        engine.generation = Some(Arc::clone(&shared));
         let inner = Arc::clone(&shared);
         let (finished, done) = mpsc::channel();
         let worker = thread::spawn(move || {
@@ -740,6 +770,7 @@ impl ServicesEngine {
         EngineHandle {
             shared,
             worker: Mutex::new(Some((worker, done))),
+            detaching: Mutex::new(()),
         }
     }
 
@@ -749,6 +780,9 @@ impl ServicesEngine {
         arguments: &[&str],
         timeout: Duration,
     ) -> Result<CommandOutput, EngineError> {
+        if let Some(generation) = &self.generation {
+            generation.check_cancelled()?;
+        }
         let mut command: Vec<OsString> = ["exec", "-u", "root", vm]
             .iter()
             .map(OsString::from)
@@ -890,6 +924,7 @@ impl ServicesEngine {
                 working_directory: None,
                 environment: Vec::new(),
             };
+            shared.check_cancelled()?;
             let output = self
                 .runner
                 .run_bounded(&copy, COPY_TIMEOUT)
@@ -1216,6 +1251,9 @@ impl ServicesEngine {
             OsString::from("--follow"),
             OsString::from(id),
         ];
+        if shared.is_cancelled() {
+            return Ok(());
+        }
         let attachment = self
             .runner
             .spawn_attached(&self.invocation(command))
@@ -1458,6 +1496,8 @@ fn id_matches(observed: &str, pin: &EnginePin) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stuck_engine::start_held;
+    use std::thread;
 
     #[test]
     fn project_paths_that_overlap_the_engine_are_refused() {
@@ -1484,6 +1524,67 @@ mod tests {
         ] {
             assert!(engine_path_conflict(Path::new(fine)).is_none(), "{fine}");
         }
+    }
+
+    /// Runs a generation with one stock call held, cancels it, releases the
+    /// call, and returns what the worker ran afterwards.
+    fn calls_after_a_cancel_during(hold_hash: bool) -> Vec<String> {
+        let (runner, handle) = start_held(hold_hash);
+        let detaching = {
+            let handle = Arc::clone(&handle);
+            thread::spawn(move || handle.detach())
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !handle.shared.is_cancelled() {
+            assert!(Instant::now() < deadline, "the detach never cancelled");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let before = runner.calls().len();
+        runner.release();
+        detaching.join().unwrap();
+        let calls = runner.calls();
+        calls[before..].to_vec()
+    }
+
+    /// DA4-05: a worker still inside an admitted call is reported, so the
+    /// caller defers stopping the VM; it stays owned and a later detach
+    /// waits for it again, then reports it gone.
+    #[test]
+    fn detach_reports_a_worker_still_inside_a_call_until_it_is_gone() {
+        let (runner, handle) = start_held(false);
+        assert!(!handle.detach_within(Duration::from_millis(100)));
+        assert!(!handle.detach_within(Duration::from_millis(50)));
+        runner.release();
+        assert!(handle.detach_within(Duration::from_secs(30)));
+        assert!(handle.detach());
+    }
+
+    #[test]
+    fn a_detached_worker_runs_no_exec_after_the_cancel() {
+        assert_eq!(calls_after_a_cancel_during(false), [] as [String; 0]);
+    }
+
+    /// A second detach, concurrent with the first, must not find the worker
+    /// taken and report it gone while it still runs.
+    #[test]
+    fn a_concurrent_detach_does_not_report_a_running_worker_gone() {
+        let (runner, handle) = start_held(false);
+        let results: Vec<bool> = thread::scope(|scope| {
+            let calls: Vec<_> = (0..2)
+                .map(|_| scope.spawn(|| handle.detach_within(Duration::from_millis(150))))
+                .collect();
+            calls.into_iter().map(|call| call.join().unwrap()).collect()
+        });
+        assert_eq!(results, [false, false]);
+        runner.release();
+        assert!(handle.detach_within(Duration::from_secs(30)));
+    }
+
+    /// Review of DA4-05: the copy itself is not an exec, so it needs its own
+    /// check after the hash that precedes it.
+    #[test]
+    fn a_detached_worker_starts_no_copy_after_the_cancel() {
+        assert_eq!(calls_after_a_cancel_during(true), [] as [String; 0]);
     }
 
     #[test]

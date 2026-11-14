@@ -466,18 +466,39 @@ pub(super) fn read_result(path: &Path) -> Result<Vec<(Vec<u8>, Entry)>, String> 
     Ok(entries)
 }
 
+/// What [`import_checked`] did.
+enum Imported<R> {
+    /// The run's lane split was cancelled first: nothing written.
+    Cancelled,
+    /// These touched paths changed here since the run started: nothing written.
+    Conflicts(Vec<String>),
+    /// The import ran.
+    Done(R),
+}
+
 /// The last check and the import, one step under the root's import lock:
-/// `None` (nothing written) when the run's lane split was cancelled first.
-fn import_unless_cancelled<R>(
+/// nothing is written when the run's lane split was cancelled first or a
+/// touched path changed here.
+fn import_checked<R>(
     store: &DaemonStore,
     job: &str,
     lock: &Mutex<()>,
+    root: &Dir,
+    base: &BTreeMap<Vec<u8>, Entry>,
+    result: &[(Vec<u8>, Entry)],
     import: impl FnOnce() -> R,
-) -> Option<R> {
+) -> Imported<R> {
+    let changed = conflicts(root, base, result);
     let _held = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    (!store.in_cancelled_split(job)).then(import)
+    if !changed.is_empty() {
+        return Imported::Conflicts(changed);
+    }
+    if store.in_cancelled_split(job) {
+        return Imported::Cancelled;
+    }
+    Imported::Done(import())
 }
 
 struct HashSink<'a>(&'a mut Sha256);
@@ -1155,16 +1176,6 @@ impl StockDaemonBackend {
             Ok(result) => result,
             Err(message) => return keep(record, format!("its changes are unreadable: {message}")),
         };
-        let changed = conflicts(&root, &base, &result);
-        if !changed.is_empty() {
-            return keep(
-                record,
-                format!(
-                    "{} changed here since it started",
-                    plural(changed.len(), "file", "files")
-                ),
-            );
-        }
         // A scope lifecycle transition (`marsh stop`) waits for this write.
         let Ok(_admission) = store.begin_background_request(format!(
             "the write-back of detached cloud run {}",
@@ -1179,14 +1190,27 @@ impl StockDaemonBackend {
         // lock) that came before this check discards the run instead; one
         // that comes after it finds the run live (a lane waits for it), so
         // nothing is written into a copy after its cancel has finished.
-        let applied = import_unless_cancelled(
+        let applied = import_checked(
             store,
             &record.job_id,
             &self.cloud.import_lock(&record.root),
+            &root,
+            &base,
+            &result,
             || cloud_fs::apply_delta(&record.root, record.root_identity, &payload, MAX_ARCHIVE),
         );
-        let Some(applied) = applied else {
-            return self.discard_loaded(store, paths, record);
+        let applied = match applied {
+            Imported::Cancelled => return self.discard_loaded(store, paths, record),
+            Imported::Conflicts(changed) => {
+                return keep(
+                    record,
+                    format!(
+                        "{} changed here since it started",
+                        plural(changed.len(), "file", "files")
+                    ),
+                );
+            }
+            Imported::Done(applied) => applied,
         };
         match applied {
             Ok(report) => {
@@ -2120,19 +2144,28 @@ mod tests {
         let (first, second) = (job(&store), job(&store));
         let lock = Mutex::new(());
         let ran = std::cell::Cell::new(0);
+        let dir = tempfile::tempdir().unwrap();
+        let root = Dir::open_root(dir.path()).unwrap();
+        let import = |job: &str, run: &dyn Fn()| {
+            import_checked(&store, job, &lock, &root, &BTreeMap::new(), &[], run)
+        };
         // Not cancelled: the import runs.
-        assert!(
-            import_unless_cancelled(&store, &first, &lock, || ran.set(ran.get() + 1)).is_some()
-        );
+        assert!(matches!(
+            import(&first, &|| ran.set(ran.get() + 1)),
+            Imported::Done(())
+        ));
         // A cancel that arrives while the import runs is not held up by it
         // (the lane waits for the run), and the import completes.
-        let during = import_unless_cancelled(&store, &second, &lock, || {
+        let during = import(&second, &|| {
             store.cancel_split("abc123def456");
             ran.set(ran.get() + 1);
         });
-        assert!(during.is_some() && ran.get() == 2);
+        assert!(matches!(during, Imported::Done(())) && ran.get() == 2);
         // A cancel that came first: nothing is imported, for any run of it.
-        assert!(import_unless_cancelled(&store, &first, &lock, || ran.set(99)).is_none());
+        assert!(matches!(
+            import(&first, &|| ran.set(99)),
+            Imported::Cancelled
+        ));
         assert_eq!(ran.get(), 2);
     }
 

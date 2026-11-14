@@ -83,6 +83,42 @@ pub(crate) fn forward_host_environment(command: &mut std::process::Command) {
     }
 }
 
+/// The whole environment of a host child of this server: fixed identity and
+/// `PATH`, then the [`forward_host_environment`] allowlist.
+pub(crate) fn apply_host_environment(
+    command: &mut std::process::Command,
+    config: &HostConfig,
+    home: &Path,
+) {
+    command
+        .env_clear()
+        .env("MARSH_HOME", home)
+        .env("MARSH_SBX", &config.sbx)
+        .env("USER", &config.username)
+        .env("LOGNAME", &config.username)
+        .env("PATH", fixed_minimal_path());
+    forward_host_environment(command);
+}
+
+/// The resident daemon this server starts gets the same environment as the
+/// host `marsh` children (`apply_host_environment`), not the gateway's own.
+pub(crate) fn start_daemon(
+    config: &HostConfig,
+) -> Result<marsh_daemon::Client, marsh_daemon::DaemonError> {
+    let mut probe = std::process::Command::new("daemon-environment");
+    apply_host_environment(&mut probe, config, &config.home);
+    let environment = probe
+        .get_envs()
+        .filter_map(|(name, value)| Some((name.to_owned(), value?.to_owned())))
+        .collect::<Vec<_>>();
+    marsh_daemon::Client::ensure_running_with_environment(
+        &config.home,
+        &config.marshd,
+        &config.sbx,
+        &environment,
+    )
+}
+
 pub(crate) const INHERITED_ENV: [&str; 13] = [
     "HOME",
     // The host state root: every host-side write follows the caller's
@@ -2721,18 +2757,12 @@ async fn run_bounded_cancel(
     command
         .args(&spec.arguments)
         .current_dir(&config.workspace)
-        .env_clear()
-        .env("MARSH_HOME", &spec.home)
-        .env("MARSH_SBX", &config.sbx)
-        .env("USER", &config.username)
-        .env("LOGNAME", &config.username)
-        .env("PATH", fixed_minimal_path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .process_group(0);
-    forward_host_environment(command.as_std_mut());
+    apply_host_environment(command.as_std_mut(), config, &spec.home);
     // On macOS a descriptor (another command's pipe, a daemon connection)
     // becomes close-on-exec only after creation; never spawn in between.
     let mut child = marsh_runtime::with_host_descriptor_creation_excluded(|| command.spawn())
@@ -4457,6 +4487,54 @@ mod tests {
         assert_eq!(operations[&owner_id].state, OperationState::Failed);
         assert_eq!(operations[&peer_id].state, OperationState::Running);
         assert!(!*peer_cancelled.borrow());
+    }
+
+    /// The export server's Kit-command path starts the resident daemon: it must
+    /// see the pinned environment, never the gateway's.
+    #[test]
+    fn the_daemon_an_export_starts_gets_the_host_child_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let home = root.path().join("home");
+        let marsh = root.path().join("marsh");
+        fs::create_dir(&workspace).unwrap();
+        executable(&marsh, "#!/bin/sh\nexit 0\n");
+        let sbx = supporting_executables(&marsh);
+        let marshd = root.path().join("marshd");
+        executable(&marshd, "#!/bin/sh\n/usr/bin/env > \"$0.env\"\nexit 1\n");
+        let config = HostConfig::new(&workspace, &home, &marsh, &sbx, false).unwrap();
+
+        assert!(start_daemon(&config).is_err(), "the stand-in exits");
+
+        let seen = fs::read_to_string(marshd.with_extension("env")).unwrap();
+        let allowed = [
+            "MARSH_HOME",
+            "MARSH_SBX",
+            "USER",
+            "LOGNAME",
+            "PATH",
+            "MARSH_INTERNAL_STARTUP_STDERR",
+            // The shell itself adds these.
+            "PWD",
+            "OLDPWD",
+            "SHLVL",
+            "_",
+        ];
+        for name in seen.lines().filter_map(|line| line.split_once('=')) {
+            assert!(
+                allowed.contains(&name.0)
+                    || INHERITED_ENV.contains(&name.0)
+                    || marsh_runtime::STOCK_SBX_SELECTORS.contains(&name.0),
+                "the daemon inherited {}: {seen}",
+                name.0
+            );
+        }
+        let path = format!("PATH={}", fixed_minimal_path().to_string_lossy());
+        assert!(seen.lines().any(|line| line == path), "{seen}");
+        assert!(
+            seen.lines()
+                .any(|line| line == format!("USER={}", config.username))
+        );
     }
 
     #[tokio::test]

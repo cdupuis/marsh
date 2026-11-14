@@ -1083,8 +1083,6 @@ impl ExportMcp {
         self.config.host_config.validate_host_executables()?;
 
         let home = self.config.host_config.home().to_path_buf();
-        let marshd = self.config.host_config.marshd().to_path_buf();
-        let sbx = self.config.host_config.sbx().to_path_buf();
         let command = self.config.declaration.command.clone();
         let tool_name = self.config.declaration.tool_name.clone();
         let max_output_bytes = self.config.declaration.max_output_bytes;
@@ -1105,7 +1103,7 @@ impl ExportMcp {
         // Connect to the real daemon endpoint
         let client = Client::connect_if_running(&home)
             .map_err(|e| format!("cannot check daemon at {}: {e}", home.display()))?
-            .map_or_else(|| Client::ensure_running(&home, &marshd, &sbx), Ok)
+            .map_or_else(|| crate::start_daemon(&self.config.host_config), Ok)
             .map_err(|e| format!("cannot connect to daemon at {}: {e}", home.display()))?;
 
         // MCP-01/MCP-03: Missing, changed, or unregistered Kit identity fails closed before invocation

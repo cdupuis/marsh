@@ -205,7 +205,9 @@ subprocess uses a fixed minimal `PATH` and the pinned `--sbx` executable; it
 does not inherit `MARSH_SBX`. At startup, `marsh-mcp` resolves the effective
 UID through the operating-system passwd database, validates the account name,
 and sets both `USER` and `LOGNAME` explicitly in every cleared child
-environment. It never trusts optional inherited identity variables. Tool calls
+environment, including the environment of a resident `marshd` that an exported
+Kit command starts (`start_daemon`). It never trusts optional inherited
+identity variables. Tool calls
 cannot add, replace, or inspect environment variables. A direct MCP client can
 equivalently launch the same command and argument list over stdio.
 

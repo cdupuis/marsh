@@ -7,6 +7,7 @@
 use super::{Client, DaemonError, EndpointPaths, PublicReply, PublicRequest};
 use marsh_contracts::JobResources;
 use std::{
+    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Read},
     os::unix::{
@@ -112,10 +113,19 @@ struct StartupChild {
 }
 
 impl StartupChild {
-    fn spawn(home: &Path, daemon: &Path, stock: &Path, launch: &File) -> Result<Self, DaemonError> {
+    fn spawn(
+        home: &Path,
+        daemon: &Path,
+        stock: &Path,
+        launch: &File,
+        environment: Option<&[(OsString, OsString)]>,
+    ) -> Result<Self, DaemonError> {
         let (reader, writer) = marsh_runtime::unix_stream_pair()?;
         reader.set_nonblocking(true)?;
         let mut command = Command::new(daemon);
+        if let Some(environment) = environment {
+            command.env_clear().envs(environment.iter().cloned());
+        }
         // Never `--test-breaks-from-env`: only a harness launching marshd
         // directly passes it, so a daemon this CLI starts ignores
         // MARSH_TEST_BREAK whatever either binary was built with
@@ -315,12 +325,22 @@ pub(super) fn connect_current_if_running(
     }
 }
 
+/// `environment` is the daemon's whole environment (plus `MARSH_SBX`), for a
+/// caller that must not hand its own to a daemon that outlives it; `None`
+/// inherits the caller's.
 pub(super) fn ensure_running(
     home: &Path,
     daemon: &Path,
     stock: &Path,
+    environment: Option<&[(OsString, OsString)]>,
 ) -> Result<Client, DaemonError> {
-    let requested = JobDefaults::from_environment(|name| std::env::var_os(name))?;
+    let requested = JobDefaults::from_environment(|name| match environment {
+        Some(environment) => environment
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone()),
+        None => std::env::var_os(name),
+    })?;
     let daemon = super::canonical_executable(daemon).map_err(|error| {
         DaemonError::InvalidState(format!(
             "cannot use resident daemon executable {}: {error}; reinstall the sibling marshd",
@@ -358,7 +378,13 @@ pub(super) fn ensure_running(
     let mut child = if live_owner {
         None
     } else {
-        Some(StartupChild::spawn(home, &daemon, &stock, &launch)?)
+        Some(StartupChild::spawn(
+            home,
+            &daemon,
+            &stock,
+            &launch,
+            environment,
+        )?)
     };
     while Instant::now() < deadline {
         if let Some(child) = &mut child

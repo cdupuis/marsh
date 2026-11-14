@@ -95,14 +95,20 @@ load the same SBX registration concurrently without starting competing scope
 owners. Legacy `--home` mode has no managed root registry or broker; its
 lifecycle state lasts only for that direct MCP process.
 
-The broker's socket, token, pid and log sit in `b-<key>/` beside a generated
-scope root, in the owner-only `marsh-mcp-scopes` directory, keyed on the
-canonical scope root (every spelling of it names one broker). A scope root
-elsewhere, or a path too long for a socket, uses `/tmp/marsh-mcp-<uid>-<key>`,
-which another local user can still squat (a denial of service, not access).
-A broker started by an earlier build listens under `/tmp` and this build
-cannot see it: run `marsh mcp stop` with the earlier build before upgrading, or
-end that `marsh-mcp broker-run` process, or it keeps the scope lease.
+The broker's socket, token, pid and log sit in `b-<key>/` in the owner-only
+`*-mcp-scopes` directory above the scope root (`marsh-mcp-scopes`, or the one
+beside a `MARSH_CONTROL_HOME` override; for every generated root, including
+`clients/sbx/<hash>`), keyed on the canonical scope root so every spelling of it
+names one broker. A long home gets a shorter directory name (`b<key6>/`). Only
+a scope root outside any such directory, or a path too long for any socket
+path, uses `/tmp/marsh-mcp-<uid>-<key>`; the broker then says so on stderr when
+it starts, because another local user can block that directory by creating it
+first (a denial of service, not access).
+A broker started by an earlier build listens under `/tmp` and holds the scope
+lease; this build cannot see or stop it. `broker-start` detects it (the socket
+under `/tmp` and the held lease) and fails with its pid and the command that
+works without the old binary: `kill <pid>`. Sandboxes loaded through that
+broker lose their MCP connection until they reload.
 
 Before creating or using a scope home, the server binds every managed root to
 the canonical path and filesystem identity of the configured workspace. A

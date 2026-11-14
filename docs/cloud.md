@@ -340,6 +340,12 @@ marsh cloud collect 42      # check on it now
   the work finishes, the sandbox idles until its time limit suspends it, so a
   shorter `--ttl` bounds that idle time. A run nobody collects is deleted
   after 14 days.
+- **Disk on your Mac.** Each stream of a run's output keeps its first 256 MiB
+  (later output is dropped and the run is marked truncated). A finished run's
+  files go 14 days after it finished; a kept patch stays until you apply or discard it
+  (set `MARSH_CLOUD_KEPT_PATCH_RETENTION` in the daemon environment for a limit); a patch of a nested agent call that could
+  not be written back stays in `cloud/results` of the control home (the job's
+  notes give its path) until you delete it; half-fetched files go after a day.
 - `marsh cloud stop 42` interrupts a run (`INT`, then `KILL` after 10
   seconds); its changes so far come back as usual.
 - `marsh stop`, `marsh reset`, and `marsh workers reset cloud` keep

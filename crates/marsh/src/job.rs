@@ -335,7 +335,7 @@ fn child_at(
 
 fn remote_message(error: &DaemonError) -> String {
     let message = match error {
-        DaemonError::Remote(message) | DaemonError::Refused(message) => message.clone(),
+        DaemonError::Remote(message) | DaemonError::Refused(message) => display_safe_text(message),
         other => other.to_string(),
     };
     message
@@ -1222,6 +1222,25 @@ mod tests {
     }
 
     const NOW: i64 = 10_000_000_000;
+
+    #[test]
+    fn a_daemon_refusal_prints_no_terminal_control() {
+        let evil = "marsh: x\u{1b}]52;c;AAAA\u{7}y";
+        for error in [
+            marsh_daemon::DaemonError::Remote(evil.into()),
+            marsh_daemon::DaemonError::Refused(evil.into()),
+            marsh_daemon::DaemonError::InvalidState(evil.into()),
+        ] {
+            let shown = super::remote_message(&error);
+            assert!(
+                !shown
+                    .chars()
+                    .any(marsh_contracts::terminal::is_terminal_unsafe),
+                "{shown:?}"
+            );
+            assert!(shown.contains("x?]52;c;AAAA?y"), "{shown:?}");
+        }
+    }
 
     #[test]
     fn listing_prints_no_terminal_control_from_any_workload_field() {

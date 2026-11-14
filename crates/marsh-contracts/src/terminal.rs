@@ -70,69 +70,111 @@ fn plain_value(value: &str) -> bool {
         })
 }
 
-/// Whether `character` could act on a terminal or hide text in a line:
-/// C0 and C1 controls (ESC, CSI, OSC, BEL, CR, DEL...), the Unicode line and
-/// paragraph separators, and the bidirectional overrides and isolates.
+/// Whether `character` could act on a terminal or hide or reorder text in a
+/// line: C0 and C1 controls (ESC, CSI, OSC, BEL, CR, DEL...), the Unicode line
+/// and paragraph separators, the bidirectional embeddings, overrides and
+/// isolates (LRE RLE PDF LRO RLO, LRI RLI FSI PDI), and invisible characters
+/// that make text vanish (zero-width space, BOM, word joiner and invisible
+/// operators, the tag block that smuggles ASCII). The marks LRM, RLM and ALM
+/// stay, since right-to-left text uses them. The zero-width joiners
+/// (U+200C, U+200D) are handled in context by [`display_safe`].
 #[must_use]
 pub fn is_terminal_unsafe(character: char) -> bool {
     character.is_control()
         || matches!(
             character,
-            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            '\u{200b}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+                | '\u{e0000}'..='\u{e007f}'
         )
 }
 
+fn is_joiner(character: char) -> bool {
+    matches!(character, '\u{200c}' | '\u{200d}')
+}
+
+/// A joiner joins two characters that are not ASCII, white space or removed
+/// ones (an emoji sequence, a Persian or Indic word). Anywhere else it only
+/// hides.
+fn joins(before: Option<char>, after: Option<char>) -> bool {
+    let joinable = |c: Option<char>| {
+        c.is_some_and(|c| {
+            !c.is_ascii() && !c.is_whitespace() && !is_terminal_unsafe(c) && !is_joiner(c)
+        })
+    };
+    joinable(before) && joinable(after)
+}
+
+fn sanitize(text: &str, keep_lines: bool, before: Option<char>, after: Option<char>) -> String {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(text.len());
+    let mut previous = before;
+    for (index, &c) in characters.iter().enumerate() {
+        let next = characters.get(index + 1).copied().or(after);
+        let kept = if is_joiner(c) {
+            joins(previous, next)
+        } else {
+            !is_terminal_unsafe(c) || (keep_lines && matches!(c, '\n' | '\t'))
+        };
+        let shown = if kept { c } else { '?' };
+        out.push(shown);
+        previous = Some(shown);
+    }
+    out
+}
+
 /// `text` for one line on the user's terminal: every character
-/// [`is_terminal_unsafe`] becomes `?`. The one filter for every string a
-/// workload, a Kit or a remote run chose that the Mac prints (receipt and job
-/// fields, daemon error text).
+/// [`is_terminal_unsafe`] (and a joiner that joins nothing) becomes `?`. The
+/// one filter for every string a workload, a Kit or a remote run chose that the
+/// Mac prints (receipt and job fields, daemon error text).
 #[must_use]
 pub fn display_safe(text: &str) -> String {
-    text.chars()
-        .map(|c| if is_terminal_unsafe(c) { '?' } else { c })
-        .collect()
+    sanitize(text, false, None, None)
 }
 
 /// Like [`display_safe`] for text of several lines: newlines and tabs stay.
 #[must_use]
 pub fn display_safe_text(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if is_terminal_unsafe(c) && !matches!(c, '\n' | '\t') {
-                '?'
-            } else {
-                c
-            }
-        })
-        .collect()
+    sanitize(text, true, None, None)
 }
 
 /// [`display_safe_text`] for bytes that arrive in chunks, such as a patch a
 /// cloud run produced and the Mac shows on a terminal. A character that a
-/// chunk boundary splits is held back for the next call.
+/// chunk boundary splits, and a joiner at the end of a chunk, wait for the
+/// next call.
 #[derive(Debug, Default)]
 pub struct DisplayFilter {
     held: Vec<u8>,
+    last: Option<char>,
 }
 
 impl DisplayFilter {
     /// The safe text for the bytes so far, without a split character's tail.
     pub fn push(&mut self, chunk: &[u8]) -> String {
         self.held.extend_from_slice(chunk);
-        let end = match std::str::from_utf8(&self.held) {
+        let mut end = match std::str::from_utf8(&self.held) {
             Err(error) if error.error_len().is_none() => error.valid_up_to(),
             _ => self.held.len(),
         };
-        let text = display_safe_text(&String::from_utf8_lossy(&self.held[..end]));
+        let mut text = String::from_utf8_lossy(&self.held[..end]);
+        while let Some(joiner) = text.chars().next_back().filter(|c| is_joiner(*c)) {
+            end -= joiner.len_utf8();
+            text = String::from_utf8_lossy(&self.held[..end]);
+        }
+        let shown = sanitize(&text, true, self.last, None);
+        self.last = shown.chars().next_back().or(self.last);
         self.held.drain(..end);
-        text
+        shown
     }
 
     /// What is left at the end of the stream.
     pub fn finish(&mut self) -> String {
-        let text = display_safe_text(&String::from_utf8_lossy(&self.held));
+        let shown = sanitize(&String::from_utf8_lossy(&self.held), true, self.last, None);
         self.held.clear();
-        text
+        shown
     }
 }
 
@@ -200,6 +242,62 @@ mod tests {
             assert_eq!(shown, "é?[2Jü?x", "split at {split}");
         }
         assert_eq!(DisplayFilter::default().push(&[0xff, b'a']), "\u{fffd}a");
+    }
+
+    #[test]
+    fn display_safe_hides_nothing_and_keeps_real_text() {
+        // Characters that vanish, reorder, or smuggle ASCII.
+        for hidden in [
+            "a\u{200b}b",
+            "a\u{feff}b",
+            "a\u{2060}b",
+            "a\u{2064}b",
+            "a\u{e0041}b",
+            "a\u{202a}b",
+            "a\u{202b}b",
+            "a\u{202c}b",
+            "a\u{202d}b",
+            "a\u{202e}b",
+            "a\u{2066}b",
+            "a\u{2067}b",
+            "a\u{2068}b",
+            "a\u{2069}b",
+            // A joiner that joins nothing, or joins ASCII, hides.
+            "a\u{200d}b",
+            "a\u{200c}b",
+            "\u{200d}",
+            "👨\u{200d}",
+        ] {
+            let shown = display_safe(hidden);
+            assert!(shown.contains('?'), "{hidden:?} -> {shown:?}");
+            assert!(
+                !shown.chars().any(|c| is_terminal_unsafe(c) || is_joiner(c)),
+                "{shown:?}"
+            );
+        }
+        // Real text, including right-to-left marks and joined emoji.
+        for kept in [
+            "日本語のテキスト 한국어 中文",
+            "👨\u{200d}👩\u{200d}👧 family, 🏳\u{fe0f}\u{200d}🌈",
+            "שלום\u{200f} עולם\u{200e} \u{061c}مرحبا",
+            "می\u{200c}خواهم",
+            "e\u{301} combining, ünïcode",
+        ] {
+            assert_eq!(display_safe(kept), kept);
+        }
+    }
+
+    #[test]
+    fn display_filter_keeps_a_joined_emoji_across_any_split() {
+        let text = "x 👨\u{200d}👩\u{200d}👧 y \u{200d}z";
+        let bytes = text.as_bytes();
+        for split in 0..=bytes.len() {
+            let mut filter = DisplayFilter::default();
+            let mut shown = filter.push(&bytes[..split]);
+            shown += &filter.push(&bytes[split..]);
+            shown += &filter.finish();
+            assert_eq!(shown, "x 👨\u{200d}👩\u{200d}👧 y ?z", "split at {split}");
+        }
     }
 
     #[test]

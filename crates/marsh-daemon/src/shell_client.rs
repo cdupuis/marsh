@@ -144,7 +144,7 @@ pub(super) fn wait_ready(
                 error.flush()?;
             }
             AttachmentFrame::Notice { message } => {
-                writeln!(error, "{message}")?;
+                error.write_all(notice_line(&message, false).as_bytes())?;
                 error.flush()?;
             }
             AttachmentFrame::Failed { message } => return Err(DaemonError::Remote(message)),
@@ -289,11 +289,7 @@ fn receive_output(
             AttachmentFrame::ControlError {
                 operation, message, ..
             } => {
-                write!(
-                    error,
-                    "marsh: {operation}: {message}{}",
-                    if terminal { "\r\n" } else { "\n" }
-                )?;
+                error.write_all(control_error_line(&operation, &message, terminal).as_bytes())?;
                 error.flush()?;
             }
             AttachmentFrame::Exited { code } => return Ok(code),
@@ -302,6 +298,52 @@ fn receive_output(
                 return Err(DaemonError::InvalidState(format!(
                     "unexpected shell output frame: {frame:?}"
                 )));
+            }
+        }
+    }
+}
+
+/// A daemon `Notice` as a line for the user's terminal: its text can come from
+/// project files and relayed errors, so every terminal control is replaced.
+pub(super) fn notice_line(message: &str, terminal: bool) -> String {
+    format!(
+        "{}{}",
+        marsh_contracts::terminal::display_safe_text(message),
+        if terminal { "\r\n" } else { "\n" }
+    )
+}
+
+/// A `ControlError` frame as a line, filtered like [`notice_line`].
+pub(super) fn control_error_line(operation: &str, message: &str, terminal: bool) -> String {
+    format!(
+        "marsh: {}: {}{}",
+        marsh_contracts::terminal::display_safe(operation),
+        marsh_contracts::terminal::display_safe_text(message),
+        if terminal { "\r\n" } else { "\n" }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notices_and_control_errors_print_no_terminal_control() {
+        let evil = "x\u{1b}]52;c;AAAA\u{7}y\u{202e}z";
+        for terminal in [false, true] {
+            for line in [
+                notice_line(evil, terminal),
+                control_error_line(evil, evil, terminal),
+            ] {
+                let body = line.trim_end_matches(['\r', '\n']);
+                assert!(
+                    !body
+                        .chars()
+                        .any(marsh_contracts::terminal::is_terminal_unsafe),
+                    "{line:?}"
+                );
+                assert!(body.contains("x?]52;c;AAAA?y?z"), "{line:?}");
+                assert_eq!(line.ends_with("\r\n"), terminal);
             }
         }
     }

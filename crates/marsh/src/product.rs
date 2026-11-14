@@ -468,10 +468,20 @@ pub fn print_cloud_notices(client: &dyn DaemonClient, stderr: &mut impl Write) {
     if let Ok(reply) =
         client.cloud_detached(marsh_daemon::cloud_detached::CloudDetachedRequest::Notices)
     {
-        for notice in reply.notices {
-            let _ = writeln!(stderr, "{}", display_safe_text(&notice));
-        }
+        let _ = write_notices(stderr, &reply.notices);
     }
+}
+
+/// Finish notices, one per line, with every terminal control replaced: a
+/// notice carries a run's label or failure text.
+///
+/// # Errors
+/// Returns the write error.
+pub fn write_notices(writer: &mut impl Write, notices: &[String]) -> std::io::Result<()> {
+    for notice in notices {
+        writeln!(writer, "{}", display_safe_text(notice))?;
+    }
+    Ok(())
 }
 
 /// `workers reset`: with `cloud` (or `all`), detached runs are kept unless
@@ -505,7 +515,7 @@ fn detached_before(
     use marsh_daemon::cloud_detached::CloudDetachedRequest;
     if crate::cli::DISCARD_DETACHED.load(std::sync::atomic::Ordering::Relaxed) {
         let reply = client.cloud_detached(CloudDetachedRequest::DiscardAll)?;
-        writeln!(stderr, "marsh: {}", reply.message)?;
+        writeln!(stderr, "marsh: {}", display_safe_text(&reply.message))?;
         return Ok(0);
     }
     Ok(client
@@ -839,7 +849,7 @@ fn workers_stop(
         writeln!(stdout)?;
     } else {
         for entry in &report.entries {
-            writeln!(stdout, "{}", entry.message)?;
+            writeln!(stdout, "{}", display_safe_text(&entry.message))?;
         }
     }
     let incomplete = report
@@ -1874,6 +1884,80 @@ mod tests {
                 .any(|c| marsh_contracts::terminal::is_terminal_unsafe(c) && c != '\n'),
             "{out:?}"
         );
+    }
+
+    /// Every host print of daemon, worker or workload text, with a controlled
+    /// string in each field it shows: none may reach the terminal.
+    #[test]
+    fn host_prints_of_daemon_and_workload_text_carry_no_terminal_control() {
+        use marsh_daemon::{ScopeCleanupState as S, ScopeLifecycleAction, ScopeLifecycleReport};
+        let evil = "x\u{1b}]52;c;AAAA\u{7}y\u{202e}z";
+        let unsafe_in = |what: &str, text: &str| {
+            let bad = text
+                .chars()
+                .filter(|c| marsh_contracts::terminal::is_terminal_unsafe(*c) && *c != '\n')
+                .collect::<String>();
+            assert!(bad.is_empty(), "{what} printed {text:?}");
+        };
+
+        let mut notices = Vec::new();
+        write_notices(&mut notices, &[evil.to_owned()]).unwrap();
+        unsafe_in("cloud notices", &String::from_utf8(notices).unwrap());
+
+        let lifecycle = ScopeLifecycleReport {
+            action: ScopeLifecycleAction::Stop,
+            cleanup_complete: false,
+            components: vec![component(
+                "kit",
+                evil,
+                S::CleanupUncertain,
+                Some(evil),
+                Some(evil),
+            )],
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let _ = write_lifecycle_report(
+            &lifecycle,
+            std::path::Path::new(evil),
+            false,
+            &mut out,
+            &mut err,
+        );
+        unsafe_in("lifecycle report", &String::from_utf8(err).unwrap());
+
+        let services = json!({
+            "enabled_projects": [evil],
+            "projects": [{"root": evil, "state": evil, "vm": evil, "reason": evil}],
+            "vm": evil, "state": evil, "root": evil, "holder": evil,
+            "internet": {"effective": evil},
+        });
+        for request in [
+            marsh_daemon::ServicesRequest::Status { root: evil.into() },
+            marsh_daemon::ServicesRequest::Start { root: evil.into() },
+            marsh_daemon::ServicesRequest::Internet {
+                root: evil.into(),
+                on: true,
+            },
+        ] {
+            let mut out = Vec::new();
+            write_services(&mut out, &request, &services).unwrap();
+            unsafe_in("services", &String::from_utf8(out).unwrap());
+        }
+
+        let jobs = json!({"schema": "marsh.jobs.v1", "jobs": [{
+            "cursor": 1, "job_id": evil, "command": "c", "placement": "local",
+            "state": "finished", "cleanup": "verified", "wall_ms": 1,
+            "exit_code": 0, "parent": evil,
+        }]});
+        let mut out = Vec::new();
+        write_results(&mut out, jobs).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("x?]52;c;AAAA?y?z"), "{out:?}");
+        unsafe_in("results list", &out);
+
+        let report = marsh_daemon::VmGcReport::default();
+        let mut out = Vec::new();
+        write_gc_report(&mut out, &report).unwrap();
     }
 
     #[test]

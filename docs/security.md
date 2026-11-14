@@ -66,14 +66,34 @@ beyond mounted files, as described [below](#mcp-connections).
 The host control directory, the install, and Kit sources are never mounted.
 marsh refuses to start in a directory that contains them.
 
-Text a job chose (command names and arguments, an agent call's summary,
-labels, error text the daemon relays) reaches your terminal only through one
-filter, `marsh_contracts::terminal::display_safe`: escape sequences, other
-control characters and bidirectional overrides print as `?`. That covers
-`marsh results`, `marsh jobs`, `marsh status`, `marsh gc`, `marsh services`,
-cloud notices and messages, error text, and `marsh cloud diff` on a terminal
-(piped, the patch stays exact). A job's own output stream (`marsh cloud
-attach`, agent replies) is raw by design, as in any terminal.
+Text a job, a Kit or a cloud run chose (command names and arguments, an agent
+call's summary, labels, a run's failure detail, file names in an error) is
+shown on your terminal through one filter,
+`marsh_contracts::terminal::display_safe`. It replaces with `?` the C0 and C1
+controls (so escape sequences), the line and paragraph separators, the
+bidirectional embedding, override and isolate controls, and invisible
+characters that hide text (zero-width space, BOM, word joiner, the tag block).
+Right-to-left marks, CJK, combining marks and joined emoji are kept; a
+zero-width joiner that joins nothing is replaced.
+
+Where it applies on the Mac: `marsh results` and `results show`, `marsh status`,
+`gc`, `services` and `workers stop`, the `stop`/`reset` summary, cloud finish
+notices and `marsh cloud` messages and job lines, daemon errors (`DaemonError`
+text, and every `marsh: ...` error line), shell notices and control errors, and
+`mcp publish` and `acp` status text. The filter runs where the text is
+printed, and a test per path feeds it a controlled string.
+
+Left as the workload wrote it:
+- the output stream of a job or a cloud run (`marsh cloud attach` replays its
+  stdout and stderr), an agent's replies, and the shell itself, all of which
+  are the program's own terminal output;
+- `marsh cloud diff` when it is piped, so the patch stays exact (on a terminal
+  it is filtered);
+- JSON output (`--json`), where control characters are escaped by JSON;
+- the daemon's log files;
+- the status lines of `marsh` helper commands that run inside the VM (`split`,
+  `fanout`, `limits`): they print to the same terminal as the job itself and
+  are not filtered. (`marsh jobs` and `acp` status, which also run there, are.)
 
 ### Shell VM
 

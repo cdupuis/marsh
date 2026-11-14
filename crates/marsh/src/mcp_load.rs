@@ -264,7 +264,10 @@ impl HostPublication {
             marsh_daemon::write_frame(channel, &PublicationHostEvent::Complete(outcome.clone()))
                 .map_err(|error| RunError::new(format!("publication result delivery lost: {error}; inspect state before retrying"), 125))?;
         } else if let PublicationOutcome::Committed(commit) = &outcome {
-            println!("{}", commit.message);
+            println!(
+                "{}",
+                marsh_contracts::terminal::display_safe_text(&commit.message)
+            );
         }
         result.map_err(|error| {
             RunError::new(

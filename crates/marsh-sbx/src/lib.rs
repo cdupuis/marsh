@@ -187,6 +187,8 @@ struct PreparationTimeouts {
     build: Duration,
     load: Duration,
     docker: Duration,
+    /// A retained worker's Start frame must be written within this.
+    start_write: Duration,
 }
 
 impl Default for PreparationTimeouts {
@@ -197,6 +199,7 @@ impl Default for PreparationTimeouts {
             build: PREPARATION_BUILD_TIMEOUT,
             load: PREPARATION_LOAD_TIMEOUT,
             docker: PREPARATION_DOCKER_TIMEOUT,
+            start_write: KEEPALIVE_READY_TIMEOUT,
         }
     }
 }
@@ -2167,14 +2170,12 @@ impl StockSbx {
         validate_name(vm)?;
         let (vm_transition, _vm_cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, vm.to_owned());
-        let _vm_transition = vm_transition
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _vm_transition =
+            fence_write_before(&vm_transition, deadline, "reset a stale scope Kit VM")?;
         let (stock_operation, _stock_cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, vm.to_owned());
-        let _stock_operation = stock_operation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _stock_operation =
+            stock_operation_before(&stock_operation, deadline, "reset a stale scope Kit VM")?;
         {
             let mut references = self
                 .grant_mount_references
@@ -2294,14 +2295,12 @@ impl StockSbx {
         validate_name(name)?;
         let (vm_transition, _vm_cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, name.to_owned());
-        let _vm_transition = vm_transition
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _vm_transition =
+            fence_write_before(&vm_transition, deadline, "remove an unused Kit VM")?;
         let (stock_operation, _stock_cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, name.to_owned());
-        let _stock_operation = stock_operation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _stock_operation =
+            stock_operation_before(&stock_operation, deadline, "remove an unused Kit VM")?;
         self.reject_quarantined(name)?;
         match self.classify_vm(name, true)? {
             VmClass::Absent => return Ok(false),
@@ -2354,14 +2353,11 @@ impl StockSbx {
         validate_name(name)?;
         let (vm_transition, _vm_cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, name.to_owned());
-        let _vm_transition = vm_transition
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _vm_transition = fence_write_before(&vm_transition, deadline, "stop an idle Kit VM")?;
         let (stock_operation, _stock_cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, name.to_owned());
-        let _stock_operation = stock_operation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _stock_operation =
+            stock_operation_before(&stock_operation, deadline, "stop an idle Kit VM")?;
         self.reject_quarantined(name)?;
         let running = match self.classify_vm(name, true)? {
             VmClass::Absent => return Ok(KitVmStop::Absent),
@@ -2474,17 +2470,21 @@ impl StockSbx {
                 &name,
                 "retired for good: a `marsh workers stop` did not settle, or `marsh --dev` left it",
             );
+            let deadline = Instant::now() + PREPARATION_SBX_TIMEOUT;
             let (vm_transition, _vm_cleanup) =
                 weak_rw_transition_lock(&self.grant_vm_transition_locks, name.clone());
-            let _vm_transition = vm_transition
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let (stock_operation, _stock_cleanup) =
                 weak_mutex_transition_lock(&self.grant_stock_operation_locks, name.clone());
-            let _stock_operation = stock_operation
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match self.remove_retired_locked(&name, Instant::now() + PREPARATION_SBX_TIMEOUT) {
+            let result = fence_write_before(&vm_transition, deadline, "remove retired Kit VMs")
+                .and_then(|_vm_transition| {
+                    let _stock_operation = stock_operation_before(
+                        &stock_operation,
+                        deadline,
+                        "remove retired Kit VMs",
+                    )?;
+                    self.remove_retired_locked(&name, deadline)
+                });
+            match result {
                 Ok(()) => removed.push(name),
                 Err(error) => failed.push((name, error)),
             }
@@ -2510,14 +2510,12 @@ impl StockSbx {
         validate_name(&spec.name)?;
         let (vm_transition, _vm_cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, spec.name.clone());
-        let _vm_transition = vm_transition
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _vm_transition =
+            fence_write_before(&vm_transition, deadline, "replace an unhealthy Kit VM")?;
         let (stock_operation, _stock_cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, spec.name.clone());
-        let _stock_operation = stock_operation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _stock_operation =
+            stock_operation_before(&stock_operation, deadline, "replace an unhealthy Kit VM")?;
         self.reject_quarantined(&spec.name)?;
         if let VmClass::Foreign = self.classify_vm(&spec.name, true)? {
             return Err(SbxError::ForeignVm(spec.name.clone()));
@@ -2624,14 +2622,11 @@ impl StockSbx {
         validate_name(&spec.name)?;
         let (vm_transition, _vm_cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, spec.name.clone());
-        let _vm_transition = vm_transition
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _vm_transition = fence_write_before(&vm_transition, deadline, "retire a Kit VM")?;
         let (stock_operation, _stock_cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, spec.name.clone());
-        let _stock_operation = stock_operation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _stock_operation =
+            stock_operation_before(&stock_operation, deadline, "retire a Kit VM")?;
         let quarantined = self.reject_quarantined(&spec.name).is_err();
         match self.classify_vm(&spec.name, true)? {
             VmClass::Absent => {
@@ -5277,13 +5272,8 @@ impl StockSbx {
             generation: worker.generation,
             spec,
         };
-        let start_write = write_frame(
-            &mut *worker
-                .input
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            &request,
-        );
+        let start_write =
+            write_start_bounded(&worker, request, self.preparation_timeouts.start_write);
         if let Err(error) = start_write {
             worker
                 .routes
@@ -5384,20 +5374,19 @@ impl StockSbx {
 
     fn stop_quarantined_name(&self, vm: &str, reason: String) -> Result<(), SbxError> {
         self.quarantine_vm(vm, reason.clone());
+        let deadline = Instant::now() + self.preparation_timeouts.sbx;
         let (vm_transition, _vm_cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, vm.to_owned());
-        let _vm_transition = vm_transition
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _vm_transition =
+            fence_write_before(&vm_transition, deadline, "stop a quarantined worker")?;
         // A transition that began before the first publication can finish
         // before this write fence is acquired. Reassert quarantine while the
         // fence excludes every later transition and retained Start.
         self.quarantine_vm(vm, reason);
         let (stock_operation, _stock_cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, vm.to_owned());
-        let _stock_operation = stock_operation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _stock_operation =
+            stock_operation_before(&stock_operation, deadline, "stop a quarantined worker")?;
         if let Some(lease) = self
             .worker_leases
             .lock()
@@ -7639,6 +7628,31 @@ fn shell_admission_before_with<T>(
     }
 }
 
+/// The VM's write fence, taken by polling until `deadline`: a transition
+/// wedged behind a stock call must not hold recovery hostage behind it.
+/// Polling `try_write` does not queue as a blocking `write` would, so under
+/// steady overlapping readers (job starts, mounts) a recovery can lose every
+/// poll and fail with `LifecycleDeadline` instead of waiting its turn. That is
+/// loud and retryable, and the price of never hanging.
+fn fence_write_before<'a>(
+    lock: &'a RwLock<()>,
+    deadline: Instant,
+    operation: &'static str,
+) -> Result<std::sync::RwLockWriteGuard<'a, ()>, SbxError> {
+    shell_admission_before(|| lock.try_write(), deadline)
+        .map_err(|_| SbxError::LifecycleDeadline { operation })
+}
+
+/// The VM's stock-operation lock, taken by polling until `deadline`.
+fn stock_operation_before<'a>(
+    lock: &'a Mutex<()>,
+    deadline: Instant,
+    operation: &'static str,
+) -> Result<std::sync::MutexGuard<'a, ()>, SbxError> {
+    shell_admission_before(|| lock.try_lock(), deadline)
+        .map_err(|_| SbxError::LifecycleDeadline { operation })
+}
+
 /// Sentinel left behind after the real retained process has been transferred
 /// to bounded teardown. Concurrent observers must treat that lease as dead;
 /// they must never gain a second handle capable of replaying termination.
@@ -7656,6 +7670,35 @@ impl marsh_runtime::AttachedProcess for ReleasedAttachedProcess {
     fn terminate(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Writes a Start frame without letting a worker that stopped reading hold
+/// the VM's read fence forever. A write that outlives `timeout` is reported
+/// as failed, which the caller treats as an unconfirmed start (quarantine and
+/// stop); stopping the VM closes the pipe and ends the writer thread.
+fn write_start_bounded(
+    worker: &Arc<RetainedWorker>,
+    request: WorkerRequest,
+    timeout: Duration,
+) -> io::Result<()> {
+    let (send, receive) = mpsc::sync_channel(1);
+    let writing = Arc::clone(worker);
+    thread::spawn(move || {
+        let result = write_frame(
+            &mut *writing
+                .input
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            &request,
+        );
+        let _ = send.send(result.map_err(io::Error::other));
+    });
+    receive.recv_timeout(timeout).unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("the start frame write did not complete in {timeout:?}"),
+        ))
+    })
 }
 
 fn terminate_and_reap_process(

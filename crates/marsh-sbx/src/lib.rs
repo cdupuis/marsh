@@ -4291,7 +4291,9 @@ impl StockSbx {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = self
-            .run_os_in(
+            .run_bounded_in_os(
+                "evict idle grant",
+                self.preparation_timeouts.sbx,
                 source,
                 [OsStr::new("umount"), OsStr::new(vm), spec.as_os_str()],
             )
@@ -4387,28 +4389,36 @@ impl StockSbx {
         }
         Self::require_success(
             "pull immutable job image",
-            self.run([
+            self.run_bounded_os(
+                "pull immutable job image",
+                self.preparation_timeouts.load,
+                [
+                    "exec",
+                    "-u",
+                    "root",
+                    &vm.name,
+                    "docker",
+                    "pull",
+                    reference.as_str(),
+                ],
+            )?,
+        )?;
+        let inspected = self.run_bounded_os(
+            "inspect pulled job image",
+            self.preparation_timeouts.docker,
+            [
                 "exec",
                 "-u",
                 "root",
                 &vm.name,
                 "docker",
-                "pull",
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}",
                 reference.as_str(),
-            ])?,
+            ],
         )?;
-        let inspected = self.run([
-            "exec",
-            "-u",
-            "root",
-            &vm.name,
-            "docker",
-            "image",
-            "inspect",
-            "--format",
-            "{{.Id}}",
-            reference.as_str(),
-        ])?;
         let image_id = String::from_utf8_lossy(&inspected.stdout).trim().to_owned();
         if !inspected.succeeded() || !valid_image_id(&image_id) {
             return Err(SbxError::ImageVerificationFailed);
@@ -4488,18 +4498,22 @@ impl StockSbx {
     }
 
     fn published_image_id(&self, vm: &str, reference: &OciImage) -> Result<OciImage, SbxError> {
-        let inspected = self.run([
-            "exec",
-            "-u",
-            "root",
-            vm,
-            "docker",
-            "image",
-            "inspect",
-            "--format",
-            "{{.Id}}",
-            reference.as_str(),
-        ])?;
+        let inspected = self.run_bounded_os(
+            "inspect published job image",
+            self.preparation_timeouts.docker,
+            [
+                "exec",
+                "-u",
+                "root",
+                vm,
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                reference.as_str(),
+            ],
+        )?;
         let image_id = String::from_utf8_lossy(&inspected.stdout).trim().to_owned();
         if !inspected.succeeded() || !valid_image_id(&image_id) {
             return Err(SbxError::ImageVerificationFailed);
@@ -5413,7 +5427,14 @@ impl StockSbx {
             VmClass::Owned { .. } => {}
         }
         self.ownership.invalidate();
-        Self::require_success("stop quarantined worker", self.run(["stop", vm])?)
+        Self::require_success(
+            "stop quarantined worker",
+            self.run_bounded_os(
+                "stop quarantined worker",
+                self.preparation_timeouts.sbx,
+                ["stop", vm],
+            )?,
+        )
     }
 
     fn reject_quarantined(&self, vm: &str) -> Result<(), SbxError> {
@@ -6244,9 +6265,13 @@ impl StockSbx {
     }
 
     fn inspect_nested_image(&self, vm: &str, tag: &str) -> Result<OciImage, SbxError> {
-        let inspected = self.run([
-            "exec", "-u", "root", vm, "docker", "image", "inspect", "--format", "{{.Id}}", tag,
-        ])?;
+        let inspected = self.run_bounded_os(
+            "inspect local v3 kit image",
+            self.preparation_timeouts.docker,
+            [
+                "exec", "-u", "root", vm, "docker", "image", "inspect", "--format", "{{.Id}}", tag,
+            ],
+        )?;
         Self::require_success("inspect local v3 kit image", inspected.clone())?;
         let image_id = String::from_utf8_lossy(&inspected.stdout).trim().to_owned();
         if !valid_image_id(&image_id) {
@@ -7226,36 +7251,48 @@ impl StockSbx {
             .ok_or_else(|| SbxError::UnsafePath(PathBuf::from(destination)))?;
         Self::require_success(
             "prepare binary install directory",
-            self.run_os([
-                OsStr::new("exec"),
-                OsStr::new("-u"),
-                OsStr::new("root"),
-                OsStr::new(vm),
-                OsStr::new("install"),
-                OsStr::new("-d"),
-                OsStr::new("-m"),
-                OsStr::new("0755"),
-                parent.as_os_str(),
-            ])?,
+            self.run_bounded_os(
+                "prepare binary install directory",
+                self.preparation_timeouts.sbx,
+                [
+                    OsStr::new("exec"),
+                    OsStr::new("-u"),
+                    OsStr::new("root"),
+                    OsStr::new(vm),
+                    OsStr::new("install"),
+                    OsStr::new("-d"),
+                    OsStr::new("-m"),
+                    OsStr::new("0755"),
+                    parent.as_os_str(),
+                ],
+            )?,
         )?;
         let copied = format!("{vm}:{temporary}");
         Self::require_success(
             "copy trusted binary",
-            self.run_os([OsStr::new("cp"), source.as_os_str(), OsStr::new(&copied)])?,
+            self.run_bounded_os(
+                "copy trusted binary",
+                self.preparation_timeouts.sbx,
+                [OsStr::new("cp"), source.as_os_str(), OsStr::new(&copied)],
+            )?,
         )?;
         Self::require_success(
             "install trusted binary",
-            self.run_os([
-                OsStr::new("exec"),
-                OsStr::new("-u"),
-                OsStr::new("root"),
-                OsStr::new(vm),
-                OsStr::new("install"),
-                OsStr::new("-m"),
-                OsStr::new("0755"),
-                OsStr::new(temporary),
-                OsStr::new(destination),
-            ])?,
+            self.run_bounded_os(
+                "install trusted binary",
+                self.preparation_timeouts.sbx,
+                [
+                    OsStr::new("exec"),
+                    OsStr::new("-u"),
+                    OsStr::new("root"),
+                    OsStr::new(vm),
+                    OsStr::new("install"),
+                    OsStr::new("-m"),
+                    OsStr::new("0755"),
+                    OsStr::new(temporary),
+                    OsStr::new(destination),
+                ],
+            )?,
         )
     }
 
@@ -7263,11 +7300,15 @@ impl StockSbx {
         let marker = serde_json::to_string(&Self::marker(profile))?;
         Self::require_success(
             "write worker ownership marker",
-            self.run([
-                "exec", "-u", "root", "-e", &format!("MARSH_WORKER_MARKER={marker}"), vm,
-                "sh", "-c",
-                "umask 077; mkdir -p /var/lib/marsh; printf '%s\\n' \"$MARSH_WORKER_MARKER\" > /var/lib/marsh/worker.json",
-            ])?,
+            self.run_bounded_os(
+                "write worker ownership marker",
+                self.preparation_timeouts.sbx,
+                [
+                    "exec", "-u", "root", "-e", &format!("MARSH_WORKER_MARKER={marker}"), vm,
+                    "sh", "-c",
+                    "umask 077; mkdir -p /var/lib/marsh; printf '%s\\n' \"$MARSH_WORKER_MARKER\" > /var/lib/marsh/worker.json",
+                ],
+            )?,
         )
     }
 
@@ -7281,11 +7322,15 @@ impl StockSbx {
                     scope.spawn(move || {
                         Self::require_success(
                             "copy trusted binary",
-                            self.run_os([
-                                OsStr::new("cp"),
-                                source.as_os_str(),
-                                OsStr::new(&destination),
-                            ])?,
+                            self.run_bounded_os(
+                                "copy trusted binary",
+                                self.preparation_timeouts.sbx,
+                                [
+                                    OsStr::new("cp"),
+                                    source.as_os_str(),
+                                    OsStr::new(&destination),
+                                ],
+                            )?,
                         )
                     })
                 })
@@ -7357,7 +7402,11 @@ impl StockSbx {
             "-c".into(),
             SHELL_SETUP_SCRIPT.into(),
         ]);
-        let output = self.run_os(arguments)?;
+        let output = self.run_bounded_os(
+            "initialize shell VM",
+            self.preparation_timeouts.sbx,
+            arguments,
+        )?;
         if output.exit_code == Some(SHELL_USER_MISMATCH_EXIT) {
             return Err(SbxError::InvalidShellUser);
         }
@@ -7422,18 +7471,6 @@ impl StockSbx {
         let mut invocation = self.invocation(arguments);
         invocation.working_directory = Some(directory.to_owned());
         invocation
-    }
-
-    fn run<const N: usize>(&self, arguments: [&str; N]) -> Result<CommandOutput, SbxError> {
-        self.run_os(arguments.map(OsStr::new))
-    }
-
-    fn run_os<I, S>(&self, arguments: I) -> Result<CommandOutput, SbxError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        Ok(self.runner.run(&self.invocation(arguments))?)
     }
 
     fn run_bounded_os<I, S>(
@@ -7502,12 +7539,26 @@ impl StockSbx {
             })
     }
 
-    fn run_os_in<I, S>(&self, directory: &Path, arguments: I) -> Result<CommandOutput, SbxError>
+    fn run_bounded_in_os<I, S>(
+        &self,
+        operation: &'static str,
+        timeout: Duration,
+        directory: &Path,
+        arguments: I,
+    ) -> Result<CommandOutput, SbxError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        Ok(self.runner.run(&self.invocation_in(directory, arguments))?)
+        self.runner
+            .run_bounded(&self.invocation_in(directory, arguments), timeout)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::TimedOut {
+                    SbxError::PreparationTimeout { operation, timeout }
+                } else {
+                    SbxError::Io(error)
+                }
+            })
     }
 
     fn require_success(operation: &'static str, output: CommandOutput) -> Result<(), SbxError> {

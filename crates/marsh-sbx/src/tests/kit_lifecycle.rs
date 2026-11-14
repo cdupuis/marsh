@@ -499,6 +499,23 @@ fn quarantine_stop_stops_only_its_vm_and_rejects_reuse_before_any_effect() {
 }
 
 #[test]
+fn a_quarantine_stop_that_never_answers_expires_typed_instead_of_hanging() {
+    let model = StockModel::new();
+    let (adapter, _kit, ready) = warm_kit(&model, KIT);
+    model.fault(verb("stop"), Fault::TimedOut { applied: false });
+
+    assert!(matches!(
+        adapter.stop_quarantined(&ready),
+        Err(SbxError::PreparationTimeout {
+            operation: "stop quarantined worker",
+            ..
+        })
+    ));
+    assert!(model.vm(KIT).unwrap().running);
+    assert_eq!(model.bounds_of("stop").len(), 1);
+}
+
+#[test]
 fn a_first_create_is_not_bounded_like_other_stock_calls() {
     // `sbx create` downloads the Kit's image on a cold host: it gets its own
     // generous bound, never the 5-minute one of ordinary stock calls, so a

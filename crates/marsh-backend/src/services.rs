@@ -314,7 +314,9 @@ impl StockDaemonBackend {
                     .owned_services_vms()
                     .into_iter()
                     .filter(|(name, _)| {
-                        inventory.get(name).is_some_and(|vm| vm.status == "running")
+                        inventory
+                            .get(name)
+                            .is_some_and(marsh_sbx::StockInventoryVm::possibly_running)
                     })
                     .map(|(_, key)| PathBuf::from(key))
                     .collect()
@@ -1180,7 +1182,9 @@ impl StockDaemonBackend {
                 owned
                     .iter()
                     .filter(|(name, _)| {
-                        inventory.get(name).is_some_and(|vm| vm.status == "running")
+                        inventory
+                            .get(name)
+                            .is_some_and(marsh_sbx::StockInventoryVm::possibly_running)
                     })
                     .filter_map(|(_, key)| {
                         let path = PathBuf::from(key);

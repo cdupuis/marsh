@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const MAX_VMS: usize = 256;
+const MAX_VMS: usize = 4096;
 const MAX_DOCUMENT: usize = 4 * 1024 * 1024;
 
 fn invalid(message: &str) -> SbxError {
@@ -23,6 +23,16 @@ pub struct StockInventoryVm {
     /// When stock SBX last ran something in it (RFC 3339), if it says.
     #[serde(default)]
     pub last_used_at: Option<String>,
+}
+
+impl StockInventoryVm {
+    /// Whether the VM may be running: anything but `stopped`. A state marsh
+    /// does not know (a VM being created or started) is never taken for
+    /// stopped, so nothing removes or skips it as idle.
+    #[must_use]
+    pub fn possibly_running(&self) -> bool {
+        self.status != "stopped"
+    }
 }
 
 /// Validated complete inventory data, not source-observation authority. No
@@ -79,42 +89,43 @@ impl StockInventory {
                 return Err(invalid("stock inventory row without a name and id"));
             };
             let ours = name.starts_with("marsh-");
-            let mut vm = if ours {
-                serde_json::from_value::<StockInventoryVm>(row.clone())
-                    .map_err(|_| invalid("incomplete stock inventory row"))?
-            } else {
-                StockInventoryVm {
-                    name: name.to_owned(),
-                    id: id.to_owned(),
-                    status: object
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|status| {
-                            !status.is_empty()
-                                && status.len() <= 64
-                                && !status.chars().any(char::is_control)
-                        })
-                        .unwrap_or("unknown")
-                        .to_owned(),
-                    agent: None,
-                    workspaces: None,
-                    last_used_at: None,
-                }
+            let text = |key: &str| object.get(key).and_then(serde_json::Value::as_str);
+            let status = text("status").filter(|status| {
+                !status.is_empty() && status.len() <= 64 && !status.chars().any(char::is_control)
+            });
+            // Any state name is kept: a VM of ours still being created or
+            // started has one marsh does not know, and rejecting it would fail
+            // every operation for every VM. A row of ours must still have a
+            // status; another tool's may lack one.
+            let status = match (status, ours) {
+                (Some(status), _) => status,
+                (None, false) => "unknown",
+                (None, true) => return Err(invalid("incomplete stock inventory row")),
+            };
+            let mut vm = StockInventoryVm {
+                name: name.to_owned(),
+                id: id.to_owned(),
+                status: status.to_owned(),
+                agent: text("agent").filter(|_| ours).map(str::to_owned),
+                // Paths are informational: a malformed list is no list.
+                workspaces: object
+                    .get("workspaces")
+                    .filter(|_| ours)
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|paths| {
+                        paths
+                            .iter()
+                            .map(|path| path.as_str().map(PathBuf::from))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .filter(|paths| paths.iter().all(|path| metadata_path(path))),
+                last_used_at: text("last_used_at").filter(|_| ours).map(str::to_owned),
             };
             vm.id.make_ascii_lowercase();
             let sound = valid_uuid(&vm.id)
                 && !vm.name.is_empty()
                 && vm.name.len() <= 256
-                && if ours {
-                    valid_name(&vm.name)
-                        && matches!(vm.status.as_str(), "running" | "stopped")
-                        && vm
-                            .workspaces
-                            .as_ref()
-                            .is_none_or(|paths| paths.iter().all(|path| metadata_path(path)))
-                } else {
-                    true
-                };
+                && (!ours || valid_name(&vm.name));
             if !sound || !ids.insert(vm.id.clone()) || vms.contains_key(&vm.name) {
                 return Err(invalid(
                     "ambiguous, changing or unsupported stock inventory identity/state",
@@ -254,12 +265,74 @@ mod tests {
             assert!(StockInventory::decode(format!("[{broken}]").as_bytes()).is_err());
         }
         for ours_bad in [
-            ours.replace("running", "paused"),
             ours.replace("\"status\":\"running\"", "\"status\":7"),
-            ours.replace("running\"", "running\",\"workspaces\":[\"relative\"]"),
+            ours.replace("\"name\":\"marsh-k-aaaaaaaa\"", "\"name\":\"marsh-k-a/b\""),
         ] {
             assert!(StockInventory::decode(format!("[{ours_bad}]").as_bytes()).is_err());
         }
+    }
+
+    /// Audit B-05: one of marsh's own VMs in a state or shape marsh does not
+    /// know (a VM still being created, a workspace path that is not absolute)
+    /// must not fail the whole listing, and with it every operation. Its
+    /// identity is sound, so the VM stays listed under its name.
+    #[test]
+    fn a_marsh_vm_in_a_transient_state_or_with_an_odd_workspace_keeps_the_listing() {
+        let ours = r#"{"name":"marsh-k-aaaaaaaa","id":"0f1e2d3c-4b5a-4978-8695-a4b3c2d1e0f9","status":"running"}"#;
+        for odd in [
+            ours.replace("running", "creating"),
+            ours.replace("running", "starting"),
+            ours.replace("running\"", "running\",\"workspaces\":[\"relative\"]"),
+            ours.replace("running\"", "running\",\"workspaces\":\"/not/a/list\""),
+        ] {
+            let decoded = StockInventory::decode(format!("[{odd}]").as_bytes()).unwrap();
+            let vm = decoded.get("marsh-k-aaaaaaaa").unwrap();
+            assert_eq!(vm.id, "0f1e2d3c-4b5a-4978-8695-a4b3c2d1e0f9");
+            assert!(vm.workspaces.is_none());
+        }
+    }
+
+    #[test]
+    fn only_stopped_is_not_possibly_running() {
+        let row = |status: &str| {
+            let listing = format!(
+                r#"[{{"name":"marsh-k-aaaaaaaa","id":"0f1e2d3c-4b5a-4978-8695-a4b3c2d1e0f9","status":"{status}"}}]"#
+            );
+            StockInventory::decode(listing.as_bytes()).unwrap()
+        };
+        for (status, running) in [
+            ("running", true),
+            ("stopped", false),
+            ("starting", true),
+            ("creating", true),
+            ("stopping", true),
+        ] {
+            assert_eq!(
+                row(status)
+                    .get("marsh-k-aaaaaaaa")
+                    .unwrap()
+                    .possibly_running(),
+                running,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_listing_is_decoded_and_an_absurd_one_is_not() {
+        let rows = |count: usize| {
+            (0..count)
+                .map(|index| {
+                    format!(
+                        r#"{{"name":"other-{index}","id":"{index:08x}-4b5a-4978-8695-a4b3c2d1e0f9","status":"running"}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let decoded = StockInventory::decode(format!("[{}]", rows(300)).as_bytes()).unwrap();
+        assert!(decoded.get("other-299").is_some());
+        assert!(StockInventory::decode(format!("[{}]", rows(5000)).as_bytes()).is_err());
     }
 
     #[test]

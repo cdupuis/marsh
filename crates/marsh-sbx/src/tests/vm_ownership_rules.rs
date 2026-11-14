@@ -560,6 +560,30 @@ fn no_create_is_submitted_while_a_restored_intent_is_not_durable() {
 }
 
 #[test]
+fn a_marsh_vm_caught_in_a_transient_state_stays_owned_and_is_never_taken_for_stopped() {
+    let ownership = VmOwnership::in_memory();
+    let name = ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
+    let uuid = "0f1e2d3c-4b5a-4978-8695-a4b3c2d1e0f9";
+    ownership.record(&name, uuid).unwrap();
+    let listing = |status: &str| {
+        StockInventory::decode(
+            format!(r#"[{{"name":"{name}","id":"{uuid}","status":"{status}"}}]"#).as_bytes(),
+        )
+        .unwrap()
+    };
+    for (status, running) in [("running", true), ("stopped", false), ("starting", true)] {
+        assert_eq!(
+            ownership.classify(&listing(status), &name),
+            VmClass::Owned {
+                uuid: uuid.into(),
+                running
+            },
+            "{status}"
+        );
+    }
+}
+
+#[test]
 fn ownership_mirror_holds_every_intent_before_create_and_tracks_removal() {
     let control = scratch();
     let registry = scratch();

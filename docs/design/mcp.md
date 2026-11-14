@@ -100,9 +100,9 @@ scope root, in the owner-only `marsh-mcp-scopes` directory, keyed on the
 canonical scope root (every spelling of it names one broker). A scope root
 elsewhere, or a path too long for a socket, uses `/tmp/marsh-mcp-<uid>-<key>`,
 which another local user can still squat (a denial of service, not access).
-A broker started by an earlier build listens under `/tmp`: stop it
-(`marsh mcp stop`) before the first start of this build, or it keeps the scope
-lease.
+A broker started by an earlier build listens under `/tmp` and this build
+cannot see it: run `marsh mcp stop` with the earlier build before upgrading, or
+end that `marsh-mcp broker-run` process, or it keeps the scope lease.
 
 Before creating or using a scope home, the server binds every managed root to
 the canonical path and filesystem identity of the configured workspace. A

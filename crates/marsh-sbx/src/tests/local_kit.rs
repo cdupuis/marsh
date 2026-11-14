@@ -583,9 +583,13 @@ struct LoadCarrier {
 
 #[derive(Clone, Copy)]
 enum LoadMode {
-    Pressure { fail_write: bool },
+    Pressure {
+        fail_write: bool,
+    },
     Blocked,
     Rejected,
+    /// Output that ends at once while the process keeps running.
+    EofWhileAlive,
 }
 
 impl CommandRunner for LoadCarrier {
@@ -633,6 +637,17 @@ impl CommandRunner for LoadCarrier {
                 }),
                 control: no_attachment_control(),
             },
+            LoadMode::EofWhileAlive => Attachment {
+                stdin: Box::new(io::sink()),
+                stdout: Box::new(Cursor::new(b"archive".to_vec())),
+                stderr: Box::new(Cursor::new(Vec::new())),
+                process: Box::new(TrackingProcess {
+                    tracking,
+                    complete_immediately: false,
+                    exit_code: 0,
+                }),
+                control: no_attachment_control(),
+            },
             LoadMode::Rejected => Attachment {
                 stdin: Box::new(PressureWriter {
                     drained: Arc::new(Drained::default()),
@@ -672,6 +687,104 @@ fn load_archive(mode: LoadMode) -> (Arc<Tracking>, Result<(), SbxError>) {
         result
     });
     (tracking, result)
+}
+
+/// Audit B-07: a `docker image save` that stays silent used to hold its
+/// thread, its claim and its `sbx exec` child forever: the deadline was only
+/// looked at after a read returned.
+#[test]
+fn a_silent_image_save_ends_at_its_deadline_and_reaps_its_child() {
+    let tracking = Arc::new(Tracking::default());
+    let runner = Arc::new(LoadCarrier {
+        tracking: Arc::clone(&tracking),
+        mode: LoadMode::Blocked,
+    });
+    let cache = scratch();
+    let reference =
+        OciImage::parse(format!("registry.example/kit@sha256:{}", "a".repeat(64))).unwrap();
+    let invocation = Invocation {
+        program: "sbx".into(),
+        arguments: vec!["exec".into()],
+        working_directory: None,
+        environment: Vec::new(),
+    };
+    let result = bounded({
+        let (reference, invocation) = (reference.clone(), invocation);
+        let directory = cache.path().to_owned();
+        move || {
+            store_published_image(
+                runner.as_ref(),
+                &invocation,
+                &directory,
+                &reference,
+                Duration::from_millis(100),
+            )
+        }
+    });
+    assert!(result.is_err(), "{result:?}");
+    assert!(tracking.terminated.load(Ordering::SeqCst));
+    assert!(tracking.reaped.load(Ordering::SeqCst));
+    assert!(cached_published_image(cache.path(), &reference).is_none());
+}
+
+/// Review of B-07: a save whose output ends while its child lives on used to
+/// be waited for and then only retained, never terminated.
+#[test]
+fn an_image_save_that_ends_its_output_but_not_its_child_has_the_child_terminated() {
+    let tracking = Arc::new(Tracking::default());
+    let runner = Arc::new(LoadCarrier {
+        tracking: Arc::clone(&tracking),
+        mode: LoadMode::EofWhileAlive,
+    });
+    let cache = scratch();
+    let reference =
+        OciImage::parse(format!("registry.example/kit@sha256:{}", "b".repeat(64))).unwrap();
+    let invocation = Invocation {
+        program: "sbx".into(),
+        arguments: vec!["exec".into()],
+        working_directory: None,
+        environment: Vec::new(),
+    };
+    let directory = cache.path().to_owned();
+    let result = bounded(move || {
+        store_published_image(
+            runner.as_ref(),
+            &invocation,
+            &directory,
+            &reference,
+            Duration::from_millis(100),
+        )
+    });
+    assert!(tracking.terminated.load(Ordering::SeqCst), "{result:?}");
+    assert!(tracking.reaped.load(Ordering::SeqCst));
+}
+
+/// A save child that survives termination is retained for reaping, never
+/// dropped, after being asked to end once.
+#[test]
+fn a_save_child_that_survives_termination_is_retained_not_dropped() {
+    struct Stubborn(Arc<AtomicBool>);
+    impl AttachedProcess for Stubborn {
+        fn wait(&mut self) -> io::Result<i32> {
+            Ok(0)
+        }
+        fn try_wait(&mut self) -> io::Result<Option<i32>> {
+            Ok(None)
+        }
+        fn terminate(&mut self) -> io::Result<()> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let terminated = Arc::new(AtomicBool::new(false));
+    let before = marsh_runtime::retained_processes().len();
+    let result = reap_within(
+        Box::new(Stubborn(Arc::clone(&terminated))),
+        Duration::from_millis(20),
+    );
+    assert!(matches!(result, Err(ref error) if error.kind() == io::ErrorKind::TimedOut));
+    assert!(terminated.load(Ordering::SeqCst));
+    assert_eq!(marsh_runtime::retained_processes().len(), before + 1);
 }
 
 #[test]

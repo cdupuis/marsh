@@ -7745,6 +7745,10 @@ fn terminate_and_reap_process(
                 thread::sleep(RETAINED_PROCESS_POLL_INTERVAL.min(remaining));
             }
         })();
+        // A child that did not end stays visible and owned, never dropped.
+        if result.is_err() {
+            marsh_runtime::retain_for_reaping(process);
+        }
         let _ = send.send(result);
     });
     match receive.recv_timeout(timeout) {
@@ -8238,30 +8242,52 @@ fn store_published_image(
     let mut process = attachment.process;
     let mut stdout = attachment.stdout;
     let mut stderr = attachment.stderr;
-    let drained = thread::spawn(move || io::copy(&mut stderr, &mut io::sink()));
+    thread::spawn(move || io::copy(&mut stderr, &mut io::sink()));
+    // The copy runs on its own thread: a save that stays silent blocks its
+    // read, and only the deadline below can end it.
+    let copier = thread::spawn(move || {
+        let copied = (|| -> io::Result<u64> {
+            let mut total = 0_u64;
+            let mut buffer = vec![0_u8; 1 << 20];
+            loop {
+                let count = stdout.read(&mut buffer)?;
+                if count == 0 {
+                    return Ok(total);
+                }
+                total += count as u64;
+                if total > PUBLISHED_IMAGE_ARCHIVE_LIMIT {
+                    return Err(io::Error::other("published image archive over its bound"));
+                }
+                staged.as_file_mut().write_all(&buffer[..count])?;
+            }
+        })();
+        (copied, staged)
+    });
     let deadline = Instant::now() + timeout;
-    let copied = (|| -> io::Result<u64> {
-        let mut total = 0_u64;
-        let mut buffer = vec![0_u8; 1 << 20];
-        loop {
-            let count = stdout.read(&mut buffer)?;
-            if count == 0 {
-                return Ok(total);
-            }
-            total += count as u64;
-            if total > PUBLISHED_IMAGE_ARCHIVE_LIMIT || Instant::now() >= deadline {
-                return Err(io::Error::other("published image archive over its bound"));
-            }
-            staged.as_file_mut().write_all(&buffer[..count])?;
-        }
-    })();
-    if copied.is_err() {
+    while !copier.is_finished() && Instant::now() < deadline {
+        thread::sleep(RETAINED_PROCESS_POLL_INTERVAL);
+    }
+    if !copier.is_finished() {
+        // The copier ends when its read does: cancelling the child's I/O and
+        // terminating it wakes the read.
+        let _ = process.cancel_io();
+        let _ = process.terminate();
+        let _ = reap_within(process, timeout.min(RETAINED_PROCESS_TEARDOWN_TIMEOUT));
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "published image save exceeded its deadline",
+        )
+        .into());
+    }
+    let (outcome, staged) = copier
+        .join()
+        .map_err(|_| io::Error::other("image save copier panicked"))?;
+    if outcome.is_err() {
         let _ = process.terminate();
     }
-    let status = process.wait();
-    let _ = drained.join();
-    let copied = copied?;
-    if status? != 0 || copied == 0 {
+    let status = reap_within(process, timeout.min(RETAINED_PROCESS_TEARDOWN_TIMEOUT));
+    let bytes = outcome?;
+    if status? != 0 || bytes == 0 {
         return Err(SbxError::ImageVerificationFailed);
     }
     staged.as_file().sync_all()?;
@@ -8281,6 +8307,40 @@ fn store_published_image(
         .map_err(|error| error.error)?;
     prune_kit_image_cache(directory, SystemTime::now());
     Ok(())
+}
+
+/// Waits up to `grace` for `process` to exit; one that has not is cancelled
+/// and terminated, and waited for another `grace`. One that still has not
+/// stays retained for reaping instead of being dropped.
+fn reap_within(
+    mut process: Box<dyn marsh_runtime::AttachedProcess>,
+    grace: Duration,
+) -> io::Result<i32> {
+    for terminate in [false, true] {
+        if terminate {
+            let _ = process.cancel_io();
+            let _ = process.terminate();
+        }
+        let deadline = Instant::now() + grace;
+        loop {
+            match process.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(RETAINED_PROCESS_POLL_INTERVAL);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    marsh_runtime::retain_for_reaping(process);
+                    return Err(error);
+                }
+            }
+        }
+    }
+    marsh_runtime::retain_for_reaping(process);
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the image save did not exit after termination",
+    ))
 }
 
 fn evict_kit_image_cache(directory: &Path, build: &LocalBuild) {

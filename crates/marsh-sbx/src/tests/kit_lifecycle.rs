@@ -759,6 +759,36 @@ fn retained_worker_teardown_is_bounded_when_termination_wedges() {
     wedge.release();
 }
 
+/// Audit B-07: a worker that outlives its termination used to be dropped
+/// when the bounded teardown gave up: a zombie nobody could see or reap.
+#[test]
+fn a_worker_that_survives_termination_stays_retained_for_reaping() {
+    let model = StockModel::new();
+    model.survive_worker_termination();
+    let adapter = Arc::new(
+        StockSbx::new("sbx", Arc::clone(&model) as Arc<dyn CommandRunner>)
+            .with_retained_process_teardown_timeout(Duration::from_millis(30)),
+    );
+    let kit = KitFixture::published(KIT);
+    adapter.ensure_kit_vm(&kit.spec).unwrap();
+    let before = marsh_runtime::retained_processes().len();
+
+    let reset = {
+        let adapter = Arc::clone(&adapter);
+        let spec = kit.spec.clone();
+        bounded(move || adapter.reset_kit_vm(&spec))
+    };
+    assert!(matches!(
+        reset,
+        Err(SbxError::Io(ref error)) if error.kind() == io::ErrorKind::TimedOut
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while marsh_runtime::retained_processes().len() <= before && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(marsh_runtime::retained_processes().len(), before + 1);
+}
+
 /// A Kit VM keeps a grant mount for every project it worked in. Once one is
 /// deleted, stock refuses to start the stopped VM; the next daemon (an
 /// upgrade, a restart) drops that saved mount and reuses the VM, instead of

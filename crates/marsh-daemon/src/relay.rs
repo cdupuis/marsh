@@ -1094,6 +1094,15 @@ fn writer_failed(
     Some(TunnelFrame::Finished { connection })
 }
 
+/// Whether this connection (this identity of it) is still in the map.
+fn registered(connections: &Connections, connection: u64, identity: &Arc<()>) -> bool {
+    connections
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&connection)
+        .is_some_and(|client| Arc::ptr_eq(&client.identity, identity))
+}
+
 fn writer_eof(connections: &Connections, connection: u64, identity: &Arc<()>) -> bool {
     let mut guard = connections
         .lock()
@@ -1298,6 +1307,13 @@ fn register_connection_as<W: Write + Send + 'static>(
                 ConnectionWrite::Data(bytes) => {
                     let failed = !unwritable && stream.write_all(&bytes).is_err();
                     pending_chunks.fetch_sub(1, Ordering::AcqRel);
+                    // A connection closed here meanwhile (a teardown, an abort)
+                    // has nothing left to credit: crediting would let the far
+                    // side's source run on, its data thrown away, until that
+                    // side is torn down too.
+                    if (failed || unwritable) && !registered(&connections, connection, &identity) {
+                        return;
+                    }
                     if send(&tunnel, &TunnelFrame::Credit { connection }).is_err() {
                         break;
                     }
@@ -2051,6 +2067,45 @@ mod tests {
         writer.join().unwrap();
         assert!(was_waiting, "producer did not wait for remote credit");
         assert!(result.is_err(), "teardown did not wake the blocked source");
+    }
+
+    /// The connection is closed here while its writer is blocked on a peer
+    /// that does not read, with chunks queued behind it. The writer then
+    /// fails, and must not return credit for the chunks it throws away: that
+    /// would let the far side's source (the daemon's producer) run on, its
+    /// data discarded and its writes succeeding, until the far relay is torn
+    /// down too.
+    #[test]
+    fn a_connection_closed_here_gives_no_credit_for_what_it_throws_away() {
+        let connections: Connections = Arc::default();
+        let (stream, _unread) = socket_pair();
+        let tunnel = Arc::new(Mutex::new(Vec::new()));
+        let _reader = register_connection(1, stream, &connections, &tunnel).unwrap();
+        let chunk = vec![b'x'; CHUNK_BYTES];
+        for _ in 0..MAX_PENDING_CHUNKS {
+            forward_data(&connections, &tunnel, 1, chunk.clone()).unwrap();
+        }
+        let credits = || {
+            let sent = tunnel.lock().unwrap().clone();
+            let mut sent = Cursor::new(sent);
+            let mut credits = 0;
+            while let Ok(frame) = read_frame::<TunnelFrame>(&mut sent) {
+                credits += usize::from(matches!(frame, TunnelFrame::Credit { .. }));
+            }
+            credits
+        };
+        // The peer's buffers fill, and the writer blocks with chunks queued.
+        thread::sleep(Duration::from_millis(300));
+        let before = credits();
+        assert!(before < MAX_PENDING_CHUNKS, "the writer never blocked");
+        close_all_connections(&connections);
+        thread::sleep(Duration::from_millis(300));
+        // At most the chunk that was being written when the peer was cut.
+        assert!(
+            credits() <= before + 1,
+            "{} credits after {before}",
+            credits()
+        );
     }
 
     #[test]

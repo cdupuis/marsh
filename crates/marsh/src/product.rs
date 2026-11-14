@@ -1854,6 +1854,29 @@ mod tests {
     }
 
     #[test]
+    fn status_prints_no_terminal_control_from_names_and_paths() {
+        let status = json!({
+            "schema": "marsh.status.v1", "features": [], "scope_id": "s\u{1b}[2J",
+            "daemon_id": "d", "endpoint_owner": {"pid": 1, "uid": 1},
+            "current_session_id": null, "control_home": "/h\u{1b}]0;t\u{7}",
+            "job_defaults": null, "shells": [],
+            "workers": [{"worker_id": "w", "vm_id": "vm\u{1b}[31m", "scope_id": "s",
+                "kit_profile": "k", "kits": ["a\u{9b}"], "warm": true, "health": "ready",
+                "container_capacity": 1, "active_container_ids": [],
+                "quarantine": {"reason": "bad\u{1b}[2J", "since": 0}}],
+        });
+        let mut out = Vec::new();
+        write_status(&mut out, status).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("scope:        s?[2J"), "{out:?}");
+        assert!(
+            !out.chars()
+                .any(|c| marsh_contracts::terminal::is_terminal_unsafe(c) && c != '\n'),
+            "{out:?}"
+        );
+    }
+
+    #[test]
     fn status_lists_the_skills_the_mirror_changed() {
         let mirror = marsh_daemon::SkillsMirrorStatus {
             enabled: true,

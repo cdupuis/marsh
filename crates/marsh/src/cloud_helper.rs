@@ -39,6 +39,10 @@ fn privileged() -> bool {
 }
 
 fn state_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = tests::STATE_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
     PathBuf::from(if privileged() { STATE } else { USER_STATE })
 }
 
@@ -61,6 +65,18 @@ fn lock_privileges_if(root: bool) -> io::Result<()> {
     #[cfg(not(target_os = "linux"))]
     let _ = root;
     Ok(())
+}
+
+/// The at-most-once start: an exclusive marker in the state directory, so a
+/// run whose start was not confirmed to the host and is retried refuses
+/// instead of running the command again.
+fn claim_start() -> io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(state_dir()?.join("started"))
+        .map(drop)
 }
 
 /// The helper the workload runs (its shell) and command links name.
@@ -684,14 +700,7 @@ fn run() -> i32 {
     );
     // At most once per sandbox: a run whose start was not confirmed to the
     // host may be retried, and must then refuse rather than run again.
-    let claimed = state_dir().and_then(|state| {
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(state.join("started"))
-    });
-    if let Err(error) = claimed {
+    if let Err(error) = claim_start() {
         eprintln!("marsh cloud: the command was already started in this sandbox: {error}");
         return 125;
     }
@@ -1351,6 +1360,10 @@ fn report_ignored(count: u64) {
 /// sync`), on stdout. It is staged first: a file the workload is writing
 /// may change size while it is read, and then the walk is retried.
 fn sync_delta(root: &Path) -> io::Result<()> {
+    sync_into(root, &mut io::stdout().lock())
+}
+
+fn sync_into(root: &Path, out: &mut dyn Write) -> io::Result<()> {
     let state = state_dir()?;
     let staged = state.join("sync.delta");
     let mut last = None;
@@ -1358,8 +1371,7 @@ fn sync_delta(root: &Path) -> io::Result<()> {
         match write_delta(root, Box::new(File::create(&staged)?)) {
             Ok(ignored) => {
                 let mut file = File::open(&staged)?;
-                let mut out = io::stdout().lock();
-                io::copy(&mut file, &mut out)?;
+                io::copy(&mut file, out)?;
                 let _ = fs::remove_file(&staged);
                 out.flush()?;
                 report_ignored(ignored);
@@ -1376,8 +1388,12 @@ fn sync_delta(root: &Path) -> io::Result<()> {
 /// SHA-256) become the baseline for those paths, so later deltas carry only
 /// newer changes.
 fn rebase() -> io::Result<()> {
+    rebase_from(io::stdin().lock())
+}
+
+fn rebase_from(input: impl io::Read) -> io::Result<()> {
     let mut entries = baseline()?;
-    let mut reader = Reader::new(BufReader::new(io::stdin().lock()), cloud::MAX_ARCHIVE)?;
+    let mut reader = Reader::new(BufReader::new(input), cloud::MAX_ARCHIVE)?;
     while let Some(header) = reader.next_header()? {
         if cloud::protected(&header.path) {
             return Err(io::Error::other("a rebase cannot name protected paths"));
@@ -1637,5 +1653,292 @@ pub fn link(name: &str, arguments: &[OsString]) -> i32 {
                 return 125;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// A test's own state directory (the real ones are under `/var` and `/tmp`).
+        pub(super) static STATE_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// A state directory, a workspace root, and the unprivileged workload
+    /// user (these tests do not run as root, where the helper needs `marsh-run`).
+    struct Sandbox {
+        _dirs: tempfile::TempDir,
+        state: PathBuf,
+        root: PathBuf,
+    }
+
+    impl Sandbox {
+        fn new() -> Option<Self> {
+            if privileged() {
+                return None;
+            }
+            let dirs = tempfile::tempdir().unwrap();
+            let base = dirs.path().canonicalize().unwrap();
+            let (state, root) = (base.join("state"), base.join("work"));
+            fs::create_dir(&state).unwrap();
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::create_dir(&root).unwrap();
+            STATE_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(state.clone()));
+            Some(Self {
+                _dirs: dirs,
+                state,
+                root,
+            })
+        }
+
+        /// Unpack a snapshot of `files` (path, content) into the workspace.
+        fn unpack(&self, files: &[(&str, &str)]) {
+            let archive = self.state.join("snapshot");
+            let mut writer =
+                Writer::new(BufWriter::new(File::create(&archive).unwrap()), u64::MAX).unwrap();
+            writer
+                .request(&CloudRequest {
+                    cwd: self.root.as_os_str().as_bytes().to_vec(),
+                    root: self.root.as_os_str().as_bytes().to_vec(),
+                    mode: CloudMode::Argv,
+                    argv: Vec::new(),
+                    env: BTreeMap::new(),
+                    terminal: None,
+                    kits: Vec::new(),
+                    stdin_terminal: false,
+                    detached: false,
+                    delegate: None,
+                    ignore: None,
+                })
+                .unwrap();
+            for (path, content) in files {
+                writer
+                    .file(
+                        path.as_bytes(),
+                        0o644,
+                        content.len() as u64,
+                        &mut content.as_bytes(),
+                    )
+                    .unwrap();
+            }
+            writer.finish().unwrap().flush().unwrap();
+            unpack(&archive, &self.root).unwrap();
+        }
+
+        fn sync(&self) -> Vec<(String, Kind)> {
+            let mut out = Vec::new();
+            sync_into(&self.root, &mut out).unwrap();
+            let mut reader = Reader::new(&out[..], u64::MAX).unwrap();
+            let mut entries = Vec::new();
+            while let Some(header) = reader.next_header().unwrap() {
+                reader.data().unwrap();
+                entries.push((String::from_utf8(header.path).unwrap(), header.kind));
+            }
+            entries
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            STATE_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// A root helper's workload cannot gain privilege through a setuid or
+    /// file-capability binary: `NoNewPrivs` is set before the spawn. It is
+    /// irreversible and per thread, so this runs in a child process of the
+    /// test binary and reads its own thread's status.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_privileged_helper_sets_no_new_privs_before_it_spawns_the_workload() {
+        const CHILD: &str = "MARSH_TEST_NNP_CHILD";
+        let flag = || {
+            fs::read_to_string("/proc/thread-self/status")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("NoNewPrivs:"))
+                .map(|value| value.trim().to_owned())
+        };
+        if std::env::var_os(CHILD).is_some() {
+            assert_eq!(flag().as_deref(), Some("0"));
+            // A helper that is not root leaves it to its own start-up.
+            lock_privileges_if(false).unwrap();
+            assert_eq!(flag().as_deref(), Some("0"));
+            lock_privileges_if(true).unwrap();
+            assert_eq!(flag().as_deref(), Some("1"));
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cloud_helper::tests::a_privileged_helper_sets_no_new_privs_before_it_spawns_the_workload",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The callers, not just `claim_start`: with the marker already there,
+    /// neither `run` nor `run --detached` starts anything (125, before the
+    /// acknowledgement or any supervisor). Removing either call fails here.
+    #[test]
+    fn a_retried_run_of_either_kind_refuses_before_starting_anything() {
+        let Some(sandbox) = Sandbox::new() else {
+            return;
+        };
+        claim_start().unwrap();
+        assert!(sandbox.state.join("started").exists());
+        assert_eq!(run(), 125);
+        assert_eq!(detached::run(), 125);
+        // Neither left a supervisor or runner behind.
+        assert!(!sandbox.state.join("supervisor").exists());
+        assert!(!sandbox.state.join("runner").exists());
+    }
+
+    #[test]
+    fn a_second_start_in_one_sandbox_is_refused() {
+        let Some(sandbox) = Sandbox::new() else {
+            return;
+        };
+        claim_start().unwrap();
+        assert!(sandbox.state.join("started").exists());
+        let again = claim_start().unwrap_err();
+        assert_eq!(again.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_file_owned_by_another_user_is_never_captured() {
+        let Some(sandbox) = Sandbox::new() else {
+            return;
+        };
+        fs::write(sandbox.root.join("mine"), b"x").unwrap();
+        let uid = nix::unistd::getuid().as_raw();
+        let mut found = BTreeMap::new();
+        walk(&sandbox.root, b"", uid, &mut found, &mut None).unwrap();
+        assert!(found.contains_key(&b"mine"[..]));
+        // A hard link to a file the workload may not read is owned by someone else.
+        let refused = walk(&sandbox.root, b"", uid + 1, &mut BTreeMap::new(), &mut None);
+        assert!(refused.unwrap_err().to_string().contains("not owned"));
+    }
+
+    #[test]
+    fn protected_paths_and_links_in_parents_never_travel_or_get_written_through() {
+        let Some(sandbox) = Sandbox::new() else {
+            return;
+        };
+        sandbox.unpack(&[("a.txt", "one")]);
+        fs::create_dir_all(sandbox.root.join(".git")).unwrap();
+        fs::write(sandbox.root.join(".git/config"), b"[core]").unwrap();
+        fs::write(sandbox.root.join("a.txt"), b"two").unwrap();
+        assert_eq!(sandbox.sync(), [("a.txt".to_owned(), Kind::File)]);
+        // A symlink in a parent position is refused, a real one is not.
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), sandbox.root.join("link")).unwrap();
+        assert!(real_parents(&sandbox.root, b"link/file").is_err());
+        fs::create_dir(sandbox.root.join("dir")).unwrap();
+        real_parents(&sandbox.root, b"dir/file").unwrap();
+    }
+
+    #[test]
+    fn the_state_directory_must_be_private_and_the_delta_needs_the_status() {
+        let Some(sandbox) = Sandbox::new() else {
+            return;
+        };
+        // A loose mode is tightened; a symlink in its place is refused.
+        fs::set_permissions(&sandbox.state, fs::Permissions::from_mode(0o755)).unwrap();
+        state_dir().unwrap();
+        assert_eq!(
+            fs::metadata(&sandbox.state).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let moved = sandbox.state.with_extension("moved");
+        fs::rename(&sandbox.state, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &sandbox.state).unwrap();
+        assert!(state_dir().is_err());
+        fs::remove_file(&sandbox.state).unwrap();
+        fs::rename(&moved, &sandbox.state).unwrap();
+        sandbox.unpack(&[("a.txt", "one")]);
+        let out = sandbox.state.join("out.delta");
+        let early = delta(&sandbox.root, &out).unwrap_err();
+        assert!(early.to_string().contains("has not ended"));
+        fs::write(sandbox.state.join("status"), b"0").unwrap();
+        fs::write(sandbox.root.join("a.txt"), b"two").unwrap();
+        delta(&sandbox.root, &out).unwrap();
+        assert!(out.exists());
+    }
+
+    #[test]
+    fn sync_returns_what_changed_and_rebase_makes_it_the_new_baseline() {
+        let Some(sandbox) = Sandbox::new() else {
+            return;
+        };
+        sandbox.unpack(&[("keep.txt", "same"), ("edit.txt", "one")]);
+        assert_eq!(sandbox.sync(), []);
+        fs::write(sandbox.root.join("edit.txt"), b"two").unwrap();
+        fs::write(sandbox.root.join("new.txt"), b"fresh").unwrap();
+        fs::remove_file(sandbox.root.join("keep.txt")).unwrap();
+        let mut entries = sandbox.sync();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            entries,
+            [
+                ("edit.txt".to_owned(), Kind::File),
+                ("keep.txt".to_owned(), Kind::Delete),
+                ("new.txt".to_owned(), Kind::File),
+            ]
+        );
+        // The laptop applied them: the same entries, with digests, rebase.
+        let mut rebase = Writer::new(Vec::new(), u64::MAX).unwrap();
+        for (path, content) in [("edit.txt", "two"), ("new.txt", "fresh")] {
+            let digest = Sha256::digest(content);
+            rebase
+                .file(path.as_bytes(), 0o644, 32, &mut &digest[..])
+                .unwrap();
+        }
+        rebase.delete(b"keep.txt").unwrap();
+        rebase_from(&rebase.finish().unwrap()[..]).unwrap();
+        assert_eq!(sandbox.sync(), []);
+        // A later change is the only thing the next sync carries.
+        fs::write(sandbox.root.join("new.txt"), b"later").unwrap();
+        assert_eq!(sandbox.sync(), [("new.txt".to_owned(), Kind::File)]);
+    }
+
+    #[test]
+    fn a_rebase_cannot_name_protected_paths_or_carry_a_request() {
+        let Some(sandbox) = Sandbox::new() else {
+            return;
+        };
+        sandbox.unpack(&[("a.txt", "one")]);
+        let before = fs::read(sandbox.state.join("baseline")).unwrap();
+        let digest = Sha256::digest("x");
+        for path in [".git/config", ".marsh/split/x", "a/.GIT/hooks/h"] {
+            let mut writer = Writer::new(Vec::new(), u64::MAX).unwrap();
+            writer
+                .file(path.as_bytes(), 0o644, 32, &mut &digest[..])
+                .unwrap();
+            let error = rebase_from(&writer.finish().unwrap()[..]).unwrap_err();
+            assert!(error.to_string().contains("protected"), "{path}");
+        }
+        assert_eq!(fs::read(sandbox.state.join("baseline")).unwrap(), before);
+    }
+
+    #[test]
+    fn the_token_is_taken_only_before_the_run_starts_and_never_unprivileged() {
+        let Some(sandbox) = Sandbox::new() else {
+            return;
+        };
+        coordinator::not_started_for_test(&sandbox.state).unwrap();
+        claim_start().unwrap();
+        assert!(coordinator::not_started_for_test(&sandbox.state).is_err());
+        let refused = coordinator::store_delegate().unwrap_err();
+        assert!(refused.to_string().contains("no root"));
     }
 }

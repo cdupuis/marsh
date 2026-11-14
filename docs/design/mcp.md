@@ -206,7 +206,14 @@ does not inherit `MARSH_SBX`. At startup, `marsh-mcp` resolves the effective
 UID through the operating-system passwd database, validates the account name,
 and sets both `USER` and `LOGNAME` explicitly in every cleared child
 environment, including the environment of a resident `marshd` that an exported
-Kit command starts (`start_daemon`). It never trusts optional inherited
+Kit command starts (`start_daemon`). That daemon outlives the call and
+serves later CLI sessions, so it also gets the numeric and switch settings it
+reads (the `MARSH_*` limits, `MARSH_AUTO_UPDATE`, `MARSH_OPEN_URLS`, the idle
+and retention settings); it does not get credentials, proxy or `DOCKER_*`
+variables (it never reads them: it runs `sbx` with a cleared environment), nor
+variables that name an image, an executable or a directory
+(`MARSH_SHELL_IMAGE`, `MARSH_GUEST_ARTIFACTS`...): start `marshd` from the CLI
+to use those. It never trusts optional inherited
 identity variables. Tool calls
 cannot add, replace, or inspect environment variables. A direct MCP client can
 equivalently launch the same command and argument list over stdio.

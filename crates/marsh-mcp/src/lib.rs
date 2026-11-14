@@ -100,22 +100,60 @@ pub(crate) fn apply_host_environment(
     forward_host_environment(command);
 }
 
-/// The resident daemon this server starts gets the same environment as the
-/// host `marsh` children (`apply_host_environment`), not the gateway's own.
-pub(crate) fn start_daemon(
+/// Settings the resident daemon reads from its own environment and that only
+/// tune it (numbers and switches): the per-job and launch limits
+/// (`marsh_daemon::limits::LIMITS`) and these. A daemon an export starts keeps
+/// serving later CLI sessions, so it needs the user's tuning. Not here:
+/// anything that names an image, an executable or a directory
+/// (`MARSH_SHELL_IMAGE`, `MARSH_KIT_IMAGE_CACHE`, `MARSH_GUEST_ARTIFACTS`,
+/// `MARSH_SKILLS_HOME`...), and credentials, proxies, `SSH_AUTH_SOCK` and
+/// `DOCKER_*`, which the daemon never reads (it runs `sbx` with a cleared
+/// environment of its own).
+pub(crate) const DAEMON_KNOBS: [&str; 8] = [
+    "MARSH_AUTO_UPDATE",
+    "MARSH_OPEN_URLS",
+    "MARSH_VM_IDLE_SECONDS",
+    "MARSH_SERVICES_IDLE_SECONDS",
+    "MARSH_SERVICES_STOP_WAIT_SECONDS",
+    "MARSH_SERVICES_POOL_BYTES",
+    "MARSH_SERVICES_POOL_RESERVE_BYTES",
+    "MARSH_CLOUD_DETACHED_RETENTION",
+];
+
+/// The environment of the resident daemon an export starts: that of the host
+/// `marsh` children (`apply_host_environment`), plus the [`DAEMON_KNOBS`] and
+/// limit variables that `lookup` (the gateway's environment) has.
+pub(crate) fn daemon_environment(
     config: &HostConfig,
-) -> Result<marsh_daemon::Client, marsh_daemon::DaemonError> {
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     let mut probe = std::process::Command::new("daemon-environment");
     apply_host_environment(&mut probe, config, &config.home);
-    let environment = probe
+    let mut environment = probe
         .get_envs()
         .filter_map(|(name, value)| Some((name.to_owned(), value?.to_owned())))
         .collect::<Vec<_>>();
+    let limits = marsh_daemon::limits::LIMITS
+        .iter()
+        .map(|spec| spec.variable);
+    for name in DAEMON_KNOBS.into_iter().chain(limits) {
+        if let Some(value) = lookup(name) {
+            environment.push((name.into(), value));
+        }
+    }
+    environment
+}
+
+/// The resident daemon this server starts gets [`daemon_environment`], not the
+/// gateway's own.
+pub(crate) fn start_daemon(
+    config: &HostConfig,
+) -> Result<marsh_daemon::Client, marsh_daemon::DaemonError> {
     marsh_daemon::Client::ensure_running_with_environment(
         &config.home,
         &config.marshd,
         &config.sbx,
-        &environment,
+        &daemon_environment(config, &|name| env::var_os(name)),
     )
 }
 
@@ -4535,6 +4573,58 @@ mod tests {
             seen.lines()
                 .any(|line| line == format!("USER={}", config.username))
         );
+    }
+
+    #[test]
+    fn the_daemon_environment_keeps_tuning_and_drops_everything_else() {
+        let (_root, config) = fixture();
+        let gateway = std::collections::BTreeMap::from([
+            ("MARSH_TREE_LAUNCH_RATE", "5/s"),
+            ("MARSH_AUTO_UPDATE", "0"),
+            ("MARSH_VM_IDLE_SECONDS", "60"),
+            // None of these reaches a daemon that outlives the gateway.
+            ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+            ("HTTPS_PROXY", "http://proxy.example"),
+            ("DOCKER_HOST", "tcp://elsewhere"),
+            ("MARSH_DAEMON_TOKEN", "secret"),
+            ("MARSH_SHELL_IMAGE", "evil.example/image"),
+            ("MARSH_GUEST_ARTIFACTS", "/tmp/evil"),
+            ("XDG_DATA_HOME", "/tmp/data"),
+        ]);
+        let environment = daemon_environment(&config, &|name| {
+            gateway.get(name).map(std::ffi::OsString::from)
+        });
+        let names = environment
+            .iter()
+            .map(|(name, _)| name.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        for kept in [
+            "MARSH_TREE_LAUNCH_RATE",
+            "MARSH_AUTO_UPDATE",
+            "MARSH_VM_IDLE_SECONDS",
+        ] {
+            assert!(
+                names.iter().any(|name| name == kept),
+                "{kept} missing: {names:?}"
+            );
+        }
+        for dropped in [
+            "SSH_AUTH_SOCK",
+            "HTTPS_PROXY",
+            "DOCKER_HOST",
+            "MARSH_DAEMON_TOKEN",
+            "MARSH_SHELL_IMAGE",
+            "MARSH_GUEST_ARTIFACTS",
+            "XDG_DATA_HOME",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == dropped),
+                "{dropped} leaked: {names:?}"
+            );
+        }
+        for pinned in ["MARSH_HOME", "MARSH_SBX", "USER", "LOGNAME", "PATH"] {
+            assert!(names.iter().any(|name| name == pinned), "{pinned} missing");
+        }
     }
 
     #[tokio::test]

@@ -237,15 +237,18 @@ impl JobSpec {
         ) {
             return Err(JobSpecError::InvalidTerminalSize);
         }
+        let user = self.session_environment.get("USER");
         if self.session_environment.len() != 4
             || !matches!(self.session_environment.get("HOME"), Some(home) if safe_absolute(Path::new(home)))
             || self.session_environment.get("MARSH_SELECTED_HOME")
                 != self.session_environment.get("HOME")
-            || self.session_environment.get("USER") != self.session_environment.get("LOGNAME")
-            || self.session_environment["USER"].is_empty()
-            || !self.session_environment["USER"]
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || user != self.session_environment.get("LOGNAME")
+            || !user.is_some_and(|user| {
+                !user.is_empty()
+                    && user
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
         {
             return Err(JobSpecError::InvalidSessionEnvironment);
         }
@@ -654,6 +657,22 @@ mod tests {
             .insert("MARSH_SELECTED_HOME".into(), "/other/home".into());
         assert_eq!(
             spec.validate(),
+            Err(JobSpecError::InvalidSessionEnvironment)
+        );
+    }
+
+    #[test]
+    fn a_session_environment_without_user_is_rejected_not_a_panic() {
+        // Four entries, but neither USER nor LOGNAME: the two compare equal as
+        // absent, and indexing "USER" used to panic.
+        let mut spec = job();
+        spec.session_environment.remove("USER");
+        spec.session_environment.remove("LOGNAME");
+        spec.session_environment.insert("A".into(), "1".into());
+        spec.session_environment.insert("B".into(), "2".into());
+        let rejected = std::panic::catch_unwind(|| spec.validate());
+        assert_eq!(
+            rejected.expect("validate must not panic"),
             Err(JobSpecError::InvalidSessionEnvironment)
         );
     }

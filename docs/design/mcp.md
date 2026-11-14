@@ -247,7 +247,8 @@ sbx mcp load marsh-dev-qualify --sandbox TRUSTED_SANDBOX_NAME
 
 All tools return structured JSON with bounded byte-faithful output encoded as
 base64 where command streams are present. Server errors are typed and fail
-closed. Stdio frames are capped at 1 MiB, output is
+closed. Stdio frames are capped at 1 MiB (so a declared stdin `max_bytes`
+of up to 1 MiB is in practice bounded a little below that by the frame), output is
 bounded, and one subprocess cap per server applies across all its operations; capacity
 exhaustion is a typed response, never an unbounded host process queue. Tool
 names and fields below are the public contract. Missing required fields are

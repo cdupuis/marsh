@@ -146,6 +146,17 @@ pub enum ArgBinding {
     Flag { option: String, field: String },
 }
 
+impl ArgBinding {
+    fn field(&self) -> Option<&str> {
+        match self {
+            Self::Literal { .. } => None,
+            Self::Positional { field }
+            | Self::NamedOption { field, .. }
+            | Self::Flag { field, .. } => Some(field),
+        }
+    }
+}
+
 /// Binding for standard input.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -783,7 +794,24 @@ impl ExportMcp {
                     if s.contains('\0') {
                         return Err(format!("field '{key}' cannot contain NUL bytes"));
                     }
-                    if s.len() > MAX_ARG_STRING_BYTES {
+                    // The declared stdin limit (checked below) governs a field
+                    // that is only stdin; one that is also an argv word is
+                    // bounded like any argument.
+                    let stdin_only = self
+                        .config
+                        .declaration
+                        .bindings
+                        .stdin
+                        .as_ref()
+                        .is_some_and(|stdin| &stdin.field == key)
+                        && !self
+                            .config
+                            .declaration
+                            .bindings
+                            .argv
+                            .iter()
+                            .any(|binding| binding.field() == Some(key.as_str()));
+                    if !stdin_only && s.len() > MAX_ARG_STRING_BYTES {
                         return Err(format!(
                             "field '{key}' length ({}) exceeds maximum limit of {MAX_ARG_STRING_BYTES} bytes",
                             s.len()
@@ -2154,6 +2182,62 @@ mod tests {
             .prepare_arguments(&json!({"count": 7, "ratio": 0.25}))
             .unwrap();
         assert_eq!(argv, [b"7".to_vec(), b"--ratio".to_vec(), b"0.25".to_vec()]);
+    }
+
+    #[test]
+    fn a_declared_stdin_limit_above_the_argument_cap_takes_effect() {
+        let decl = ToolDeclaration::load_from_str(
+            r#"{
+                "schema_version": "marsh.published_tool/v1",
+                "tool_name": "feed",
+                "description": "Feeds",
+                "command": "test-report",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "input": { "type": "string" },
+                        "name": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                "bindings": {
+                    "argv": [ { "type": "positional", "field": "name" } ],
+                    "stdin": { "field": "input", "max_bytes": 1048576 }
+                },
+                "max_output_bytes": 1024,
+                "timeout_ms": 5000
+            }"#,
+            None,
+        )
+        .unwrap();
+        let export_mcp = ExportMcp::new(ExportConfig {
+            host_config: fake_host_config(),
+            declaration: decl,
+            declaration_path: None,
+        });
+        let (_, stdin) = export_mcp
+            .prepare_arguments(&json!({"input": "x".repeat(100 * 1024)}))
+            .unwrap();
+        assert_eq!(stdin.len(), 100 * 1024);
+        let (_, stdin) = export_mcp
+            .prepare_arguments(&json!({"input": "x".repeat(MAX_STDIN_BYTES_LIMIT)}))
+            .unwrap();
+        assert_eq!(stdin.len(), MAX_STDIN_BYTES_LIMIT);
+        let err = export_mcp
+            .prepare_arguments(&json!({"input": "x".repeat(MAX_STDIN_BYTES_LIMIT + 1)}))
+            .unwrap_err();
+        assert!(
+            err.contains("exceeds configured limit of 1048576 bytes"),
+            "{err}"
+        );
+        // A field that is also an argv word keeps the argument cap.
+        let err = export_mcp
+            .prepare_arguments(&json!({"name": "x".repeat(MAX_ARG_STRING_BYTES + 1)}))
+            .unwrap_err();
+        assert!(
+            err.contains("exceeds maximum limit of 65536 bytes"),
+            "{err}"
+        );
     }
 
     #[test]

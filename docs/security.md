@@ -66,6 +66,15 @@ beyond mounted files, as described [below](#mcp-connections).
 The host control directory, the install, and Kit sources are never mounted.
 marsh refuses to start in a directory that contains them.
 
+Text a job chose (command names and arguments, an agent call's summary,
+labels, error text the daemon relays) reaches your terminal only through one
+filter, `marsh_contracts::terminal::display_safe`: escape sequences, other
+control characters and bidirectional overrides print as `?`. That covers
+`marsh results`, `marsh jobs`, `marsh status`, `marsh gc`, `marsh services`,
+cloud notices and messages, error text, and `marsh cloud diff` on a terminal
+(piped, the patch stays exact). A job's own output stream (`marsh cloud
+attach`, agent replies) is raw by design, as in any terminal.
+
 ### Shell VM
 
 Your shell runs here as your user, with passwordless `sudo` and a private

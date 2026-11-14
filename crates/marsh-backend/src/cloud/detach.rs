@@ -267,6 +267,25 @@ impl Record {
         Ok(())
     }
 
+    /// The agent calls the run reports, as receipt entries: only a run with a
+    /// coordinator (a delegate) has records the workload did not write, and
+    /// each is shown without control characters either way.
+    fn trusted_calls(&self, reported: &[RemoteCall]) -> Vec<marsh_daemon::CloudChildCall> {
+        use marsh_sbx::vm_text::plain_text;
+        if self.delegate.is_none() {
+            return Vec::new();
+        }
+        reported
+            .iter()
+            .map(|call| marsh_daemon::CloudChildCall {
+                kit: plain_text(&call.kit, 64),
+                args: call.args.iter().map(|arg| plain_text(arg, 256)).collect(),
+                exit: call.exit,
+                summary: plain_text(&call.summary, 1024),
+            })
+            .collect()
+    }
+
     /// The agent sandboxes the run reports owning, kept for deletion only
     /// when a coordinator (root, with a delegate) wrote the report: in a Kit
     /// run the workload writes that list itself.
@@ -997,20 +1016,9 @@ impl StockDaemonBackend {
         Self::tail_output(&adapter, &id, ctl, &paths, &mut record, &remote);
         record.note_reported_sandboxes(&remote.sandboxes);
         record.save(&paths)?;
-        if !remote.children.is_empty() {
-            store.set_cloud_children(
-                job,
-                remote
-                    .children
-                    .iter()
-                    .map(|call| marsh_daemon::CloudChildCall {
-                        kit: call.kit.clone(),
-                        args: call.args.clone(),
-                        exit: call.exit,
-                        summary: call.summary.clone(),
-                    })
-                    .collect(),
-            );
+        let calls = record.trusted_calls(&remote.children);
+        if !calls.is_empty() {
+            store.set_cloud_children(job, calls);
         }
         if !remote.done {
             if !remote.supervisor_alive && remote.status.is_none() {
@@ -2620,6 +2628,35 @@ mod tests {
         record.delegate = Some("someone".into());
         record.note_reported_sandboxes(&listed);
         assert_eq!(record.child_sandboxes.len(), 1);
+    }
+
+    /// R6-NEW-03: a Kit run's agent-call records are the workload's own and
+    /// are not taken; a coordinator's are, without terminal control.
+    #[test]
+    fn agent_call_records_come_only_from_a_coordinator_and_are_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        fs::create_dir_all(&paths.detached).unwrap();
+        fs::create_dir_all(&paths.results).unwrap();
+        let mut record = stored(
+            &paths,
+            "0000aaaa-0000-0000-0000-000000000001",
+            "running",
+            false,
+            0,
+        );
+        let reported = [RemoteCall {
+            kit: "codex".into(),
+            args: vec!["\u{1b}]52;c;AAAA\u{7}go".into()],
+            exit: 0,
+            summary: "wrote\u{1b}[2J".into(),
+        }];
+        assert_eq!(record.trusted_calls(&reported).len(), 0);
+        record.delegate = Some("someone".into());
+        let calls = record.trusted_calls(&reported);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args, ["]52;c;AAAAgo"]);
+        assert_eq!(calls[0].summary, "wrote[2J");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     ffi::{OsStr, OsString},
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -98,10 +98,12 @@ pub enum ServicesCommand {
     Stop {
         json: bool,
     },
-    /// Remove the VM and its disk; `yes` skips the confirmation.
+    /// Remove the VM and its disk; `yes` skips the confirmation. `project`
+    /// names the folder of a project that is gone from the Mac.
     Remove {
         yes: bool,
         json: bool,
+        project: Option<PathBuf>,
     },
     /// Hold the lease for `seconds`, then let it expire on its own.
     Hold {
@@ -120,7 +122,7 @@ pub enum ServicesCommand {
     Help,
 }
 
-pub const SERVICES_USAGE: &str = "usage: marsh docker status [--json] | start [--json] | stop [--json] | rm [--yes] [--json] | hold SECONDS [--json] | release HOLDER [--json] | internet on|off [--json]";
+pub const SERVICES_USAGE: &str = "usage: marsh docker status [--json] | start [--json] | stop [--json] | rm [--yes] [--json] [--project GONE_FOLDER] | hold SECONDS [--json] | release HOLDER [--json] | internet on|off [--json]";
 
 /// `marsh --dev` and its in-VM broker are gone; host `make dev` remains.
 pub const DEV_REMOVED: &str =
@@ -681,7 +683,16 @@ pub(crate) fn parse_services(arguments: &[String]) -> Result<ServicesCommand, Cl
         ["status"] if !yes => ServicesCommand::Status { json },
         ["start"] if !yes => ServicesCommand::Start { json },
         ["stop"] if !yes => ServicesCommand::Stop { json },
-        ["rm"] => ServicesCommand::Remove { yes, json },
+        ["rm"] => ServicesCommand::Remove {
+            yes,
+            json,
+            project: None,
+        },
+        ["rm", "--project", folder] if Path::new(folder).is_absolute() => ServicesCommand::Remove {
+            yes,
+            json,
+            project: Some(PathBuf::from(folder)),
+        },
         ["hold", seconds] if !yes => ServicesCommand::Hold {
             seconds: seconds
                 .parse()
@@ -1224,6 +1235,7 @@ mod tests {
                 C::Remove {
                     yes: false,
                     json: false,
+                    project: None,
                 },
             ),
             (
@@ -1231,6 +1243,15 @@ mod tests {
                 C::Remove {
                     yes: true,
                     json: false,
+                    project: None,
+                },
+            ),
+            (
+                vec!["rm", "--project", "/Users/a/gone", "--yes"],
+                C::Remove {
+                    yes: true,
+                    json: false,
+                    project: Some("/Users/a/gone".into()),
                 },
             ),
             (
@@ -1279,6 +1300,9 @@ mod tests {
             vec!["internet", "maybe"],
             vec!["internet", "on", "--yes"],
             vec!["destroy"],
+            vec!["rm", "--project"],
+            vec!["rm", "--project", "relative/gone"],
+            vec!["status", "--project", "/Users/a/gone"],
         ] {
             assert!(services(&bad).is_err(), "{bad:?}");
             assert!(docker(&bad).is_err(), "{bad:?}");

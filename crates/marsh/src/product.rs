@@ -41,7 +41,7 @@ Usage:
   marsh docker status [--json]
   marsh docker start [--json]
   marsh docker stop [--json]
-  marsh docker rm [--yes] [--json]
+  marsh docker rm [--yes] [--json] [--project GONE_FOLDER]
   marsh docker hold SECONDS [--json]
   marsh docker release HOLDER [--json]
   marsh docker internet on|off [--json]
@@ -59,7 +59,9 @@ status: every project of this home with a Docker VM, and this one.
 start: create the VM if needed (with a Docker disk of `marsh config
 services-disk-size`, default 40g) and wait until it is ready.
 stop: stop the VM, keeping its disk and data.
-rm: remove this project's VM and its disk (asks first, unless --yes). `marsh
+rm: remove this project's VM and its disk (asks first, unless --yes).
+`--project GONE_FOLDER` removes the VM of a project whose folder was moved or
+deleted (`status` marks those). `marsh
 stop` keeps Docker VMs (it stops them), and `marsh reset` skips them unless
 given `--include-services`.
 hold / release: keep the VM running for SECONDS (or until released); they
@@ -877,9 +879,18 @@ fn services_command(
     if matches!(command, Command::Help) {
         return write_help(stdout, SERVICES_HELP);
     }
-    let root = std::fs::canonicalize(&session.launch_directory).map_err(|error| {
-        ProductError::Operation(format!("{}: {error}", session.launch_directory.display()))
-    })?;
+    // A project that is gone from the Mac cannot be canonicalized: `rm
+    // --project` names its recorded folder, and the daemon checks it against
+    // the VMs it owns.
+    let root = match &command {
+        Command::Remove {
+            project: Some(project),
+            ..
+        } => project.clone(),
+        _ => std::fs::canonicalize(&session.launch_directory).map_err(|error| {
+            ProductError::Operation(format!("{}: {error}", session.launch_directory.display()))
+        })?,
+    };
     let (request, json) = match command {
         Command::Status { json } => (Request::Status { root }, json),
         Command::Start { json } => (Request::Start { root }, json),
@@ -887,7 +898,7 @@ fn services_command(
         Command::Hold { seconds, json } => (Request::Hold { root, seconds }, json),
         Command::Release { holder, json } => (Request::Release { root, holder }, json),
         Command::Internet { on, json } => (Request::Internet { root, on }, json),
-        Command::Remove { yes, json } => {
+        Command::Remove { yes, json, .. } => {
             if !yes && !confirm_services_removal(&root)? {
                 writeln!(stdout, "not removed")?;
                 return Ok(ProductOutcome::Complete(1));
@@ -977,6 +988,13 @@ fn write_services_lines(
                         .and_then(Value::as_str)
                         .map_or_else(String::new, |reason| format!("  ({reason})")),
                 )?;
+                if project["folder_missing"].as_bool().unwrap_or(false) {
+                    writeln!(
+                        stdout,
+                        "  the folder is gone from this Mac: `marsh docker rm --project {}` removes its Docker VM and disk",
+                        text(project, "root")
+                    )?;
+                }
             }
         }
         Request::Start { .. } | Request::Hold { .. } => {

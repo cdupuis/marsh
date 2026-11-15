@@ -463,7 +463,9 @@ fn services(arguments: &[OsString]) -> i32 {
         Command::Status { .. } => Request::Status { root },
         Command::Start { .. } => Request::Start { root },
         Command::Stop { .. } => Request::Stop { root },
-        Command::Remove { .. } => Request::Remove { root },
+        Command::Remove { project, .. } => Request::Remove {
+            root: project.unwrap_or(root),
+        },
         Command::Hold { seconds, .. } => Request::Hold { root, seconds },
         Command::Release { holder, .. } => Request::Release { root, holder },
         Command::Internet { on, .. } => Request::Internet { root, on },

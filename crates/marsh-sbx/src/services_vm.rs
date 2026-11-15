@@ -478,7 +478,7 @@ impl StockSbx {
         if !output.succeeded() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let hint = if stderr.contains("cannot restore mount") {
-                "; the project folder is gone from the Mac: restore it, or remove the VM with `marsh services rm`"
+                "; the project folder is gone from the Mac: restore it, or remove the VM with `marsh docker rm --project FOLDER` (`marsh docker status` lists the folder)"
             } else {
                 ""
             };

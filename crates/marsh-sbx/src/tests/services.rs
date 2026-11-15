@@ -117,3 +117,135 @@ fn no_exec_reaches_a_services_vm_that_is_not_the_recorded_running_one() {
         }
     }
 }
+
+const IMPOSTOR: &str = "00000000-0000-0000-0000-00000000ffff";
+
+/// A services VM recorded for a project, running in the model.
+fn owned_services_vm(
+    model: &StockModel,
+    adapter: &StockSbx,
+    shell: &ShellFixture,
+    project: &str,
+) -> (PathBuf, String) {
+    let project = directory(shell.dir.path(), project);
+    let name = adapter
+        .vm_name(VmPurpose::Services, project.to_str().unwrap())
+        .unwrap();
+    model.seed_owned(adapter, &name);
+    (project, name)
+}
+
+fn soon() -> Instant {
+    Instant::now() + Duration::from_secs(30)
+}
+
+/// `marsh docker stop` keeps the VM and its data; `rm` removes exactly the
+/// recorded VM, once, and forgets the record.
+#[test]
+fn stop_keeps_the_vm_and_remove_deletes_the_recorded_one() {
+    let model = StockModel::new();
+    let adapter = model.adapter();
+    let shell = ShellFixture::new();
+    let (project, name) = owned_services_vm(&model, &adapter, &shell, "project");
+    let (_, bystander) = owned_services_vm(&model, &adapter, &shell, "bystander");
+
+    assert!(adapter.stop_services_vm(&project, soon()).unwrap());
+    assert_eq!(model.calls_of("stop").len(), 1);
+    assert!(!model.vm(&name).expect("stop keeps the VM").running);
+    assert!(
+        !adapter.stop_services_vm(&project, soon()).unwrap(),
+        "already stopped"
+    );
+    assert_eq!(model.calls_of("stop").len(), 1);
+    assert_eq!(model.count("rm"), 0, "a stop never removes");
+
+    assert!(adapter.remove_services_vm(&project, soon()).unwrap());
+    assert!(model.vm(&name).is_none());
+    assert!(adapter.recorded_services_vm(&project).is_none());
+    assert!(!adapter.remove_services_vm(&project, soon()).unwrap());
+    assert_eq!(model.count("rm"), 1);
+    assert!(model.vm(&bystander).is_some(), "another project's VM stays");
+    assert_eq!(adapter.owned_services_vms().len(), 1);
+}
+
+/// A VM that is not the recorded one holds the name: removal forgets the
+/// record and never touches the VM; stop refuses.
+#[test]
+fn a_foreign_vm_at_the_recorded_name_is_never_stopped_or_removed() {
+    let model = StockModel::new();
+    let adapter = model.adapter();
+    let shell = ShellFixture::new();
+    let (project, name) = owned_services_vm(&model, &adapter, &shell, "project");
+    model.with_vm(&name, |vm| vm.id = IMPOSTOR.into());
+
+    assert!(matches!(
+        adapter.stop_services_vm(&project, soon()),
+        Err(SbxError::ForeignVm(_))
+    ));
+    assert_eq!(model.calls_of("stop").len(), 0);
+    assert!(!adapter.remove_services_vm(&project, soon()).unwrap());
+    assert_eq!(model.count("rm"), 0, "the impostor must not be removed");
+    assert_eq!(model.vm(&name).unwrap().id, IMPOSTOR);
+    assert!(adapter.recorded_services_vm(&project).is_none());
+    assert_eq!(model.calls_of("exec").len(), 0);
+}
+
+/// `reset --include-services` removes the VMs of the confirmed projects only,
+/// by recorded UUID: an unconfirmed project is kept (reported as such), and a
+/// confirmed project whose name now holds a foreign VM removes nothing.
+#[test]
+fn reset_removes_only_confirmed_projects_and_never_a_foreign_vm() {
+    let model = StockModel::new();
+    let adapter = model.adapter();
+    let shell = ShellFixture::new();
+    let (confirmed, confirmed_name) = owned_services_vm(&model, &adapter, &shell, "confirmed");
+    let (kept, kept_name) = owned_services_vm(&model, &adapter, &shell, "kept");
+    let (replaced, replaced_name) = owned_services_vm(&model, &adapter, &shell, "replaced");
+    model.with_vm(&replaced_name, |vm| vm.id = IMPOSTOR.into());
+
+    let key = |path: &Path| path.to_str().unwrap().to_owned();
+    let keys: BTreeSet<String> = [key(&confirmed), key(&replaced)].into();
+    let results = adapter.remove_confirmed_services_vms_before(&keys, soon());
+    let outcome = |name: &str| {
+        let entry = results.iter().find(|(n, _, _)| n == name).unwrap();
+        entry
+            .2
+            .as_ref()
+            .map(|removed| *removed)
+            .map_err(ToString::to_string)
+    };
+    assert_eq!(results.len(), 3, "one entry per owned VM");
+    assert_eq!(outcome(&confirmed_name), Ok(Some(true)));
+    assert_eq!(outcome(&kept_name), Ok(None), "not confirmed");
+    assert_eq!(
+        outcome(&replaced_name),
+        Ok(Some(false)),
+        "foreign: nothing removed"
+    );
+    assert!(model.vm(&confirmed_name).is_none());
+    assert!(model.vm(&kept_name).is_some());
+    assert_eq!(model.vm(&replaced_name).unwrap().id, IMPOSTOR);
+    assert_eq!(model.count("rm"), 1);
+    assert!(adapter.recorded_services_vm(&kept).is_some());
+    assert!(adapter.recorded_services_vm(&replaced).is_none());
+}
+
+/// A key that no owned VM has (a project that never had one, or a
+/// look-alike path) removes nothing at all.
+#[test]
+fn reset_with_an_unknown_project_key_touches_nothing() {
+    let model = StockModel::new();
+    let adapter = model.adapter();
+    let shell = ShellFixture::new();
+    let (project, name) = owned_services_vm(&model, &adapter, &shell, "project");
+    let lookalike = format!("{}/", project.display());
+    let keys: BTreeSet<String> = [lookalike, "/nowhere".to_owned()].into();
+    let results = adapter.remove_confirmed_services_vms_before(&keys, soon());
+    assert!(
+        results
+            .iter()
+            .all(|(_, _, result)| matches!(result, Ok(None)))
+    );
+    assert_eq!(model.count("rm"), 0);
+    assert!(model.vm(&name).is_some());
+}

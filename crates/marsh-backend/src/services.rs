@@ -1989,6 +1989,32 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    /// The project a services request names must be a canonical, existing
+    /// directory: a missing or moved folder, a link, a spelling with `..` and
+    /// a file are all refused (`rm --project` is the one way to a missing
+    /// folder, through `missing_project_root`).
+    #[test]
+    fn services_root_accepts_only_a_canonical_existing_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let base = fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let project = base.join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(base.join("file"), "").unwrap();
+        std::os::unix::fs::symlink(&project, base.join("link")).unwrap();
+        assert_eq!(backend.services_root(&project).unwrap(), project);
+        for bad in [
+            base.join("missing"),
+            base.join("link"),
+            base.join("file"),
+            project.join("..").join("project"),
+            PathBuf::from("relative/project"),
+        ] {
+            assert!(backend.services_root(&bad).is_err(), "{}", bad.display());
+        }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
     fn scope(config: Option<&str>) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         if let Some(config) = config {

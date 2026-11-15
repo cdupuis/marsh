@@ -562,6 +562,35 @@ impl Services {
             );
     }
 
+    /// The one way the agent sends a volume create to the engine, for the
+    /// explicit create and for the implicit one of a container create, so their
+    /// handling of an unknown outcome cannot diverge. Sent and not answered
+    /// (timeout, error after the send): the create may still land, so the name
+    /// is fenced against other workspaces here, and the caller must KEEP the
+    /// reservation. Only [`CreateOutcome::NotSent`] (the dial failed) allows
+    /// giving the reservation back.
+    fn engine_volume_create(
+        &self,
+        workspace: &str,
+        name: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> CreateOutcome {
+        let up = match self.dial() {
+            Ok(up) => up,
+            Err(e) => return CreateOutcome::NotSent(e),
+        };
+        match self.exchange(up, "POST", "/volumes/create", body) {
+            Ok((resp, answer)) => CreateOutcome::Answered(resp, answer),
+            Err(e) => {
+                if let Some(name) = name {
+                    self.fence_volume(name, workspace);
+                }
+                self.log(&format!("create of volume {name:?} did not complete: {e}"));
+                CreateOutcome::Unknown(e)
+            }
+        }
+    }
+
     pub(crate) fn up_request(
         &self,
         method: &str,
@@ -1564,14 +1593,25 @@ impl Env for Scope {
             Json::Str(ws.clone()).to_string_json(),
             Json::Str(self.auth.attempt.clone()).to_string_json()
         );
-        let (st, _) = self
+        match self
             .svc
-            .up_request("POST", "/volumes/create", Some(create.as_bytes()))
-            .map_err(|e| give_back(fail(format!("engine unavailable: {e}"))))?;
-        if st != 201 {
-            return Err(give_back(fail("could not create the volume".into())));
+            .engine_volume_create(ws, Some(name), Some(create.as_bytes()))
+        {
+            CreateOutcome::Answered(resp, _) if resp.status == 201 => Ok(()),
+            // The engine answered with an error: nothing was created.
+            CreateOutcome::Answered(..) => {
+                Err(give_back(fail("could not create the volume".into())))
+            }
+            CreateOutcome::NotSent(e) => Err(give_back(fail(format!("engine unavailable: {e}")))),
+            // It may still land: the reservation stays, the name is fenced.
+            CreateOutcome::Unknown(e) => Err(Refusal {
+                status: 502,
+                msg: format!(
+                    "the engine did not answer the volume create ({e}); the volume name stays reserved until the fence expires"
+                ),
+                close: false,
+            }),
         }
-        Ok(())
     }
 
     fn reserve_volume(&self, name: &str) -> Result<bool, Refusal> {
@@ -2843,6 +2883,15 @@ fn record_container(
     Ok(())
 }
 
+/// What became of a volume create sent by the agent.
+enum CreateOutcome {
+    Answered(RespHead, Vec<u8>),
+    /// The engine could not be dialed: nothing was sent.
+    NotSent(io::Error),
+    /// Sent, not answered: it may still land (the name is already fenced).
+    Unknown(io::Error),
+}
+
 thread_local! {
     /// This thread holds `vol_lock` for the request it is handling.
     static VOL_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -2959,27 +3008,12 @@ fn create_volume(
 ) -> bool {
     let svc = &scope.svc;
     let keep = !head.close;
-    let up = match svc.dial() {
-        Ok(up) => up,
-        Err(e) => {
-            // Nothing was sent: give back the reservation.
-            undo_post(scope, &adm.post);
-            drop(volume_op.take());
-            reply(
-                &mut conn.stream,
-                502,
-                &format!("the engine is not available: {e}"),
-                true,
-            );
-            return false;
-        }
-    };
     let body = match &adm.body {
         ReqBody::Json(b) => Some(b.as_slice()),
         _ => None,
     };
-    match svc.exchange(up, "POST", &adm.path, body) {
-        Ok((resp, answer)) => {
+    match svc.engine_volume_create(&scope.auth.workspace, name, body) {
+        CreateOutcome::Answered(resp, answer) => {
             let mut out = answer.clone();
             let recorded = record(scope, &adm.post, resp.status, &answer, &mut out);
             // Answered and recorded (or refused): the client's reply is
@@ -3000,13 +3034,21 @@ fn create_volume(
             .and_then(|()| conn.stream.write_all(&out));
             keep && sent.is_ok()
         }
-        Err(e) => {
-            // Sent, no answer: it may still land, so the reservation stays.
-            if let Some(name) = name {
-                svc.fence_volume(name, &scope.auth.workspace);
-            }
+        CreateOutcome::NotSent(e) => {
+            // Nothing was sent: give back the reservation.
+            undo_post(scope, &adm.post);
             drop(volume_op.take());
-            svc.log(&format!("create of volume {name:?} did not complete: {e}"));
+            reply(
+                &mut conn.stream,
+                502,
+                &format!("the engine is not available: {e}"),
+                true,
+            );
+            false
+        }
+        CreateOutcome::Unknown(_) => {
+            // Sent, no answer: the reservation stays and the name is fenced.
+            drop(volume_op.take());
             reply(
                 &mut conn.stream,
                 502,

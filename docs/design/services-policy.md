@@ -160,9 +160,16 @@ engine does not answer keeps the sender's reservation and fences the name like a
 unanswered delete
 (`a_volume_create_whose_client_disconnected_still_records_its_owner`,
 `a_hung_volume_create_is_bounded_and_fences_the_name`,
-`a_connection_takes_the_volume_lock_again_after_a_volume_create`). Container
-creates (including a named volume: the volume part runs inside admission under the
-same lock, the container create itself is streamed and not under it) and network
+`a_connection_takes_the_volume_lock_again_after_a_volume_create`). The volume
+create that a container create makes for a named volume (`Binds`, or a `Mounts`
+entry of type volume; `ensure_volume`, inside admission under the same lock) is
+sent through the same function (`engine_volume_create`), so the two cannot differ
+on an unknown outcome: a create sent and not answered keeps the reservation and
+fences the name, and only a failed dial gives the reservation back
+(`an_unanswered_implicit_volume_create_keeps_the_reservation_and_fences_the_name`,
+`a_volume_create_that_was_never_sent_gives_the_reservation_back`,
+`an_implicit_volume_create_that_could_not_be_dialed_gives_the_reservation_back`).
+The container create itself is streamed and not under the lock, and network
 creates are not agent-owned. This was chosen over fencing at the start of every delete and re-checking the
 fence after a create's engine call, because that would have to undo a volume the
 create may or may not have made; holding the lock needs no undo and fails closed

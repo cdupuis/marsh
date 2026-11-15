@@ -1326,28 +1326,34 @@ fn a_client_that_does_not_read_its_reply_does_not_block_other_workspaces() {
 /// write) cannot stretch the request write past the call deadline.
 #[test]
 fn a_trickling_reader_cannot_stretch_the_request_write_past_the_deadline() {
-    let h = H::new("trickleww4", false, no_custom(), |cfg| {
-        cfg.up_progress = Duration::from_millis(150);
-    });
-    let (client, mut server) = UnixStream::pair().unwrap();
-    let reader = std::thread::spawn(move || {
-        let mut buf = vec![0_u8; 512];
-        while let Ok(n) = server.read(&mut buf) {
-            if n == 0 {
-                break;
+    // (bytes per read, pause between reads): progress inside every write.
+    for (chunk, pause) in [(512_usize, 60_u64), (256, 50)] {
+        let h = H::new("trickleww4", false, no_custom(), |cfg| {
+            cfg.up_progress = Duration::from_millis(150);
+        });
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0_u8; chunk];
+            while let Ok(n) = server.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(pause));
             }
-            std::thread::sleep(Duration::from_millis(60));
-        }
-    });
-    let body = vec![b'x'; 64 * 1024];
-    let started = Instant::now();
-    let result = h
-        .svc
-        .exchange(client, "POST", "/volumes/create", Some(&body));
-    let took = started.elapsed();
-    assert!(result.is_err());
-    assert!(took < Duration::from_millis(500), "{took:?}");
-    reader.join().unwrap();
+        });
+        let body = vec![b'x'; 64 * 1024];
+        let started = Instant::now();
+        let result = h
+            .svc
+            .exchange(client, "POST", "/volumes/create", Some(&body));
+        let took = started.elapsed();
+        assert!(result.is_err());
+        assert!(
+            took < Duration::from_millis(450),
+            "{chunk}/{pause}: {took:?}"
+        );
+        reader.join().unwrap();
+    }
 }
 
 /// The same for a delete: its answer is in memory and recorded, and the lock is
@@ -1387,6 +1393,95 @@ fn a_client_that_does_not_read_a_delete_reply_does_not_block_other_workspaces() 
         started.elapsed()
     );
     drop(stuck);
+}
+
+/// The volume create inside a container create (`docker run -v data:/x`) is
+/// agent-owned like an explicit one: when the engine does not answer a SENT
+/// create, the reservation stays with the sender and the name is fenced, so
+/// another workspace cannot adopt (and then delete) the volume that create
+/// makes when it lands late.
+#[test]
+fn an_unanswered_implicit_volume_create_keeps_the_reservation_and_fences_the_name() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("implicitcreatew4", false, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(250);
+        cfg.delete_fence = SHORT_FENCE;
+    });
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    let create = r#"{"Image":"busybox","HostConfig":{"Binds":["data:/x"]}}"#;
+    engine.hold_next_create.store(true, Ordering::SeqCst);
+    let (status, reply) = call(&sock_a, "POST", "/containers/create", Some(create));
+    assert!(status >= 500, "{status} {reply}");
+    assert_eq!(h.engine.created.load(Ordering::SeqCst), 0);
+    assert!(
+        h.svc.ledger.has_volume("lane-a", "data"),
+        "the reservation was given up"
+    );
+    assert!(h.svc.volume_fenced("data"));
+    // Another workspace cannot take the name, directly or implicitly.
+    assert_eq!(call(&sock_b, "POST", "/volumes/create", DATA).0, 503);
+    let (status, _) = call(&sock_b, "POST", "/containers/create", Some(create));
+    assert_eq!(status, 503);
+    // The held create lands late: the volume has its owner.
+    engine.create_release.store(true, Ordering::SeqCst);
+    assert!(wait_for(Duration::from_secs(5), || engine
+        .held_create_done
+        .load(Ordering::SeqCst)));
+    assert!(engine.store.lock().unwrap().contains_key("data"));
+    assert!(h.svc.ledger.has_volume("lane-a", "data"));
+    assert!(!h.svc.ledger.has_volume("lane-b", "data"));
+    // The sender is exempt from its own fence.
+    let (status, reply) = call(&sock_a, "POST", "/containers/create", Some(create));
+    assert_eq!(status, 201, "{reply}");
+}
+
+/// A volume create that never left (the engine could not be dialed) gives
+/// the reservation back, for both the explicit and the implicit path.
+#[test]
+fn a_volume_create_that_was_never_sent_gives_the_reservation_back() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("notsentcreatew4", false, engine.handler(), |_| {});
+    let sock = h.serve(&h.auth);
+    std::fs::remove_file(h.dir.join("engine.sock")).unwrap();
+    assert_eq!(call(&sock, "POST", "/volumes/create", DATA).0, 502);
+    let create = r#"{"Image":"busybox","HostConfig":{"Binds":["other:/x"]}}"#;
+    let (status, _) = call(&sock, "POST", "/containers/create", Some(create));
+    assert!(status >= 500);
+    assert!(!h.svc.ledger.has_volume("lane-a", "data"));
+    assert!(!h.svc.ledger.has_volume("lane-a", "other"));
+    assert!(!h.svc.volume_fenced("data"));
+    assert!(!h.svc.volume_fenced("other"));
+}
+
+/// The implicit create's dial fails after the inspect worked (the engine is
+/// gone between the two calls): nothing was sent, so the reservation is given
+/// back and nothing is fenced.
+#[test]
+fn an_implicit_volume_create_that_could_not_be_dialed_gives_the_reservation_back() {
+    let socket = std::env::temp_dir()
+        .join(format!("e3-ep-{}-implicitdialw4", std::process::id()))
+        .join("engine.sock");
+    let h = H::new(
+        "implicitdialw4",
+        false,
+        Arc::new(move |req, s| {
+            if req.method == "GET" && req.target == "/volumes/other" {
+                answer(s, 404, "{\"message\":\"no such volume\"}");
+                let _ = std::fs::remove_file(&socket);
+                return true;
+            }
+            false
+        }),
+        |_| {},
+    );
+    let sock = h.serve(&h.auth);
+    let create = r#"{"Image":"busybox","HostConfig":{"Binds":["other:/x"]}}"#;
+    let (status, reply) = call(&sock, "POST", "/containers/create", Some(create));
+    assert!(status >= 500, "{status} {reply}");
+    assert!(!h.svc.ledger.has_volume("lane-a", "other"));
+    assert!(!h.svc.volume_fenced("other"));
 }
 
 fn raw_exchange(sock: &Path, request: &str, keep_reading_for: Duration) -> String {

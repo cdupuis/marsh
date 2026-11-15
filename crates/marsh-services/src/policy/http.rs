@@ -146,6 +146,9 @@ pub struct Conn {
     pos: usize,
     pub limits: HttpLimits,
     pub poll: Option<Poll>,
+    /// One absolute end for every read on this connection (head, body, chunk
+    /// framing, trailers): no read waits past it, whatever the per-read limits.
+    pub hard_deadline: Option<Instant>,
 }
 
 fn is_tchar(b: u8) -> bool {
@@ -161,6 +164,7 @@ impl Conn {
             pos: 0,
             limits,
             poll: None,
+            hard_deadline: None,
         }
     }
 
@@ -188,7 +192,13 @@ impl Conn {
     }
 
     fn fill(&mut self, wait: Duration) -> Result<usize, HttpError> {
-        let deadline = Instant::now() + wait;
+        let mut deadline = Instant::now() + wait;
+        if let Some(hard) = self.hard_deadline {
+            if Instant::now() >= hard {
+                return Err(HttpError::Timeout);
+            }
+            deadline = deadline.min(hard);
+        }
         let mut tmp = [0u8; 16 * 1024];
         loop {
             let left = deadline.saturating_duration_since(Instant::now());

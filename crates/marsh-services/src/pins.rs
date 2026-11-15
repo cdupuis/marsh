@@ -870,7 +870,14 @@ mod imp {
         let mut rep = RestoreReport::default();
         let ledger_err = |e: crate::ledger::LedgerError| std::io::Error::other(e.to_string());
         for (id, rec) in ledger.pins() {
-            match mgr.restore(&id, &rec, &ledger.protected(&rec.project_root)) {
+            let restored = if ledger.quarantined() {
+                Err(PinError::Refused(
+                    "the ledger was corrupt: protected paths are unknown".into(),
+                ))
+            } else {
+                mgr.restore(&id, &rec, &ledger.protected(&rec.project_root))
+            };
+            match restored {
                 Ok(()) => {
                     ledger.set_pin_failed(&id, false).map_err(ledger_err)?;
                     rep.restored.push(id);
@@ -1111,5 +1118,82 @@ mod tests {
         assert!(read_only("foo", true));
         assert!(read_only("foo/f", false));
         std::fs::remove_dir_all(&project).unwrap();
+    }
+
+    /// Engine-up's restore with a corrupt-ledger note present: the recorded
+    /// protected identities cannot be trusted, so no pin is recreated. It is
+    /// poisoned and flagged failed, and the container holding it is blocked.
+    /// (Without the note the restore would try to mount and fail for another
+    /// reason, so the message is part of the check.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_recreates_no_pin_while_the_ledger_is_quarantined() {
+        use crate::ledger::{ContainerRec, Ledger, Paths, PinRec};
+        let dir = std::env::temp_dir().join(format!("pins-quarantine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        let paths = Paths {
+            ledger: dir.join("ledger.json"),
+            bind_root: dir.join("binds"),
+            socket_root: dir.join("socks"),
+        };
+        std::fs::create_dir_all(&paths.bind_root).unwrap();
+        {
+            let ledger = Ledger::open(&paths.ledger).unwrap();
+            ledger
+                .add_pin(
+                    "pin1",
+                    PinRec {
+                        scope: "lane-a".into(),
+                        project_root: dir.join("project").display().to_string(),
+                        rel: String::new(),
+                        read_only: false,
+                        is_dir: true,
+                        subs: Vec::new(),
+                        dev: 0,
+                        ino: 0,
+                        created: 0,
+                        failed: false,
+                    },
+                )
+                .unwrap();
+            ledger
+                .add_container(
+                    "c1",
+                    ContainerRec {
+                        scope: "lane-a".into(),
+                        attempt: "a1".into(),
+                        name: None,
+                        pins: vec!["pin1".into()],
+                        created: 0,
+                    },
+                )
+                .unwrap();
+        }
+        std::fs::write(
+            paths.ledger.with_extension("quarantine"),
+            "corrupt ledger kept as x\n",
+        )
+        .unwrap();
+        let ledger = Ledger::open(&paths.ledger).unwrap();
+        assert!(ledger.quarantined());
+        let report = restore_all_in(&paths, &ledger).unwrap();
+        assert!(report.restored.is_empty(), "{:?}", report.restored);
+        assert_eq!(report.failed.len(), 1);
+        assert!(
+            report.failed[0].1.contains("ledger was corrupt"),
+            "{:?}",
+            report.failed
+        );
+        assert_eq!(report.blocked_containers, ["c1"]);
+        assert!(ledger.pin("pin1").unwrap().failed);
+        assert!(ledger.container_has_failed_pin("c1"));
+        assert!(
+            std::fs::symlink_metadata(paths.bind_root.join("lane-a").join("pin1"))
+                .unwrap()
+                .is_symlink(),
+            "the pin path is poisoned"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

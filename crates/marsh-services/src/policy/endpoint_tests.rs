@@ -512,7 +512,8 @@ fn a_ledger_write_failure_refuses_and_leaves_no_engine_object() {
     assert_eq!(st, 201, "baseline create: {body}");
     assert_eq!(h.engine.created.load(Ordering::SeqCst), 1);
 
-    let tmp = h.dir.join("ledger.json.tmp");
+    let tmp = h.dir.join("ledger.lock");
+    std::fs::remove_file(&tmp).unwrap();
     std::fs::create_dir(&tmp).unwrap();
     let (st, body) = call(&sock, "POST", "/containers/create", Some(CREATE));
     assert_eq!(st, 503, "an unsaved create was acknowledged: {body}");
@@ -530,6 +531,1522 @@ fn a_ledger_write_failure_refuses_and_leaves_no_engine_object() {
     std::fs::remove_dir(&tmp).unwrap();
     let (st, body) = call(&sock, "POST", "/containers/create", Some(CREATE));
     assert_eq!(st, 201, "admission did not resume: {body}");
+}
+
+/// A second agent serving the same ledger (a replacement that started before
+/// the old relay exited) is refused, so it cannot answer from a stale view and
+/// let a request delete a volume the ledger has since given to another
+/// workspace.
+#[test]
+fn a_second_serving_agent_on_one_ledger_is_refused() {
+    let h = H::new("secondagent", true, no_custom(), |_| {});
+    let mut cfg = Config::default();
+    cfg.paths.ledger = h.dir.join("ledger.json");
+    cfg.ledger_serve_wait = Duration::from_millis(100);
+    let error = Services::new(cfg.clone(), &h.dir.join("engine.sock"))
+        .err()
+        .expect("a second server must be refused");
+    assert!(error.to_string().contains("another agent"), "{error}");
+    drop(h);
+    assert!(Services::new(cfg, &scratch("secondagent-engine").join("e.sock")).is_ok());
+}
+
+/// A corrupt ledger forgets which paths are protected: binds of a project
+/// folder are refused (nothing reaches the engine) until an operator clears
+/// the note; other requests still work.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_corrupt_ledger_refuses_project_binds_but_not_other_creates() {
+    let h = H::new("quarantine", true, no_custom(), |_| {});
+    std::fs::create_dir_all(h.dir.join("data")).unwrap();
+    std::fs::write(
+        h.dir.join("ledger.quarantine"),
+        "corrupt ledger kept as x\n",
+    )
+    .unwrap();
+    let sock = h.serve(&h.auth);
+    let body = format!(
+        r#"{{"Image":"busybox","HostConfig":{{"Binds":["{}:/data"]}}}}"#,
+        h.dir.join("data").display()
+    );
+    let (status, reply) = call(&sock, "POST", "/containers/create", Some(&body));
+    assert_eq!(status, 403, "{reply}");
+    assert!(
+        reply.contains(&h.dir.join("ledger.quarantine").display().to_string()),
+        "the full path of the note: {reply}"
+    );
+    assert_eq!(h.engine.created.load(Ordering::SeqCst), 0);
+    let (status, reply) = call(&sock, "POST", "/containers/create", Some(CREATE));
+    assert_eq!(status, 201, "{reply}");
+}
+
+/// An engine whose volumes are a name -> body map; the first `DELETE` waits
+/// for `gate` before removing the name (a request that is already at the
+/// engine when its caller is gone, or has given up).
+struct VolumeEngine {
+    store: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    deletes: Arc<AtomicUsize>,
+    first_done: Arc<AtomicBool>,
+    gate: Arc<AtomicBool>,
+    /// 0: delete normally; otherwise answer every DELETE with this status.
+    delete_status: Arc<std::sync::atomic::AtomicU16>,
+    /// Hold every DELETE (not only the first) until `gate`.
+    hold_all_deletes: Arc<AtomicBool>,
+    /// 0: create normally; otherwise answer every volume CREATE with this status.
+    create_status: Arc<std::sync::atomic::AtomicU16>,
+    /// Hold the next volume CREATE until `create_release`; `held_create_done`
+    /// is set when it has been answered.
+    hold_next_create: Arc<AtomicBool>,
+    create_release: Arc<AtomicBool>,
+    held_create_done: Arc<AtomicBool>,
+}
+
+impl VolumeEngine {
+    fn new() -> Self {
+        Self {
+            store: Arc::default(),
+            deletes: Arc::default(),
+            first_done: Arc::default(),
+            gate: Arc::default(),
+            delete_status: Arc::default(),
+            create_status: Arc::default(),
+            hold_all_deletes: Arc::default(),
+            hold_next_create: Arc::default(),
+            create_release: Arc::default(),
+            held_create_done: Arc::default(),
+        }
+    }
+
+    fn handler(&self) -> Handler {
+        let (store, deletes, gate, first_done, delete_status) = (
+            self.store.clone(),
+            self.deletes.clone(),
+            self.gate.clone(),
+            self.first_done.clone(),
+            self.delete_status.clone(),
+        );
+        let create_status = self.create_status.clone();
+        let (hold_all, hold_create, release, create_done) = (
+            self.hold_all_deletes.clone(),
+            self.hold_next_create.clone(),
+            self.create_release.clone(),
+            self.held_create_done.clone(),
+        );
+        // One removal of a name at a time, in no particular order.
+        let by_name: Arc<Mutex<()>> = Arc::default();
+        Arc::new(move |req, s| {
+            let name = req.target.trim_start_matches("/volumes/").to_owned();
+            match (req.method.as_str(), req.target.as_str()) {
+                ("GET", "/containers/json?all=1" | "/networks") => {
+                    answer(s, 200, "[]");
+                    true
+                }
+                ("GET", "/volumes") => {
+                    let bodies = store.lock().unwrap().values().cloned().collect::<Vec<_>>();
+                    answer(s, 200, &format!("{{\"Volumes\":[{}]}}", bodies.join(",")));
+                    true
+                }
+                ("POST", "/volumes/create")
+                    if String::from_utf8_lossy(&req.body).contains("\"slowbody\"") =>
+                {
+                    // A valid head, then the body only much later.
+                    let _ = s.write_all(
+                        b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n",
+                    );
+                    std::thread::sleep(Duration::from_millis(1500));
+                    let _ = s.write_all(b"{}");
+                    true
+                }
+                ("POST", "/volumes/create")
+                    if String::from_utf8_lossy(&req.body).contains("\"bigreply\"") =>
+                {
+                    answer(s, 201, &"x".repeat(4 << 20));
+                    true
+                }
+                ("POST", "/volumes/create") if create_status.load(Ordering::SeqCst) != 0 => {
+                    answer(
+                        s,
+                        create_status.load(Ordering::SeqCst),
+                        "{\"message\":\"refused\"}",
+                    );
+                    true
+                }
+                ("POST", "/volumes/create")
+                    if !String::from_utf8_lossy(&req.body).contains("\"Name\":\"") =>
+                {
+                    // A nameless create: the engine picks the name.
+                    let body = "{\"Name\":\"anon-1\",\"Labels\":{}}".to_owned();
+                    store.lock().unwrap().insert("anon-1".into(), body.clone());
+                    answer(s, 201, &body);
+                    true
+                }
+                ("POST", "/volumes/create") => {
+                    let held = hold_create.swap(false, Ordering::SeqCst);
+                    if held {
+                        while !release.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    let body = String::from_utf8_lossy(&req.body).into_owned();
+                    let named = body
+                        .split("\"Name\":\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or("")
+                        .to_owned();
+                    store.lock().unwrap().insert(named, body.clone());
+                    answer(s, 201, &body);
+                    if held {
+                        create_done.store(true, Ordering::SeqCst);
+                    }
+                    true
+                }
+                ("GET", t) if t.starts_with("/volumes/") => {
+                    match store.lock().unwrap().get(&name).cloned() {
+                        Some(body) => answer(s, 200, &body),
+                        None => answer(s, 404, "{\"message\":\"no such volume\"}"),
+                    }
+                    true
+                }
+                ("DELETE", t) if t.starts_with("/volumes/") => {
+                    if name == "bigdel" {
+                        // An error answer with a large body (the owner keeps the volume).
+                        answer(s, 409, &"x".repeat(4 << 20));
+                        return true;
+                    }
+                    if name == "drip" {
+                        // A reply that trickles in, a byte at a time.
+                        let _ = s.write_all(b"HTTP/1.1 500 X\r\nContent-Length: 1000\r\n\r\n");
+                        for _ in 0..1000 {
+                            if s.write_all(b"x").is_err() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        return true;
+                    }
+                    // Accepted first, executed whenever it gets the name's lock:
+                    // a request can be delayed before the lock while a later one
+                    // runs (arrival order is not execution order).
+                    let first = deletes.fetch_add(1, Ordering::SeqCst) == 0;
+                    if first || hold_all.load(Ordering::SeqCst) {
+                        while !gate.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    let _one_at_a_time = by_name.lock().unwrap();
+                    let status = delete_status.load(Ordering::SeqCst);
+                    if status != 0 {
+                        answer(s, status, "{\"message\":\"refused\"}");
+                        return true;
+                    }
+                    let found = store.lock().unwrap().remove(&name).is_some();
+                    if found {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 204 No Content\r\nApi-Version: 1.45\r\nConnection: close\r\n\r\n",
+                        );
+                    } else {
+                        answer(s, 404, "{\"message\":\"no such volume\"}");
+                    }
+                    if first {
+                        first_done.store(true, Ordering::SeqCst);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        })
+    }
+}
+
+fn lane_b(h: &H) -> Authority {
+    Authority {
+        project_root: h.dir.clone(),
+        workspace: "lane-b".into(),
+        attempt: "att2".into(),
+    }
+}
+
+/// The caller of a DELETE that is already at the engine goes away. The name
+/// stays reserved until the engine has finished: a second delete and lane B's
+/// create wait, so the pending one cannot remove lane B's replacement.
+#[test]
+fn a_delete_whose_client_disconnected_still_holds_the_name_until_the_engine_finishes() {
+    let engine = VolumeEngine::new();
+    let h = H::new("deletegone", false, engine.handler(), |_| {});
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    let (status, body) = call(
+        &sock_a,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"data"}"#),
+    );
+    assert_eq!(status, 201, "{body}");
+
+    {
+        let mut c = UnixStream::connect(&sock_a).unwrap();
+        c.write_all(b"DELETE /volumes/data HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        assert!(wait_for(Duration::from_secs(5), || engine
+            .deletes
+            .load(Ordering::SeqCst)
+            == 1));
+    } // the client is gone
+    let second = {
+        let sock = sock_a.clone();
+        std::thread::spawn(move || call(&sock, "DELETE", "/volumes/data", None).0)
+    };
+    let create_b = {
+        let sock = sock_b.clone();
+        std::thread::spawn(move || {
+            call(&sock, "POST", "/volumes/create", Some(r#"{"Name":"data"}"#)).0
+        })
+    };
+    // Long enough for the endpoint to notice the vanished client.
+    std::thread::sleep(Duration::from_millis(3500));
+    assert!(
+        !second.is_finished(),
+        "the name was released with the client"
+    );
+    assert!(
+        !create_b.is_finished(),
+        "another workspace claimed the name"
+    );
+    engine.gate.store(true, Ordering::SeqCst);
+    second.join().unwrap();
+    assert_eq!(create_b.join().unwrap(), 201);
+    assert!(engine.first_done.load(Ordering::SeqCst));
+    assert!(
+        engine.store.lock().unwrap().contains_key("data"),
+        "lane B's volume was deleted"
+    );
+    assert!(h.svc.ledger.has_volume("lane-b", "data"));
+}
+
+/// A lane A volume whose first DELETE the engine does not answer in time (it
+/// is held at the engine until `gate`), on a Services with short deadlines.
+const SHORT_FENCE: Duration = Duration::from_millis(2500);
+
+fn timed_out_delete(name: &str) -> (VolumeEngine, H, PathBuf, PathBuf) {
+    let engine = VolumeEngine::new();
+    let h = H::new(name, false, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(250);
+        cfg.delete_fence = SHORT_FENCE;
+    });
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    let (status, body) = call(
+        &sock_a,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"data"}"#),
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, _) = call(&sock_a, "DELETE", "/volumes/data", None);
+    assert_eq!(status, 502, "the first delete timed out");
+    (engine, h, sock_a, sock_b)
+}
+
+fn release_first_delete(engine: &VolumeEngine) {
+    engine.gate.store(true, Ordering::SeqCst);
+    assert!(wait_for(Duration::from_secs(5), || engine
+        .first_done
+        .load(Ordering::SeqCst)));
+}
+
+const DATA: Option<&str> = Some(r#"{"Name":"data"}"#);
+
+/// The engine does not answer a DELETE in time: its outcome is unknown, so the
+/// name is fenced against OTHER workspaces until the fence expires, whatever
+/// else happens meanwhile: the owner's retry succeeding (the first request may
+/// still be queued at the engine and run later), the engine showing the name
+/// absent, or the reconciler dropping the ledger entry. Lane B then creates
+/// its volume only after the fence expired, and keeps it.
+#[test]
+fn another_workspace_waits_out_the_fence_of_a_delete_that_was_not_answered() {
+    let (engine, h, sock_a, sock_b) = timed_out_delete("dt1");
+    // The retry runs ahead of the first request and removes the volume.
+    assert_eq!(call(&sock_a, "DELETE", "/volumes/data", None).0, 204);
+    assert!(!h.svc.ledger.has_volume("lane-a", "data"));
+    assert!(!engine.store.lock().unwrap().contains_key("data"));
+    // Neither that answer, nor an absent inspect, nor the reconciler ends it.
+    h.svc.reconcile();
+    assert_eq!(call(&sock_b, "POST", "/volumes/create", DATA).0, 503);
+    assert!(h.svc.volume_fenced("data"));
+    // The first request finally runs (and finds nothing to remove) ...
+    release_first_delete(&engine);
+    assert_eq!(call(&sock_b, "POST", "/volumes/create", DATA).0, 503);
+    // ... and once the fence has expired lane B's volume is created and stays.
+    std::thread::sleep(SHORT_FENCE + Duration::from_millis(300));
+    let (status, body) = call(&sock_b, "POST", "/volumes/create", DATA);
+    assert_eq!(status, 201, "{body}");
+    assert!(engine.store.lock().unwrap().contains_key("data"));
+    assert!(h.svc.ledger.has_volume("lane-b", "data"));
+    assert!(!h.svc.volume_fenced("data"));
+}
+
+/// The fence protects other workspaces from the late landing of a delete the
+/// owner sent; the owner is exempt (a late landing can only remove its own
+/// volume): after a retry released the name, it re-creates it at once, by
+/// create and by a container with a named volume.
+#[test]
+fn the_workspace_that_sent_the_delete_is_not_refused_by_its_own_fence() {
+    let (engine, h, sock_a, _) = timed_out_delete("dt2");
+    assert_eq!(call(&sock_a, "DELETE", "/volumes/data", None).0, 204);
+    let (status, body) = call(&sock_a, "POST", "/volumes/create", DATA);
+    assert_eq!(status, 201, "{body}");
+    assert!(h.svc.volume_fenced("data"));
+    let create = r#"{"Image":"busybox","HostConfig":{"Binds":["data:/x"]}}"#;
+    let (status, body) = call(&sock_a, "POST", "/containers/create", Some(create));
+    assert_eq!(status, 201, "{body}");
+    release_first_delete(&engine);
+}
+
+/// `docker run -v data:/x` creates the named volume through another path
+/// (`ensure_volume`): it honors the fence against other workspaces too.
+#[test]
+fn a_container_create_by_another_workspace_honors_the_fence() {
+    let (engine, h, sock_a, sock_b) = timed_out_delete("dt4");
+    assert_eq!(call(&sock_a, "DELETE", "/volumes/data", None).0, 204);
+    let create = r#"{"Image":"busybox","HostConfig":{"Binds":["data:/x"]}}"#;
+    let (status, reply) = call(&sock_b, "POST", "/containers/create", Some(create));
+    assert_eq!(status, 503, "{reply}");
+    assert_eq!(h.engine.created.load(Ordering::SeqCst), 0);
+    release_first_delete(&engine);
+    std::thread::sleep(SHORT_FENCE + Duration::from_millis(300));
+    let (status, reply) = call(&sock_b, "POST", "/containers/create", Some(create));
+    assert_eq!(status, 201, "{reply}");
+}
+
+/// The first client disconnects, the engine does not answer within the
+/// deadline (the delete is fenced), the owner retries and succeeds, and lane B
+/// is still refused until expiry: its replacement survives the first request.
+#[test]
+fn a_disconnected_delete_that_timed_out_fences_the_name_too() {
+    let engine = VolumeEngine::new();
+    let h = H::new("dt5", false, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(250);
+        cfg.delete_fence = SHORT_FENCE;
+    });
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    assert_eq!(call(&sock_a, "POST", "/volumes/create", DATA).0, 201);
+    {
+        let mut c = UnixStream::connect(&sock_a).unwrap();
+        c.write_all(b"DELETE /volumes/data HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+    }
+    assert!(wait_for(Duration::from_secs(5), || h
+        .svc
+        .volume_fenced("data")));
+    assert_eq!(call(&sock_a, "DELETE", "/volumes/data", None).0, 204);
+    assert_eq!(call(&sock_b, "POST", "/volumes/create", DATA).0, 503);
+    release_first_delete(&engine);
+    std::thread::sleep(SHORT_FENCE + Duration::from_millis(300));
+    assert_eq!(call(&sock_b, "POST", "/volumes/create", DATA).0, 201);
+    assert!(engine.store.lock().unwrap().contains_key("data"));
+}
+
+/// A delete that never reached the engine (it could not be dialed) leaves
+/// nothing pending, so nothing is fenced.
+#[test]
+fn a_delete_that_was_never_sent_fences_nothing() {
+    let engine = VolumeEngine::new();
+    let h = H::new("deletenotsent", false, engine.handler(), |_| {});
+    let sock = h.serve(&h.auth);
+    assert_eq!(call(&sock, "POST", "/volumes/create", DATA).0, 201);
+    std::fs::remove_file(h.dir.join("engine.sock")).unwrap();
+    assert_eq!(call(&sock, "DELETE", "/volumes/data", None).0, 502);
+    assert!(!h.svc.volume_fenced("data"));
+    assert!(h.svc.ledger.has_volume("lane-a", "data"));
+}
+
+/// An engine that answers with an error (the volume is in use, or it failed)
+/// has answered: lane A keeps the volume and the reply is the engine's.
+#[test]
+fn an_engine_error_on_delete_keeps_the_owner_and_is_passed_on() {
+    for status in [409_u16, 500] {
+        let engine = VolumeEngine::new();
+        engine.gate.store(true, Ordering::SeqCst);
+        let h = H::new("deleteerror", false, engine.handler(), |_| {});
+        let sock = h.serve(&h.auth);
+        assert_eq!(call(&sock, "POST", "/volumes/create", DATA).0, 201);
+        engine.delete_status.store(status, Ordering::SeqCst);
+        let (got, body) = call(&sock, "DELETE", "/volumes/data", None);
+        assert_eq!(got, status);
+        assert!(body.contains("refused"), "{body}");
+        assert!(h.svc.ledger.has_volume("lane-a", "data"), "{status}");
+        assert!(!h.svc.volume_fenced("data"), "{status}");
+        assert!(engine.store.lock().unwrap().contains_key("data"));
+    }
+}
+
+/// A create that was admitted before a delete (and so before any fence) must
+/// not publish its ownership after that delete and a later fence: volume
+/// creates and deletes of a name run one at a time from admission to the end
+/// of the engine call, so the delete waits for the create instead of
+/// overtaking it.
+#[test]
+fn a_volume_create_holds_the_name_from_admission_to_the_end_of_its_engine_call() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("createhold", false, engine.handler(), |_| {});
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    assert_eq!(call(&sock_b, "POST", "/volumes/create", DATA).0, 201);
+    engine.hold_next_create.store(true, Ordering::SeqCst);
+    let second_create = {
+        let sock = sock_b.clone();
+        std::thread::spawn(move || call(&sock, "POST", "/volumes/create", DATA).0)
+    };
+    // Admitted and at the engine.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !engine.hold_next_create.load(Ordering::SeqCst),
+        "the create never reached the engine"
+    );
+    let delete_b = {
+        let sock = sock_b.clone();
+        std::thread::spawn(move || call(&sock, "DELETE", "/volumes/data", None).0)
+    };
+    let create_a = {
+        let sock = sock_a.clone();
+        std::thread::spawn(move || call(&sock, "POST", "/volumes/create", DATA).0)
+    };
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !delete_b.is_finished(),
+        "a delete overtook a create at the engine"
+    );
+    assert!(
+        !create_a.is_finished(),
+        "another workspace claimed the name meanwhile"
+    );
+    engine.create_release.store(true, Ordering::SeqCst);
+    assert_eq!(second_create.join().unwrap(), 201);
+    assert!(engine.held_create_done.load(Ordering::SeqCst));
+    assert_eq!(delete_b.join().unwrap(), 204);
+    // Whichever of the two waiting requests ran first decides lane A's answer:
+    // refused while lane B still owned the name, or created after B's delete.
+    let a_status = create_a.join().unwrap();
+    assert!(matches!(a_status, 201 | 403), "{a_status}");
+    assert_eq!(h.svc.ledger.has_volume("lane-a", "data"), a_status == 201);
+    assert!(
+        !h.svc.ledger.has_volume("lane-b", "data"),
+        "lane B deleted it"
+    );
+}
+
+/// A retry that the engine answers 404 (the first request finished late)
+/// releases the name like any answered delete.
+#[test]
+fn a_delete_retry_answered_404_releases_the_name() {
+    let (engine, h, sock_a, _) = timed_out_delete("dt6");
+    release_first_delete(&engine);
+    assert_eq!(call(&sock_a, "DELETE", "/volumes/data", None).0, 404);
+    assert!(!h.svc.ledger.has_volume("lane-a", "data"));
+}
+
+/// Each unanswered delete refreshes the fence: a second failure well after the
+/// first extends it past the first one's expiry.
+#[test]
+fn a_repeated_unanswered_delete_refreshes_the_fence_time() {
+    let (engine, h, sock_a, sock_b) = timed_out_delete("dt7");
+    engine.hold_all_deletes.store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(1700));
+    assert_eq!(call(&sock_a, "DELETE", "/volumes/data", None).0, 502);
+    // Past the first failure's expiry (2.5 s), inside the second's.
+    std::thread::sleep(Duration::from_millis(900));
+    assert!(h.svc.volume_fenced("data"));
+    assert_eq!(call(&sock_b, "POST", "/volumes/create", DATA).0, 503);
+    engine.gate.store(true, Ordering::SeqCst);
+}
+
+/// The terminal chunk arriving a byte at a time (each piece inside the
+/// per-read limit) is cut off by the call's absolute deadline, in time.
+#[test]
+fn a_drip_fed_terminal_chunk_obeys_the_whole_call_deadline() {
+    let h = H::new(
+        "dripterminalw4",
+        false,
+        Arc::new(|req, s| {
+            if req.method != "DELETE" {
+                return false;
+            }
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            for byte in b"0\r\n\r\n" {
+                std::thread::sleep(Duration::from_millis(120));
+                if s.write_all(&[*byte]).is_err() {
+                    return true;
+                }
+            }
+            true
+        }),
+        |cfg| cfg.up_progress = Duration::from_millis(200),
+    );
+    let sock = h.serve(&h.auth);
+    h.svc.ledger.claim_volume("lane-a", "att1", "data").unwrap();
+    let started = Instant::now();
+    let (status, _) = call(&sock, "DELETE", "/volumes/data", None);
+    assert_eq!(
+        status,
+        502,
+        "accepted a reply after {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(450),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(h.svc.volume_fenced("data"));
+}
+
+/// A request that the engine reads slowly (partial writes, each inside the
+/// write timeout) is cut off by the same deadline.
+#[test]
+fn a_slowly_read_request_obeys_the_whole_call_deadline() {
+    let h = H::new("slowwritew4", false, no_custom(), |cfg| {
+        cfg.up_progress = Duration::from_millis(200);
+    });
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut buf = vec![0_u8; 8 * 1024];
+        while let Ok(n) = server.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    });
+    let body = vec![b'x'; 8 * 1024 * 1024];
+    let started = Instant::now();
+    let result = h
+        .svc
+        .exchange(client, "POST", "/volumes/create", Some(&body));
+    assert!(result.is_err());
+    assert!(
+        started.elapsed() < Duration::from_millis(600),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(reader);
+}
+
+/// A volume create is made by the agent, not through the client's connection:
+/// the client leaving cannot end it early. Lane A's create is held at the
+/// engine and A disconnects; lane B's create of the name waits (it is not let
+/// in after the old 2 s disconnect poll), and when A's create lands its
+/// ownership is recorded, so B is refused and nothing is left without an owner.
+#[test]
+fn a_volume_create_whose_client_disconnected_still_records_its_owner() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("createdisc", false, engine.handler(), |_| {});
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    engine.hold_next_create.store(true, Ordering::SeqCst);
+    {
+        let mut c = UnixStream::connect(&sock_a).unwrap();
+        let body = r#"{"Name":"data"}"#;
+        write!(
+            c,
+            "POST /volumes/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        assert!(wait_for(Duration::from_secs(5), || !engine
+            .hold_next_create
+            .load(Ordering::SeqCst)));
+    } // A is gone, its create still at the engine
+    let create_b = {
+        let sock = sock_b.clone();
+        std::thread::spawn(move || call(&sock, "POST", "/volumes/create", DATA).0)
+    };
+    std::thread::sleep(Duration::from_millis(2600));
+    assert!(
+        !create_b.is_finished(),
+        "the name was released with the client"
+    );
+    assert!(!engine.store.lock().unwrap().contains_key("data"));
+    engine.create_release.store(true, Ordering::SeqCst);
+    assert_eq!(
+        create_b.join().unwrap(),
+        403,
+        "lane A's create was recorded first"
+    );
+    assert!(engine.store.lock().unwrap().contains_key("data"));
+    assert!(h.svc.ledger.has_volume("lane-a", "data"));
+    assert!(!h.svc.ledger.has_volume("lane-b", "data"));
+}
+
+/// A create the engine does not answer is bounded by the call deadline like a
+/// delete: the lock is not held past it (another name's create goes through),
+/// the reservation stays with the sender, and the name is fenced against other
+/// workspaces, which the sender itself is exempt from.
+#[test]
+fn a_hung_volume_create_is_bounded_and_fences_the_name() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("createhung", false, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(300);
+        cfg.delete_fence = SHORT_FENCE;
+    });
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    engine.hold_next_create.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    let first = {
+        let sock = sock_a.clone();
+        std::thread::spawn(move || call(&sock, "POST", "/volumes/create", DATA).0)
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    let (status, _) = call(
+        &sock_b,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"other"}"#),
+    );
+    assert_eq!(status, 201);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(first.join().unwrap(), 502);
+    assert!(
+        h.svc.ledger.has_volume("lane-a", "data"),
+        "the reservation was given up"
+    );
+    assert!(h.svc.volume_fenced("data"));
+    assert_eq!(call(&sock_b, "POST", "/volumes/create", DATA).0, 503);
+    assert_eq!(
+        call(&sock_a, "POST", "/volumes/create", DATA).0,
+        201,
+        "the sender is exempt"
+    );
+    engine.create_release.store(true, Ordering::SeqCst);
+}
+
+/// The lock a volume create holds for its whole request is released with it: a
+/// later request on the same connection (the same thread) takes it again.
+#[test]
+fn a_connection_takes_the_volume_lock_again_after_a_volume_create() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("lockflag", false, engine.handler(), |_| {});
+    let sock = h.serve(&h.auth);
+    let mut c = UnixStream::connect(&sock).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let body = r#"{"Name":"data"}"#;
+    write!(
+        c,
+        "POST /volumes/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut buf = vec![0_u8; 4096];
+    let n = c.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 201"));
+    // Another thread holds the volume lock; the next request on this
+    // connection (a container with a named volume) must wait for it.
+    let held = h.svc.vol_lock.lock().unwrap();
+    let create = r#"{"Image":"busybox","HostConfig":{"Binds":["data:/x"]}}"#;
+    write!(
+        c,
+        "POST /containers/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{create}",
+        create.len()
+    )
+    .unwrap();
+    c.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    assert!(
+        c.read(&mut buf).is_err(),
+        "the request did not wait for the volume lock"
+    );
+    drop(held);
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let n = c.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 201"));
+}
+
+/// A create whose engine body is slow does not hold every workspace's volume
+/// lock past the call deadline: another workspace's create of another name goes
+/// through while the first is still waiting for its body.
+#[test]
+fn a_slow_engine_body_does_not_block_other_workspaces_past_the_deadline() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("slowbodyw4", false, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(250);
+    });
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    let started = Instant::now();
+    let slow = {
+        let sock = sock_a.clone();
+        std::thread::spawn(move || {
+            call(
+                &sock,
+                "POST",
+                "/volumes/create",
+                Some(r#"{"Name":"slowbody"}"#),
+            )
+            .0
+        })
+    };
+    std::thread::sleep(Duration::from_millis(80));
+    let (status, _) = call(
+        &sock_b,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"other"}"#),
+    );
+    assert_eq!(status, 201);
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(slow.join().unwrap(), 502);
+}
+
+/// A client that never reads its reply does not hold the volume lock: the
+/// engine's answer is in memory and recorded, and the lock is released before
+/// the reply is written to the client.
+#[test]
+fn a_client_that_does_not_read_its_reply_does_not_block_other_workspaces() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("noreadw4", false, engine.handler(), |_| {});
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    let mut stuck = UnixStream::connect(&sock_a).unwrap();
+    let body = r#"{"Name":"bigreply"}"#;
+    write!(
+        stuck,
+        "POST /volumes/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300)); // the reply is being written
+    let started = Instant::now();
+    let (status, _) = call(
+        &sock_b,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"other"}"#),
+    );
+    assert_eq!(status, 201);
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        h.svc.ledger.has_volume("lane-a", "bigreply"),
+        "recorded before the reply"
+    );
+    drop(stuck);
+}
+
+/// A reader that drains a few hundred bytes at a time (progress inside every
+/// write) cannot stretch the request write past the call deadline.
+#[test]
+fn a_trickling_reader_cannot_stretch_the_request_write_past_the_deadline() {
+    // (bytes per read, pause between reads): progress inside every write.
+    for (chunk, pause) in [(512_usize, 60_u64), (256, 50)] {
+        let h = H::new("trickleww4", false, no_custom(), |cfg| {
+            cfg.up_progress = Duration::from_millis(150);
+        });
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0_u8; chunk];
+            while let Ok(n) = server.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(pause));
+            }
+        });
+        let body = vec![b'x'; 64 * 1024];
+        let started = Instant::now();
+        let result = h
+            .svc
+            .exchange(client, "POST", "/volumes/create", Some(&body));
+        let took = started.elapsed();
+        assert!(result.is_err());
+        assert!(
+            took < Duration::from_millis(450),
+            "{chunk}/{pause}: {took:?}"
+        );
+        reader.join().unwrap();
+    }
+}
+
+/// The same for a delete: its answer is in memory and recorded, and the lock is
+/// released before a reply that its client does not read is written.
+#[test]
+fn a_client_that_does_not_read_a_delete_reply_does_not_block_other_workspaces() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("noreaddelw4", false, engine.handler(), |_| {});
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    assert_eq!(
+        call(
+            &sock_a,
+            "POST",
+            "/volumes/create",
+            Some(r#"{"Name":"bigdel"}"#)
+        )
+        .0,
+        201
+    );
+    let mut stuck = UnixStream::connect(&sock_a).unwrap();
+    stuck
+        .write_all(b"DELETE /volumes/bigdel HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    let (status, _) = call(
+        &sock_b,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"other"}"#),
+    );
+    assert_eq!(status, 201);
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(stuck);
+}
+
+/// The volume create inside a container create (`docker run -v data:/x`) is
+/// agent-owned like an explicit one: when the engine does not answer a SENT
+/// create, the reservation stays with the sender and the name is fenced, so
+/// another workspace cannot adopt (and then delete) the volume that create
+/// makes when it lands late.
+#[test]
+fn an_unanswered_implicit_volume_create_keeps_the_reservation_and_fences_the_name() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("implicitcreatew4", false, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(250);
+        cfg.delete_fence = SHORT_FENCE;
+    });
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    let create = r#"{"Image":"busybox","HostConfig":{"Binds":["data:/x"]}}"#;
+    engine.hold_next_create.store(true, Ordering::SeqCst);
+    let (status, reply) = call(&sock_a, "POST", "/containers/create", Some(create));
+    assert!(status >= 500, "{status} {reply}");
+    assert_eq!(h.engine.created.load(Ordering::SeqCst), 0);
+    assert!(
+        h.svc.ledger.has_volume("lane-a", "data"),
+        "the reservation was given up"
+    );
+    assert!(h.svc.volume_fenced("data"));
+    // Another workspace cannot take the name, directly or implicitly.
+    assert_eq!(call(&sock_b, "POST", "/volumes/create", DATA).0, 503);
+    let (status, _) = call(&sock_b, "POST", "/containers/create", Some(create));
+    assert_eq!(status, 503);
+    // The held create lands late: the volume has its owner.
+    engine.create_release.store(true, Ordering::SeqCst);
+    assert!(wait_for(Duration::from_secs(5), || engine
+        .held_create_done
+        .load(Ordering::SeqCst)));
+    assert!(engine.store.lock().unwrap().contains_key("data"));
+    assert!(h.svc.ledger.has_volume("lane-a", "data"));
+    assert!(!h.svc.ledger.has_volume("lane-b", "data"));
+    // The sender is exempt from its own fence.
+    let (status, reply) = call(&sock_a, "POST", "/containers/create", Some(create));
+    assert_eq!(status, 201, "{reply}");
+}
+
+/// A volume create that never left (the engine could not be dialed) gives
+/// the reservation back, for both the explicit and the implicit path.
+#[test]
+fn a_volume_create_that_was_never_sent_gives_the_reservation_back() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("notsentcreatew4", false, engine.handler(), |_| {});
+    let sock = h.serve(&h.auth);
+    std::fs::remove_file(h.dir.join("engine.sock")).unwrap();
+    assert_eq!(call(&sock, "POST", "/volumes/create", DATA).0, 502);
+    let create = r#"{"Image":"busybox","HostConfig":{"Binds":["other:/x"]}}"#;
+    let (status, _) = call(&sock, "POST", "/containers/create", Some(create));
+    assert!(status >= 500);
+    assert!(!h.svc.ledger.has_volume("lane-a", "data"));
+    assert!(!h.svc.ledger.has_volume("lane-a", "other"));
+    assert!(!h.svc.volume_fenced("data"));
+    assert!(!h.svc.volume_fenced("other"));
+    // Nothing was sent, so nothing is in flight.
+    assert!(!h.svc.create_pending("data"));
+    assert!(!h.svc.create_pending("other"));
+}
+
+/// The implicit create's dial fails after the inspect worked (the engine is
+/// gone between the two calls): nothing was sent, so the reservation is given
+/// back and nothing is fenced.
+#[test]
+fn an_implicit_volume_create_that_could_not_be_dialed_gives_the_reservation_back() {
+    let socket = std::env::temp_dir()
+        .join(format!("e3-ep-{}-implicitdialw4", std::process::id()))
+        .join("engine.sock");
+    let h = H::new(
+        "implicitdialw4",
+        false,
+        Arc::new(move |req, s| {
+            if req.method == "GET" && req.target == "/volumes/other" {
+                answer(s, 404, "{\"message\":\"no such volume\"}");
+                let _ = std::fs::remove_file(&socket);
+                return true;
+            }
+            false
+        }),
+        |_| {},
+    );
+    let sock = h.serve(&h.auth);
+    let create = r#"{"Image":"busybox","HostConfig":{"Binds":["other:/x"]}}"#;
+    let (status, reply) = call(&sock, "POST", "/containers/create", Some(create));
+    assert!(status >= 500, "{status} {reply}");
+    assert!(!h.svc.ledger.has_volume("lane-a", "other"));
+    assert!(!h.svc.volume_fenced("other"));
+}
+
+/// A refused volume request is answered without holding the volume lock: a
+/// client that pipelines refused creates and never reads its replies (the
+/// server's refusal write blocks) cannot stall another workspace's create.
+#[test]
+fn a_client_that_never_reads_its_refusals_does_not_block_other_workspaces() {
+    // Refused creates (a name another workspace owns) and refused deletes (a
+    // name this workspace does not own), pipelined without reading.
+    for (round, request) in [
+        "POST /volumes/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: 16\r\n\r\n{\"Name\":\"owned\"}",
+        "DELETE /volumes/owned HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let engine = VolumeEngine::new();
+        engine.gate.store(true, Ordering::SeqCst);
+        let h = H::new(&format!("refusalsw4{round}"), false, engine.handler(), |_| {});
+        let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+        // Lane B owns `owned`: lane A's requests for it are refused.
+        assert_eq!(
+            call(&sock_b, "POST", "/volumes/create", Some(r#"{"Name":"owned"}"#)).0,
+            201
+        );
+        let stuck = UnixStream::connect(&sock_a).unwrap();
+        let mut writer = stuck.try_clone().unwrap();
+        let batch = request.repeat(4000);
+        let pipelined = std::thread::spawn(move || {
+            let _ = writer.write_all(batch.as_bytes());
+        });
+        std::thread::sleep(Duration::from_millis(1000));
+        let started = Instant::now();
+        let (status, _) = call(&sock_b, "POST", "/volumes/create", Some(r#"{"Name":"other"}"#));
+        assert_eq!(status, 201, "round {round}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "round {round}: {:?}",
+            started.elapsed()
+        );
+        let _ = stuck.shutdown(std::net::Shutdown::Both);
+        drop(stuck);
+        let _ = pipelined.join();
+    }
+}
+
+/// An engine error on a volume create leaves the name unowned (the reservation
+/// made at admission is given back), and a nameless create is owned by its
+/// sender under the name the engine chose.
+#[test]
+fn record_gives_back_a_refused_create_and_claims_a_nameless_one() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("recordw4", false, engine.handler(), |_| {});
+    let sock = h.serve(&h.auth);
+    engine.create_status.store(500, Ordering::SeqCst);
+    assert_eq!(call(&sock, "POST", "/volumes/create", DATA).0, 500);
+    assert!(
+        !h.svc.ledger.has_volume("lane-a", "data"),
+        "the reservation stayed"
+    );
+    engine.create_status.store(0, Ordering::SeqCst);
+    let (status, body) = call(&sock, "POST", "/volumes/create", Some("{}"));
+    assert_eq!(status, 201, "{body}");
+    assert!(h.svc.ledger.has_volume("lane-a", "anon-1"), "{body}");
+}
+
+/// A reconcile (a prune, or the periodic pass) that runs while a volume create
+/// of unknown outcome is still pending must not drop the sender's record of
+/// the volume (older than the 30 s grace, absent from the engine's list): when
+/// the create lands inside the fence it has its owner. After the fence expired
+/// the normal rule applies again.
+#[test]
+fn reconcile_keeps_the_owner_of_a_create_that_may_still_land() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("reconcilecreatew4", true, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(250);
+        cfg.delete_fence = SHORT_FENCE;
+        // An established record (outside reconcile's 30 s grace) for a volume
+        // the engine does not have.
+        std::fs::write(
+            &cfg.paths.ledger,
+            r#"{"containers":{},"networks":{},"volumes":{"data":{"scope":"lane-a","attempt":"att1","created":1}},"execs":{},"pins":{},"scope_networks":{}}"#,
+        )
+        .unwrap();
+    });
+    assert!(
+        !h.svc.ledger.quarantined(),
+        "the seeded ledger did not parse"
+    );
+    assert!(h.svc.ledger.has_volume("lane-a", "data"));
+    let sock_a = h.serve(&h.auth);
+    let create = r#"{"Image":"busybox","HostConfig":{"Binds":["data:/x"]}}"#;
+    engine.hold_next_create.store(true, Ordering::SeqCst);
+    let (status, _) = call(&sock_a, "POST", "/containers/create", Some(create));
+    assert!(status >= 500, "{status}");
+    assert!(h.svc.volume_fenced("data"));
+    h.svc.reconcile();
+    assert!(
+        h.svc.ledger.has_volume("lane-a", "data"),
+        "reconcile dropped the owner"
+    );
+    engine.create_release.store(true, Ordering::SeqCst);
+    assert!(wait_for(Duration::from_secs(5), || engine
+        .held_create_done
+        .load(Ordering::SeqCst)));
+    assert!(engine.store.lock().unwrap().contains_key("data"));
+    h.svc.reconcile();
+    assert!(h.svc.ledger.has_volume("lane-a", "data"));
+    // Once the fence has expired, an absent volume's record goes as usual.
+    engine.store.lock().unwrap().remove("data");
+    std::thread::sleep(SHORT_FENCE + Duration::from_millis(300));
+    h.svc.reconcile();
+    assert!(!h.svc.ledger.has_volume("lane-a", "data"));
+}
+
+const SEEDED_OLD_A: &str = r#"{"containers":{},"networks":{},"volumes":{"data":{"scope":"lane-a","attempt":"att1","created":1}},"execs":{},"pins":{},"scope_networks":{}}"#;
+
+/// The two ways a create of `data` reaches the engine: an explicit create and a
+/// container create with a named volume.
+fn create_request(sock: &Path, implicit: bool) -> u16 {
+    if implicit {
+        let body = r#"{"Image":"busybox","HostConfig":{"Binds":["data:/x"]}}"#;
+        call(sock, "POST", "/containers/create", Some(body)).0
+    } else {
+        call(sock, "POST", "/volumes/create", DATA).0
+    }
+}
+
+/// A reconcile that runs while a create of the name is in flight (before its
+/// outcome is known) must not drop the owner: the name is in the in-flight
+/// registry from before the first byte is sent, and the reconcile cannot
+/// overtake the create.
+#[test]
+fn a_reconcile_during_a_create_that_then_times_out_keeps_the_owner() {
+    for implicit in [false, true] {
+        let engine = VolumeEngine::new();
+        engine.gate.store(true, Ordering::SeqCst);
+        let h = H::new(
+            &format!("inflightreconw4{implicit}"),
+            true,
+            engine.handler(),
+            |cfg| {
+                cfg.up_progress = Duration::from_millis(400);
+                cfg.delete_fence = SHORT_FENCE;
+                std::fs::write(&cfg.paths.ledger, SEEDED_OLD_A).unwrap();
+            },
+        );
+        assert!(h.svc.ledger.has_volume("lane-a", "data"));
+        let sock = h.serve(&h.auth);
+        engine.hold_next_create.store(true, Ordering::SeqCst);
+        let create = {
+            let sock = sock.clone();
+            std::thread::spawn(move || create_request(&sock, implicit))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        // The create is at the engine: a reconcile now sees no volume listed.
+        let svc = h.svc.clone();
+        let reconcile = std::thread::spawn(move || svc.reconcile());
+        assert!(create.join().unwrap() >= 500);
+        reconcile.join().unwrap();
+        h.svc.reconcile();
+        assert!(
+            h.svc.ledger.has_volume("lane-a", "data"),
+            "implicit={implicit}"
+        );
+        engine.create_release.store(true, Ordering::SeqCst);
+        assert!(wait_for(Duration::from_secs(5), || engine
+            .held_create_done
+            .load(Ordering::SeqCst)));
+        assert!(engine.store.lock().unwrap().contains_key("data"));
+        assert!(
+            h.svc.ledger.has_volume("lane-a", "data"),
+            "implicit={implicit}"
+        );
+    }
+}
+
+/// While a create of the name is of unknown outcome, a delete of it by any
+/// workspace, its sender too, is refused (503) instead of being answered 404 and
+/// releasing the name before the late create lands.
+#[test]
+fn a_delete_of_a_name_with_a_create_of_unknown_outcome_is_refused() {
+    for implicit in [false, true] {
+        let engine = VolumeEngine::new();
+        engine.gate.store(true, Ordering::SeqCst);
+        let h = H::new(
+            &format!("deletependingw4{implicit}"),
+            false,
+            engine.handler(),
+            |cfg| {
+                cfg.up_progress = Duration::from_millis(250);
+                cfg.delete_fence = SHORT_FENCE;
+            },
+        );
+        let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+        engine.hold_next_create.store(true, Ordering::SeqCst);
+        assert!(create_request(&sock_a, implicit) >= 500);
+        assert!(h.svc.ledger.has_volume("lane-a", "data"));
+        let (status, body) = call(&sock_a, "DELETE", "/volumes/data", None);
+        assert_eq!(status, 503, "implicit={implicit}: {body}");
+        // The owner is still the owner, and so is it when the create lands.
+        assert!(h.svc.ledger.has_volume("lane-a", "data"));
+        engine.create_release.store(true, Ordering::SeqCst);
+        assert!(wait_for(Duration::from_secs(5), || engine
+            .held_create_done
+            .load(Ordering::SeqCst)));
+        assert!(engine.store.lock().unwrap().contains_key("data"));
+        assert!(h.svc.ledger.has_volume("lane-a", "data"));
+        // Another workspace's delete is not forwarded either.
+        let (status, _) = call(&sock_b, "DELETE", "/volumes/data", None);
+        assert_ne!(status, 204);
+        assert!(engine.store.lock().unwrap().contains_key("data"));
+        // After the fence time the owner can delete.
+        std::thread::sleep(SHORT_FENCE + Duration::from_millis(300));
+        assert_eq!(call(&sock_a, "DELETE", "/volumes/data", None).0, 204);
+    }
+}
+
+/// A reconcile whose engine snapshot is taken while a create is in flight must
+/// not use that snapshot after the create was answered: the snapshot (the
+/// engine's lists) is taken under the volume lock, so a slow create that
+/// succeeds is either fully before or fully after it, and the owner of a record
+/// older than the grace survives.
+#[test]
+fn a_reconcile_cannot_use_a_snapshot_older_than_a_create_it_waited_for() {
+    for implicit in [false, true] {
+        let engine = VolumeEngine::new();
+        engine.gate.store(true, Ordering::SeqCst);
+        let h = H::new(
+            &format!("staleSnapshotw4{implicit}"),
+            true,
+            engine.handler(),
+            |cfg| {
+                cfg.up_progress = Duration::from_secs(5);
+                std::fs::write(&cfg.paths.ledger, SEEDED_OLD_A).unwrap();
+            },
+        );
+        let sock = h.serve(&h.auth);
+        engine.hold_next_create.store(true, Ordering::SeqCst);
+        let create = {
+            let sock = sock.clone();
+            std::thread::spawn(move || create_request(&sock, implicit))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        // The create is at the engine; a reconcile starts now.
+        let svc = h.svc.clone();
+        let reconcile = std::thread::spawn(move || svc.reconcile());
+        std::thread::sleep(Duration::from_millis(300));
+        engine.create_release.store(true, Ordering::SeqCst);
+        assert_eq!(create.join().unwrap(), 201, "implicit={implicit}");
+        reconcile.join().unwrap();
+        assert!(engine.store.lock().unwrap().contains_key("data"));
+        assert!(
+            h.svc.ledger.has_volume("lane-a", "data"),
+            "OWNER LOST (implicit={implicit}): the volume exists, the ledger forgot it"
+        );
+    }
+}
+
+/// A later answered attempt does not complete an earlier unanswered one: after
+/// create #1 timed out, a retry that is answered (201, or an error) must not end
+/// the unknown state, so the owner's delete is still refused and the late
+/// create #1 lands with its owner.
+#[test]
+fn an_answered_retry_does_not_complete_an_earlier_unanswered_create() {
+    for implicit in [false, true] {
+        for retry_status in [0_u16, 500] {
+            let engine = VolumeEngine::new();
+            engine.gate.store(true, Ordering::SeqCst);
+            let h = H::new(
+                &format!("retryw4{implicit}{retry_status}"),
+                false,
+                engine.handler(),
+                |cfg| {
+                    cfg.up_progress = Duration::from_millis(250);
+                    cfg.delete_fence = SHORT_FENCE;
+                },
+            );
+            let sock = h.serve(&h.auth);
+            engine.hold_next_create.store(true, Ordering::SeqCst);
+            assert!(create_request(&sock, implicit) >= 500);
+            // The retry is answered.
+            engine.create_status.store(retry_status, Ordering::SeqCst);
+            let _ = create_request(&sock, implicit);
+            engine.create_status.store(0, Ordering::SeqCst);
+            let label = format!("implicit={implicit} retry={retry_status}");
+            let (status, body) = call(&sock, "DELETE", "/volumes/data", None);
+            assert_eq!(status, 503, "{label}: {body}");
+            assert!(h.svc.ledger.has_volume("lane-a", "data"), "{label}");
+            engine.create_release.store(true, Ordering::SeqCst);
+            assert!(wait_for(Duration::from_secs(5), || engine
+                .held_create_done
+                .load(Ordering::SeqCst)));
+            assert!(engine.store.lock().unwrap().contains_key("data"), "{label}");
+            assert!(h.svc.ledger.has_volume("lane-a", "data"), "{label}");
+        }
+    }
+}
+
+/// The in-flight registry and the fence end at the same instant (the time of the
+/// timeout plus the fence time): there is no gap in which the fence still holds
+/// and the owner's delete is answered 404 before the late create lands.
+#[test]
+fn the_registry_outlasts_the_fence_of_an_unknown_create() {
+    for implicit in [false, true] {
+        let engine = VolumeEngine::new();
+        engine.gate.store(true, Ordering::SeqCst);
+        let h = H::new(
+            &format!("lifetimew4{implicit}"),
+            false,
+            engine.handler(),
+            |cfg| {
+                cfg.up_progress = Duration::from_millis(800);
+                cfg.delete_fence = Duration::from_millis(1200);
+            },
+        );
+        let sock = h.serve(&h.auth);
+        engine.hold_next_create.store(true, Ordering::SeqCst);
+        assert!(create_request(&sock, implicit) >= 500);
+        // The fence runs from the timeout; so must the registry.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(h.svc.volume_fenced("data"));
+        let (status, _) = call(&sock, "DELETE", "/volumes/data", None);
+        assert_eq!(
+            status, 503,
+            "implicit={implicit}: the fence held but the registry did not"
+        );
+        engine.create_release.store(true, Ordering::SeqCst);
+        assert!(wait_for(Duration::from_secs(5), || engine
+            .held_create_done
+            .load(Ordering::SeqCst)));
+        assert!(h.svc.ledger.has_volume("lane-a", "data"));
+    }
+}
+
+/// One clock: the registry entry and the fence of an unknown create both end at
+/// the timeout's time plus the fence time, neither earlier nor later.
+#[test]
+fn an_unknown_creates_registry_entry_and_fence_end_together() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("oneclockw4", false, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(250);
+        cfg.delete_fence = Duration::from_millis(1200);
+    });
+    let sock = h.serve(&h.auth);
+    engine.hold_next_create.store(true, Ordering::SeqCst);
+    assert!(create_request(&sock, false) >= 500);
+    assert!(h.svc.volume_fenced("data") && h.svc.create_pending("data"));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(!h.svc.volume_fenced("data"), "the fence outlived its time");
+    assert!(
+        !h.svc.create_pending("data"),
+        "the registry outlived the fence"
+    );
+    engine.create_release.store(true, Ordering::SeqCst);
+}
+
+fn raw_exchange(sock: &Path, request: &str, keep_reading_for: Duration) -> String {
+    let mut c = UnixStream::connect(sock).unwrap();
+    c.set_read_timeout(Some(keep_reading_for)).unwrap();
+    c.write_all(request.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The reply to a volume delete carries the engine's status line and headers,
+/// no body headers on a 204, and keeps the connection when the client did.
+#[test]
+fn the_delete_reply_is_the_engines_and_keeps_a_keep_alive_connection() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("deletereply", false, engine.handler(), |_| {});
+    let sock = h.serve(&h.auth);
+    for round in 0..2 {
+        assert_eq!(call(&sock, "POST", "/volumes/create", DATA).0, 201);
+        if round == 0 {
+            // Keep-alive: a second request goes down the same connection.
+            let mut c = UnixStream::connect(&sock).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            c.write_all(b"DELETE /volumes/data HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            let mut buf = vec![0_u8; 4096];
+            let n = c.read(&mut buf).unwrap();
+            let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
+            assert!(reply.starts_with("HTTP/1.1 204 No Content\r\n"), "{reply}");
+            assert!(reply.contains("Api-Version: 1.45"), "{reply}");
+            assert!(!reply.contains("Content-Length"), "{reply}");
+            assert!(!reply.contains("Connection: close"), "{reply}");
+            c.write_all(b"GET /volumes/data HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut rest = Vec::new();
+            let _ = c.read_to_end(&mut rest);
+            assert!(
+                String::from_utf8_lossy(&rest).contains("404"),
+                "the connection was closed"
+            );
+        } else {
+            let reply = raw_exchange(
+                &sock,
+                "DELETE /volumes/data HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                Duration::from_secs(5),
+            );
+            assert!(reply.starts_with("HTTP/1.1 204 No Content\r\n"), "{reply}");
+            assert!(reply.contains("Connection: close"), "{reply}");
+            assert!(!reply.contains("Error"), "{reply}");
+        }
+    }
+}
+
+/// An engine that trickles its reply is cut off by the call's total deadline,
+/// not just the per-read one; the delete is then of unknown outcome.
+#[test]
+fn a_trickling_engine_reply_is_bounded_by_the_whole_call() {
+    let engine = VolumeEngine::new();
+    let h = H::new("deletedrip", false, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(400);
+    });
+    let sock = h.serve(&h.auth);
+    assert_eq!(
+        call(&sock, "POST", "/volumes/create", Some(r#"{"Name":"drip"}"#)).0,
+        201
+    );
+    let started = Instant::now();
+    assert_eq!(call(&sock, "DELETE", "/volumes/drip", None).0, 502);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(h.svc.volume_fenced("drip"));
+}
+
+/// A DELETE admitted while lane A owned `data` must not reach the engine after
+/// lane A's ownership ended and lane B created its own `data`: each volume
+/// operation is checked, sent and recorded under one lock, so the later
+/// requests wait for the first (or are refused) instead of overtaking it.
+/// (An earlier DELETE held at the engine, a second DELETE that releases A's
+/// ownership, B's create; then the first is released.)
+#[test]
+fn a_delayed_delete_cannot_remove_a_volume_another_workspace_now_owns() {
+    let store: Arc<Mutex<std::collections::HashMap<String, String>>> = Arc::default();
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(AtomicBool::new(false));
+    let custom: Handler = {
+        let (store, deletes, gate) = (store.clone(), deletes.clone(), gate.clone());
+        Arc::new(move |req, s| {
+            let name = req.target.trim_start_matches("/volumes/").to_owned();
+            match (req.method.as_str(), req.target.as_str()) {
+                ("POST", "/volumes/create") => {
+                    let body = String::from_utf8_lossy(&req.body).into_owned();
+                    let named = body
+                        .split("\"Name\":\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or("")
+                        .to_owned();
+                    store.lock().unwrap().insert(named, body.clone());
+                    answer(s, 201, &body);
+                    true
+                }
+                ("GET", t) if t.starts_with("/volumes/") => {
+                    match store.lock().unwrap().get(&name).cloned() {
+                        Some(body) => answer(s, 200, &body),
+                        None => answer(s, 404, "{\"message\":\"no such volume\"}"),
+                    }
+                    true
+                }
+                ("DELETE", t) if t.starts_with("/volumes/") => {
+                    if deletes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        while !gate.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    let found = store.lock().unwrap().remove(&name).is_some();
+                    if found {
+                        let _ =
+                            s.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+                    } else {
+                        answer(s, 404, "{\"message\":\"no such volume\"}");
+                    }
+                    true
+                }
+                _ => false,
+            }
+        })
+    };
+    let h = H::new("staledelete", false, custom, |_| {});
+    let auth_b = Authority {
+        project_root: h.dir.clone(),
+        workspace: "lane-b".into(),
+        attempt: "att2".into(),
+    };
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&auth_b));
+    let (status, body) = call(
+        &sock_a,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"data"}"#),
+    );
+    assert_eq!(status, 201, "{body}");
+
+    let first = {
+        let sock = sock_a.clone();
+        std::thread::spawn(move || call(&sock, "DELETE", "/volumes/data", None).0)
+    };
+    assert!(wait_for(Duration::from_secs(5), || deletes
+        .load(Ordering::SeqCst)
+        == 1));
+    let second = {
+        let sock = sock_a.clone();
+        std::thread::spawn(move || call(&sock, "DELETE", "/volumes/data", None).0)
+    };
+    let create_b = {
+        let sock = sock_b.clone();
+        std::thread::spawn(move || {
+            call(&sock, "POST", "/volumes/create", Some(r#"{"Name":"data"}"#)).0
+        })
+    };
+    // Neither may overtake the first while it is still at the engine.
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(!second.is_finished(), "a second delete overtook the first");
+    assert!(
+        !create_b.is_finished(),
+        "another workspace claimed the name meanwhile"
+    );
+    gate.store(true, Ordering::SeqCst);
+    assert_eq!(first.join().unwrap(), 204);
+    assert_eq!(
+        second.join().unwrap(),
+        404,
+        "the name was no longer lane A's"
+    );
+    assert_eq!(create_b.join().unwrap(), 201);
+    // Lane B's volume exists, in the engine and in the ledger.
+    assert!(store.lock().unwrap().contains_key("data"));
+    assert!(h.svc.ledger.has_volume("lane-b", "data"));
+    assert!(!h.svc.ledger.has_volume("lane-a", "data"));
 }
 
 // --- freeze ordering ------------------------------------------------------------
@@ -2019,4 +3536,77 @@ fn tag_call_from(sock: &Path, src: &str, repo: &str) -> u16 {
         None,
     )
     .0
+}
+
+/// A reply head that arrives in pieces, each inside the per-read limit, is cut
+/// off by the whole-call deadline (a 204 returns no body to check afterwards).
+#[test]
+fn a_drip_fed_response_head_obeys_the_whole_call_deadline() {
+    let h = H::new(
+        "dripheadw4",
+        false,
+        Arc::new(|req, s| {
+            if req.method != "DELETE" {
+                return false;
+            }
+            for part in [
+                "HTTP/1.1 204 No Content\r\n",
+                "Api-Version: 1.45\r\n",
+                "X-One: 1\r\n",
+                "\r\n",
+            ] {
+                if s.write_all(part.as_bytes()).is_err() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            true
+        }),
+        |cfg| cfg.up_progress = Duration::from_millis(150),
+    );
+    let sock = h.serve(&h.auth);
+    h.svc.ledger.claim_volume("lane-a", "att1", "data").unwrap();
+    let started = Instant::now();
+    let (status, _) = call(&sock, "DELETE", "/volumes/data", None);
+    assert_eq!(status, 502, "accepted a head after {:?}", started.elapsed());
+    assert!(h.svc.volume_fenced("data"));
+}
+
+/// Chunked framing delivered a piece at a time is bounded by the same deadline.
+#[test]
+fn a_drip_fed_chunked_reply_obeys_the_whole_call_deadline() {
+    let h = H::new(
+        "dripchunkw4",
+        false,
+        Arc::new(|req, s| {
+            if req.method != "DELETE" {
+                return false;
+            }
+            for part in [
+                "HTTP/1.1 409 X\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "5\r\n",
+                "hello\r\n",
+                "1\r\n",
+                "!\r\n",
+                "0\r\n\r\n",
+            ] {
+                if s.write_all(part.as_bytes()).is_err() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            true
+        }),
+        |cfg| cfg.up_progress = Duration::from_millis(250),
+    );
+    let sock = h.serve(&h.auth);
+    h.svc.ledger.claim_volume("lane-a", "att1", "data").unwrap();
+    let started = Instant::now();
+    let (status, _) = call(&sock, "DELETE", "/volumes/data", None);
+    assert_eq!(
+        status,
+        502,
+        "accepted a reply after {:?}",
+        started.elapsed()
+    );
 }

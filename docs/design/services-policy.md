@@ -131,6 +131,130 @@ spellings.
 
 ## Ledger (A4)
 
+Every change takes an exclusive `flock` on `ledger.lock`, reloads the file if
+another agent process published since, writes a private temporary file, fsyncs
+it, renames it over `ledger.json` and fsyncs the directory. A file that does not
+parse is kept as `ledger.json.corrupt-*` (never deleted), the agent boots on the
+first complete state in it (or an empty one), and writes `ledger.quarantine`: the
+recorded protected identities (`.git`, `.marsh`) cannot be trusted, so binding a
+project folder is refused (and restore marks pins failed) until an operator
+checks them and removes that file. The serving agent also holds `ledger.serve`
+for its lifetime, so a replacement that starts early waits, then fails, rather
+than answering from a stale view. A volume create or delete holds the name from its
+admission (the claim, or the ownership check) through the engine call to the
+ledger record, under the lock every volume claim takes (`vol_lock`): an operation
+admitted earlier cannot publish its ownership after a later operation or fence,
+and an old delete cannot land after the name was given to another workspace
+(`a_delayed_delete_cannot_remove_a_volume_another_workspace_now_owns`,
+`a_volume_create_holds_the_name_from_admission_to_the_end_of_its_engine_call`).
+The lock is released as soon as the engine's answer is in memory and recorded
+(or the call failed and the fence is set), and an admission refusal releases it
+before it is written; no reply to the client (an answer, a refusal or an error)
+is written, and no rest of a refused request is drained, while the lock is held,
+so a client that reads slowly or not at all does not hold up other workspaces'
+volume requests
+(`a_client_that_does_not_read_its_reply_does_not_block_other_workspaces`,
+`a_client_that_does_not_read_a_delete_reply_does_not_block_other_workspaces`,
+`a_client_that_never_reads_its_refusals_does_not_block_other_workspaces`,
+`a_slow_engine_body_does_not_block_other_workspaces_past_the_deadline`). The
+engine calls made inside admission (an inspect, an implicit create) still hold
+the lock, bounded by `up_progress`.
+Both are made by the agent itself (`exchange`, one absolute `up_progress`
+deadline), not through the client's connection: a client that leaves does not
+cancel the engine call, ownership is recorded by its result, and a create the
+engine does not answer keeps the sender's reservation and fences the name like an
+unanswered delete
+(`a_volume_create_whose_client_disconnected_still_records_its_owner`,
+`a_hung_volume_create_is_bounded_and_fences_the_name`,
+`a_connection_takes_the_volume_lock_again_after_a_volume_create`). The volume
+create that a container create makes for a named volume (`Binds`, or a `Mounts`
+entry of type volume; `ensure_volume`, inside admission under the same lock) is
+sent through the same function (`engine_volume_create`), so the two cannot differ
+on an unknown outcome: a create sent and not answered keeps the reservation and
+fences the name, and only a failed dial gives the reservation back
+(`an_unanswered_implicit_volume_create_keeps_the_reservation_and_fences_the_name`,
+`a_volume_create_that_was_never_sent_gives_the_reservation_back`,
+`an_implicit_volume_create_that_could_not_be_dialed_gives_the_reservation_back`).
+The container create itself is streamed and not under the lock, and network
+creates are not agent-owned. This was chosen over fencing at the start of every delete and re-checking the
+fence after a create's engine call, because that would have to undo a volume the
+create may or may not have made; holding the lock needs no undo and fails closed
+(the cost is the queue below). The agent
+makes the engine call itself, so the client leaving does not end it early
+(`a_delete_whose_client_disconnected_still_holds_the_name_until_the_engine_finishes`).
+The ledger releases the name only when the engine answers 200, 204 or 404. If a
+delete was sent and the engine does not answer (timeout, a reply cut off by the
+whole-call deadline `up_progress`, an error after the send), the owner keeps the
+name and the name is fenced against OTHER workspaces for `delete_fence`
+(5 minutes): their volume creates and container creates with that named volume
+(`ensure_volume`) get a 503 (`another_workspace_waits_out_the_fence_of_a_delete_that_was_not_answered`,
+`a_container_create_by_another_workspace_honors_the_fence`,
+`a_disconnected_delete_that_timed_out_fences_the_name_too`). The workspace that
+sent the delete is not refused by its own fence, because a late landing of its
+own delete can only remove its own volume
+(`the_workspace_that_sent_the_delete_is_not_refused_by_its_own_fence`). The fence
+only expires by time. Nothing else ends it: a later delete of the name that
+succeeds, an inspect that finds the volume absent and the reconciler dropping the
+ledger entry do not show that the earlier request has finished (a request can be
+accepted, then wait at the engine while a later one runs first). A delete that was
+never sent (the engine could not be dialed) fences nothing
+(`a_delete_that_was_never_sent_fences_nothing`). The fence is in memory only: an
+agent restart forgets it. It is time-based, so a delete that lands after the fence
+expired is not stopped; the engine gives no way to cancel or confirm a request it
+has accepted. An in-flight registry holds one entry per volume create attempt, from before the
+first byte is sent. An attempt removes only its own entry, when the engine answers
+it or the dial failed, so a later answered retry cannot complete an earlier
+unanswered attempt
+(`an_answered_retry_does_not_complete_an_earlier_unanswered_create`). An attempt
+whose outcome is unknown keeps its entry until the time of its timeout plus the
+fence time, the same instant the fence ends (one clock, derived once:
+`the_registry_outlasts_the_fence_of_an_unknown_create`,
+`an_unknown_creates_registry_entry_and_fence_end_together`). A name is in flight
+while any entry for it exists. While a name is registered: a reconcile (a prune or the periodic pass) takes the volume
+lock before it reads the engine's lists (so it cannot overtake a create, and its
+snapshot is never older than one it waited for; the three reads, each bounded by
+`up_progress`, run under the lock, so a hung engine delays volume requests by up
+to about three deadlines) and keeps the ledger record whatever
+its age (`reconcile_keeps_the_owner_of_a_create_that_may_still_land`,
+`a_reconcile_during_a_create_that_then_times_out_keeps_the_owner`), and a delete of
+the name, by any workspace and the sender too, is refused with a 503 instead of
+being answered 404 and releasing the name before the late create lands
+(`a_delete_of_a_name_with_a_create_of_unknown_outcome_is_refused`). After the fence
+time the usual rules apply again. An engine error on a delete (409, 5xx) is an answer: the owner keeps
+the volume and the reply is passed on. The reply to a delete is the engine's
+(status line, headers, body; keep-alive when the client asked for it). Every
+engine call the agent makes itself ends at one absolute deadline, `up_progress` (30 s)
+after it started: the request write (nonblocking, waiting with `poll` for at most
+the time left: a blocking write renews its own timeout while the reader makes
+progress), the response head, every
+read of the body including chunk-size lines, trailers and the terminal chunk
+(`a_drip_fed_response_head_obeys_the_whole_call_deadline`,
+`a_drip_fed_chunked_reply_obeys_the_whole_call_deadline`,
+`a_drip_fed_terminal_chunk_obeys_the_whole_call_deadline`,
+`a_slowly_read_request_obeys_the_whole_call_deadline`,
+`a_trickling_engine_reply_is_bounded_by_the_whole_call`). This covers
+DELETE of a volume against volume claims. Container and network deletes (they
+address the engine by the ID the ledger resolved), volume prune and other
+label-filtered engine calls are not serialized this way and are not covered.
+Volume creates, deletes and named-volume container creates queue behind one lock
+for every workspace (not per name), so a hung engine call delays them all until
+its answer or the 30 s deadline, and the lock is not fair; a per-name lock would
+narrow this and is not done. The engine DELETE that undoes a volume after a
+ledger write failed (`undo`) is neither locked nor fenced; it needs a degraded
+ledger, which refuses every claim. A ledger that goes corrupt while the agent
+runs is not set aside: the ledger degrades and refuses writes until restart.
+Enforced by the ledger tests `a_change_is_published_in_the_durable_order`,
+`a_corrupt_ledger_quarantines_until_an_operator_clears_it`,
+`only_one_agent_serves_a_ledger_at_a_time`, the endpoint tests
+`a_second_serving_agent_on_one_ledger_is_refused` and
+`a_corrupt_ledger_refuses_project_binds_but_not_other_creates`, the pin test
+`restore_recreates_no_pin_while_the_ledger_is_quarantined`,
+`a_failed_sync_is_not_acknowledged` (sync errors are honored; no test shows the
+real `fsync` is issued), and
+`two_ledgers_on_one_file_keep_each_others_records`,
+`racing_writers_never_tear_or_lose_the_ledger` and
+`an_unparseable_ledger_is_set_aside_not_deleted`.
+
 `ledger.json` on the pool records the owner scope of containers, networks,
 volumes and exec IDs, plus pins and substituted sockets. Every object route
 resolves names, short IDs and full IDs inside the caller's scope only and

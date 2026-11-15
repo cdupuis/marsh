@@ -738,6 +738,12 @@ protects, what it does not, and the risks marsh accepts.
 | `marsh docker hold SECONDS`, `release HOLDER` | Keep the VM awake; for testing the idle timer |
 | `marsh reset --include-services [--yes]` | Also delete Docker data, after listing the projects |
 
+If Docker reports that project folders cannot be bound because the ownership
+records were corrupt, marsh kept the damaged file and wrote `ledger.quarantine`
+next to it in the Docker VM (`/pool/marsh/`). Check that your `.git` and `.marsh`
+folders are where you expect, then remove that file; pins already marked failed
+come back at the next Docker engine start.
+
 `marsh docker` runs on your Mac. A job or the marsh shell cannot run it. The
 same commands are in [marsh(1)](man/marsh.1.md).
 

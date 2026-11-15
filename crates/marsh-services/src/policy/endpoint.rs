@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -58,6 +58,16 @@ pub struct Config {
     pub hijack_idle: Duration,
     /// How often a raw stream looks for a vanished peer and for idleness.
     pub hijack_poll: Duration,
+    /// How long a starting agent waits for the previous one to stop serving
+    /// the ledger before it gives up.
+    pub ledger_serve_wait: Duration,
+    /// How long the agent waits for the engine's answer to one of its own
+    /// calls (inspect, create, delete of a volume).
+    pub up_progress: Duration,
+    /// After a volume delete whose outcome at the engine is unknown, the name
+    /// cannot be claimed by anyone for this long: a request that is still at
+    /// the engine must not remove what a later claimant creates.
+    pub delete_fence: Duration,
     pub verbose: bool,
 }
 
@@ -78,6 +88,9 @@ impl Default for Config {
             socket_aliases: vec!["/run/marsh/docker.sock".to_string()],
             hijack_idle: Duration::from_mins(30),
             hijack_poll: Duration::from_millis(500),
+            ledger_serve_wait: Duration::from_secs(10),
+            up_progress: Duration::from_secs(30),
+            delete_fence: Duration::from_secs(300),
             verbose: false,
         }
     }
@@ -138,6 +151,16 @@ pub struct Services {
     /// held across one engine inspect (bounded by `up_request`'s 30 s progress
     /// timeout), which serializes tag claims while the engine hangs.
     tag_res: Mutex<TagRes>,
+    /// Volume names with a delete of unknown outcome, and when it was sent.
+    fenced: Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// The in-flight registry: one entry per create ATTEMPT (so a later
+    /// attempt's answer cannot complete an earlier unanswered one). An entry is
+    /// removed by its own attempt on an answer or a failed dial; if the
+    /// attempt's outcome is unknown it becomes `unknown until`, the time of the
+    /// timeout plus the fence time, the very instant the fence uses. A name is
+    /// in flight while any entry for it exists: a reconcile keeps its ledger
+    /// record and a delete of it is refused.
+    pending_creates: Mutex<Vec<PendingCreate>>,
     /// A pin is mounted and then recorded; both happen under the read side, and
     /// the sweep of unrecorded pins runs under the write side, so it can never
     /// see the first without the second.
@@ -247,7 +270,7 @@ impl Services {
         let ledger = if cfg.paths.ledger.as_os_str().is_empty() {
             Ledger::in_memory()
         } else {
-            Ledger::open(&cfg.paths.ledger)?
+            Ledger::open_exclusive(&cfg.paths.ledger, cfg.ledger_serve_wait)?
         };
         let pins = PinManager::new(&cfg.paths.bind_root);
         Ok(Arc::new(Self {
@@ -264,6 +287,8 @@ impl Services {
             gate: Gate::default(),
             vol_lock: Mutex::new(()),
             tag_res: Mutex::new(HashMap::new()),
+            fenced: Mutex::default(),
+            pending_creates: Mutex::default(),
             pin_gate: RwLock::new(()),
         }))
     }
@@ -505,37 +530,236 @@ impl Services {
         Ok(s)
     }
 
+    /// `vol_lock`, unless this thread already holds it for the whole request
+    /// (a volume create or delete: [`VolHold`]).
+    fn vol_enter(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        if VOL_HELD.with(std::cell::Cell::get) {
+            return None;
+        }
+        Some(
+            self.vol_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Whether a delete of this volume's name, of unknown outcome, may still
+    /// land at the engine (the fence only ever ends by time).
+    #[cfg(test)]
+    fn volume_fenced(&self, name: &str) -> bool {
+        self.fence_holder(name).is_some()
+    }
+
+    /// The workspace whose uncertain delete of `name` is still fenced.
+    fn fence_holder(&self, name: &str) -> Option<String> {
+        let mut fenced = self
+            .fenced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wait = self.cfg.delete_fence;
+        fenced.retain(|_, (_, sent)| sent.elapsed() < wait);
+        fenced.get(name).map(|(workspace, _)| workspace.clone())
+    }
+
+    /// Names of volumes whose create may still land (within the fence time).
+    fn create_pending(&self, name: &str) -> bool {
+        self.pending_create_names().iter().any(|n| n == name)
+    }
+
+    fn pending_create_names(&self) -> Vec<String> {
+        let mut pending = self
+            .pending_creates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (fence, call) = (self.cfg.delete_fence, self.cfg.up_progress);
+        pending.retain(|p| match p.unknown_at {
+            // Unknown: until the fence's own instant.
+            Some(at) => at.elapsed() < fence,
+            // Still in flight: its call is bounded (a leaked entry goes).
+            None => p.started.elapsed() < fence + call,
+        });
+        pending.iter().map(|p| p.name.clone()).collect()
+    }
+
+    fn fence_volume(&self, name: &str, workspace: &str) {
+        self.fence_volume_at(name, workspace, std::time::Instant::now());
+    }
+
+    fn fence_volume_at(&self, name: &str, workspace: &str, at: std::time::Instant) {
+        self.fenced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_owned(), (workspace.to_owned(), at));
+    }
+
+    /// The one way the agent sends a volume create to the engine, for the
+    /// explicit create and for the implicit one of a container create, so their
+    /// handling of an unknown outcome cannot diverge. Sent and not answered
+    /// (timeout, error after the send): the create may still land, so the name
+    /// is fenced against other workspaces here, and the caller must KEEP the
+    /// reservation. Only [`CreateOutcome::NotSent`] (the dial failed) allows
+    /// giving the reservation back.
+    fn engine_volume_create(
+        &self,
+        workspace: &str,
+        name: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> CreateOutcome {
+        // In flight from before the first byte is sent, as this attempt's own
+        // entry.
+        static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+        let attempt = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+        if let Some(name) = name {
+            self.pending_creates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(PendingCreate {
+                    name: name.to_owned(),
+                    id: attempt,
+                    started: std::time::Instant::now(),
+                    unknown_at: None,
+                });
+        }
+        // An answer or a failed dial removes only this attempt's entry.
+        let done = |this: &Self| {
+            this.pending_creates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|p| p.id != attempt);
+        };
+        let up = match self.dial() {
+            Ok(up) => up,
+            Err(e) => {
+                done(self);
+                return CreateOutcome::NotSent(e);
+            }
+        };
+        match self.exchange(up, "POST", "/volumes/create", body) {
+            Ok((resp, answer)) => {
+                done(self);
+                CreateOutcome::Answered(resp, answer)
+            }
+            Err(e) => {
+                // Unknown: one instant for the registry entry and the fence.
+                let at = std::time::Instant::now();
+                if let Some(name) = name {
+                    self.fence_volume_at(name, workspace, at);
+                    for p in self
+                        .pending_creates
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter_mut()
+                        .filter(|p| p.id == attempt)
+                    {
+                        p.unknown_at = Some(at);
+                    }
+                }
+                self.log(&format!("create of volume {name:?} did not complete: {e}"));
+                CreateOutcome::Unknown(e)
+            }
+        }
+    }
+
     pub(crate) fn up_request(
         &self,
         method: &str,
         path: &str,
         body: Option<&[u8]>,
     ) -> io::Result<(u16, Vec<u8>)> {
-        let mut s = self.dial()?;
-        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n");
+        let (resp, body) = self.exchange(self.dial()?, method, path, body)?;
+        Ok((resp.status, body))
+    }
+
+    /// One request on an already dialed engine connection: the whole exchange
+    /// (the write, the head, every read of the body) must finish within
+    /// `up_progress`; a reply that trickles in is cut off.
+    fn exchange(
+        &self,
+        mut s: UnixStream,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> io::Result<(RespHead, Vec<u8>)> {
+        let budget = self.cfg.up_progress;
+        let deadline = std::time::Instant::now() + budget;
+        let remaining = || {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(Duration::from_millis(1))
+        };
+        let mut request =
+            format!("{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n");
         if let Some(b) = body {
-            head.push_str(&format!(
+            request.push_str(&format!(
                 "Content-Type: application/json\r\nContent-Length: {}\r\n",
                 b.len()
             ));
         } else if method != "GET" {
-            head.push_str("Content-Length: 0\r\n");
+            request.push_str("Content-Length: 0\r\n");
         }
-        head.push_str("\r\n");
-        s.write_all(head.as_bytes())?;
-        if let Some(b) = body {
-            s.write_all(b)?;
+        request.push_str("\r\n");
+        // Nonblocking writes, waiting for the socket with `poll` for at most
+        // what is left of the call: a blocking write keeps renewing its own
+        // timeout while the reader makes progress, so it cannot honor a
+        // deadline.
+        s.set_nonblocking(true)?;
+        for mut part in [request.as_bytes(), body.unwrap_or_default()] {
+            while !part.is_empty() {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                match s.write(part) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n) => part = &part[n..],
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        let mut fds = [rustix::event::PollFd::new(
+                            &s,
+                            rustix::event::PollFlags::OUT,
+                        )];
+                        let wait = rustix::event::Timespec {
+                            tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
+                            tv_nsec: i64::from(left.subsec_nanos()),
+                        };
+                        rustix::event::poll(&mut fds, Some(&wait)).map_err(io::Error::from)?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         }
+        s.set_nonblocking(false)?;
         let mut conn = Conn::new(
             s,
             HttpLimits {
-                progress: Duration::from_secs(30),
+                head_deadline: remaining(),
+                progress: remaining(),
                 ..HttpLimits::default()
             },
         );
+        conn.hard_deadline = Some(deadline);
         let resp = conn.read_response_head(method == "HEAD").map_err(http_io)?;
-        let body = read_resp_body(&mut conn, &resp, 32 << 20).map_err(http_io)?;
-        Ok((resp.status, body))
+        let body = read_resp_body(&mut conn, &resp, 32 << 20, Some(deadline)).map_err(http_io)?;
+        Ok((resp, body))
+    }
+
+    /// Refuse a claim by `workspace` of a name that another workspace sent an
+    /// unanswered delete for, until the fence expires. The workspace that sent
+    /// the delete is exempt: a late landing of its own delete can only remove
+    /// its own volume. Nothing else ends the fence: neither a later delete's
+    /// answer nor the engine showing the name absent proves the earlier
+    /// request has finished.
+    fn check_fence(&self, name: &str, workspace: &str) -> Result<(), Refusal> {
+        match self.fence_holder(name) {
+            Some(holder) if holder != workspace => Err(Refusal {
+                status: 503,
+                msg: format!(
+                    "a delete of volume {name:?} by another workspace has not been answered by the engine; try again later"
+                ),
+                close: false,
+            }),
+            _ => Ok(()),
+        }
     }
 
     fn lock_tags(&self) -> std::sync::MutexGuard<'_, TagRes> {
@@ -629,6 +853,10 @@ impl Services {
                     .collect(),
             )
         };
+        // Not while a volume create or delete is in progress, and not with a
+        // snapshot older than one: the lock is taken before the engine's lists
+        // are read, and the registry is read and the records dropped under it.
+        let guard = self.vol_enter();
         let (Some(cs), Some(ns), Some(vs)) = (
             ids("/containers/json?all=1", None, "Id"),
             ids("/networks", None, "Id"),
@@ -636,7 +864,11 @@ impl Services {
         ) else {
             return;
         };
-        match self.ledger.reconcile(&cs, &ns, &vs, now()) {
+        let reconciled = self
+            .ledger
+            .reconcile(&cs, &ns, &vs, &self.pending_create_names(), now());
+        drop(guard);
+        match reconciled {
             Ok(freed) => self.unpin_freed(freed),
             Err(e) => self.log(&format!("reconcile: {e}")),
         }
@@ -1135,6 +1367,17 @@ impl Env for Scope {
                 msg: e.to_string(),
                 close: false,
             })?;
+        if self.svc.ledger.quarantined() {
+            return Err(Refusal::forbid(format!(
+                "marsh: the ownership records were corrupt, so which paths are protected (.git, .marsh) is unknown: project folders cannot be bound until an operator checks them and removes {}",
+                self.svc
+                    .cfg
+                    .paths
+                    .ledger
+                    .with_extension("quarantine")
+                    .display()
+            )));
+        }
         self.svc.note_protected(&root);
         let known = self.svc.ledger.protected(&root.given.to_string_lossy());
         // Mounted, then recorded, with the sweep of unrecorded pins held off.
@@ -1382,11 +1625,8 @@ impl Env for Scope {
     }
 
     fn ensure_volume(&self, name: &str) -> Result<(), Refusal> {
-        let _g = self
-            .svc
-            .vol_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = self.svc.vol_enter();
+        self.svc.check_fence(name, &self.auth.workspace)?;
         let fail = |m: String| Refusal {
             status: 500,
             msg: m,
@@ -1430,22 +1670,30 @@ impl Env for Scope {
             Json::Str(ws.clone()).to_string_json(),
             Json::Str(self.auth.attempt.clone()).to_string_json()
         );
-        let (st, _) = self
+        match self
             .svc
-            .up_request("POST", "/volumes/create", Some(create.as_bytes()))
-            .map_err(|e| give_back(fail(format!("engine unavailable: {e}"))))?;
-        if st != 201 {
-            return Err(give_back(fail("could not create the volume".into())));
+            .engine_volume_create(ws, Some(name), Some(create.as_bytes()))
+        {
+            CreateOutcome::Answered(resp, _) if resp.status == 201 => Ok(()),
+            // The engine answered with an error: nothing was created.
+            CreateOutcome::Answered(..) => {
+                Err(give_back(fail("could not create the volume".into())))
+            }
+            CreateOutcome::NotSent(e) => Err(give_back(fail(format!("engine unavailable: {e}")))),
+            // It may still land: the reservation stays, the name is fenced.
+            CreateOutcome::Unknown(e) => Err(Refusal {
+                status: 502,
+                msg: format!(
+                    "the engine did not answer the volume create ({e}); the volume name stays reserved until the fence expires"
+                ),
+                close: false,
+            }),
         }
-        Ok(())
     }
 
     fn reserve_volume(&self, name: &str) -> Result<bool, Refusal> {
-        let _g = self
-            .svc
-            .vol_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = self.svc.vol_enter();
+        self.svc.check_fence(name, &self.auth.workspace)?;
         let ws = &self.auth.workspace;
         let claim = self
             .svc
@@ -1879,9 +2127,20 @@ fn handle_request(scope: &Arc<Scope>, conn: &mut Conn, head: &Head) -> io::Resul
         BodyPolicy::Stream => None,
     };
     let client_body = body.clone();
+    // A volume create or delete holds the name from admission (the ownership
+    // check or the claim) through the engine call to the ledger record, under
+    // the lock every volume claim takes: nothing admitted earlier can publish
+    // after a later operation or fence, and nobody can claim the name while an
+    // operation on it is in flight.
+    let mut volume_op =
+        matches!(m.kind, Kind::VolumeCreate | Kind::VolumeDelete).then(|| VolHold::take(svc));
     let mut adm = match admit(&m, head, body, scope.as_ref()) {
         Ok(a) => a,
         Err(r) => {
+            // The refusal is written (and the rest of the request drained)
+            // without holding the volume lock: a client that never reads must
+            // not stall other workspaces.
+            drop(volume_op.take());
             return Ok(refuse(
                 conn,
                 head,
@@ -1895,6 +2154,28 @@ fn handle_request(scope: &Arc<Scope>, conn: &mut Conn, head: &Head) -> io::Resul
         adm.hijack = None;
         adm.upgrade = None;
     }
+    if let Post::VolumeDelete { name } = adm.post.clone() {
+        return Ok(delete_volume(
+            scope,
+            conn,
+            head,
+            &adm,
+            &name,
+            &mut volume_op,
+        ));
+    }
+    if let Post::VolumeCreate { name, .. } = adm.post.clone() {
+        return Ok(create_volume(
+            scope,
+            conn,
+            head,
+            &adm,
+            name.as_deref(),
+            &mut volume_op,
+        ));
+    }
+    // Not a volume create or delete after all: nothing here holds the lock.
+    drop(volume_op.take());
     let result = forward(scope, conn, head, &mut adm, m.kind);
     match result {
         Ok(keep) => Ok(keep),
@@ -2183,7 +2464,25 @@ fn canonical_header(k: &str) -> String {
         .join("-")
 }
 
-fn read_resp_body(c: &mut Conn, resp: &RespHead, cap: usize) -> Result<Vec<u8>, HttpError> {
+fn read_resp_body(
+    c: &mut Conn,
+    resp: &RespHead,
+    cap: usize,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<u8>, HttpError> {
+    let late = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
+    // Each read may wait only for what is left of the whole call.
+    let tighten = |c: &mut Conn| -> Result<(), HttpError> {
+        if let Some(d) = deadline {
+            let left = d.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(HttpError::Timeout);
+            }
+            c.limits.progress = left;
+        }
+        Ok(())
+    };
+    tighten(c)?;
     let mut out = Vec::new();
     let mut buf = vec![0u8; 16 * 1024];
     let mut st = match resp.framing {
@@ -2191,9 +2490,13 @@ fn read_resp_body(c: &mut Conn, resp: &RespHead, cap: usize) -> Result<Vec<u8>, 
         RespFraming::Length(n) => BodyState::new(Framing::Length(n)),
         RespFraming::Chunked => BodyState::new(Framing::Chunked),
         RespFraming::UntilClose => loop {
+            tighten(c)?;
             let n = c.read_until_close(&mut buf)?;
             if n == 0 {
                 return Ok(out);
+            }
+            if late() {
+                return Err(HttpError::Timeout);
             }
             if out.len() + n > cap {
                 return Err(HttpError::BodyTooLarge);
@@ -2202,14 +2505,23 @@ fn read_resp_body(c: &mut Conn, resp: &RespHead, cap: usize) -> Result<Vec<u8>, 
         },
     };
     loop {
+        tighten(c)?;
         let n = c.read_body(&mut st, &mut buf)?;
         if n == 0 {
-            return Ok(out);
+            // The end of the body is only accepted inside the deadline.
+            return if late() {
+                Err(HttpError::Timeout)
+            } else {
+                Ok(out)
+            };
         }
         if out.len() + n > cap {
             return Err(HttpError::BodyTooLarge);
         }
         out.extend_from_slice(&buf[..n]);
+        if late() {
+            return Err(HttpError::Timeout);
+        }
     }
 }
 
@@ -2391,7 +2703,7 @@ fn respond(
             | Post::ListVolumes
     );
     if buffered && resp.framing != RespFraming::NoBody {
-        let body = match read_resp_body(upc, resp, 32 << 20) {
+        let body = match read_resp_body(upc, resp, 32 << 20, None) {
             Ok(b) => b,
             Err(e) => {
                 undo_post(scope, &adm.post);
@@ -2652,6 +2964,205 @@ fn record_container(
         }
     }
     Ok(())
+}
+
+/// One create attempt in the in-flight registry.
+struct PendingCreate {
+    name: String,
+    id: u64,
+    started: std::time::Instant,
+    /// Set when the attempt's outcome became unknown: the timeout's time.
+    unknown_at: Option<std::time::Instant>,
+}
+
+/// What became of a volume create sent by the agent.
+enum CreateOutcome {
+    Answered(RespHead, Vec<u8>),
+    /// The engine could not be dialed: nothing was sent.
+    NotSent(io::Error),
+    /// Sent, not answered: it may still land (the name is already fenced).
+    Unknown(io::Error),
+}
+
+thread_local! {
+    /// This thread holds `vol_lock` for the request it is handling.
+    static VOL_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `vol_lock` held from the admission of a volume create or delete to the end
+/// of its handling; the claim paths inside admission see the flag and do not
+/// take the lock again.
+struct VolHold<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+impl<'a> VolHold<'a> {
+    fn take(svc: &'a Services) -> Self {
+        let guard = svc
+            .vol_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        VOL_HELD.with(|held| held.set(true));
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for VolHold<'_> {
+    fn drop(&mut self) {
+        VOL_HELD.with(|held| held.set(false));
+    }
+}
+
+/// A volume delete, made by the agent itself rather than streamed through the
+/// client's connection, so that the client leaving cannot end it early: the
+/// caller (holding `vol_lock`) waits for the engine. The ledger releases the
+/// name only on an answer that says it is gone. If the engine does not answer,
+/// the delete may still land later, so the name stays with its owner and is
+/// fenced against other workspaces' claims for `delete_fence`.
+fn delete_volume(
+    scope: &Arc<Scope>,
+    conn: &mut Conn,
+    head: &Head,
+    adm: &Admitted,
+    name: &str,
+    volume_op: &mut Option<VolHold<'_>>,
+) -> bool {
+    let svc = &scope.svc;
+    let mut path = adm.path.clone();
+    if !adm.query.is_empty() {
+        path.push('?');
+        path.push_str(&encode_query(&adm.query));
+    }
+    // A create of this name that has not been answered may still land: this
+    // delete (even the sender's) would be answered 404 and release the name
+    // before it does, so it is refused.
+    if svc.create_pending(name) {
+        drop(volume_op.take());
+        reply(
+            &mut conn.stream,
+            503,
+            "a create of this volume is in progress or its outcome is unknown; try again later",
+            false,
+        );
+        return !head.close;
+    }
+    // Nothing was sent if the engine cannot be dialed: no fence.
+    let up = match svc.dial() {
+        Ok(up) => up,
+        Err(e) => {
+            drop(volume_op.take());
+            reply(
+                &mut conn.stream,
+                502,
+                &format!("the engine is not available: {e}"),
+                true,
+            );
+            return false;
+        }
+    };
+    match svc.exchange(up, "DELETE", &path, None) {
+        Ok((resp, body)) => {
+            // The engine answered this delete. That does not show that an
+            // earlier unanswered delete of the name has finished, so an
+            // existing fence is left to expire.
+            if matches!(resp.status, 200 | 204 | 404) {
+                post_actions(scope, &adm.post);
+            }
+            // The answer is in memory and recorded: the reply to the client
+            // is relayed without holding the volume lock.
+            drop(volume_op.take());
+            let out = if resp.framing == RespFraming::NoBody {
+                Out::Bodiless
+            } else {
+                Out::Length(body.len() as u64)
+            };
+            let keep = !head.close;
+            let sent = write_resp_head(&mut conn.stream, &resp, out, keep, None)
+                .and_then(|()| conn.stream.write_all(&body));
+            keep && sent.is_ok()
+        }
+        Err(e) => {
+            svc.fence_volume(name, &scope.auth.workspace);
+            drop(volume_op.take());
+            svc.log(&format!("delete of volume {name} did not complete: {e}"));
+            reply(
+                &mut conn.stream,
+                502,
+                "the engine did not answer the delete; the volume name stays reserved until it is known to be gone",
+                true,
+            );
+            false
+        }
+    }
+}
+
+/// A volume create, made by the agent itself like a delete: dialed and sent
+/// under the volume lock the request already holds, bounded as a whole by
+/// `up_progress`, and not cut short by the client leaving (the engine call is
+/// finished, ownership recorded by its result, and the reply relayed if the
+/// client is still there). If the engine does not answer, the create may still
+/// land: the sender keeps its reservation and the name is fenced against other
+/// workspaces like an unanswered delete.
+fn create_volume(
+    scope: &Arc<Scope>,
+    conn: &mut Conn,
+    head: &Head,
+    adm: &Admitted,
+    name: Option<&str>,
+    volume_op: &mut Option<VolHold<'_>>,
+) -> bool {
+    let svc = &scope.svc;
+    let keep = !head.close;
+    let body = match &adm.body {
+        ReqBody::Json(b) => Some(b.as_slice()),
+        _ => None,
+    };
+    match svc.engine_volume_create(&scope.auth.workspace, name, body) {
+        CreateOutcome::Answered(resp, answer) => {
+            let mut out = answer.clone();
+            let recorded = record(scope, &adm.post, resp.status, &answer, &mut out);
+            // Answered and recorded (or refused): the client's reply is
+            // written without holding the volume lock.
+            drop(volume_op.take());
+            if let Err(r) = recorded {
+                scope_log(&format!("not recorded: {}", r.msg));
+                reply(&mut conn.stream, r.status, &r.msg, false);
+                return keep;
+            }
+            let sent = write_resp_head(
+                &mut conn.stream,
+                &resp,
+                Out::Length(out.len() as u64),
+                keep,
+                Some(out.len()),
+            )
+            .and_then(|()| conn.stream.write_all(&out));
+            keep && sent.is_ok()
+        }
+        CreateOutcome::NotSent(e) => {
+            // Nothing was sent: give back the reservation.
+            undo_post(scope, &adm.post);
+            drop(volume_op.take());
+            reply(
+                &mut conn.stream,
+                502,
+                &format!("the engine is not available: {e}"),
+                true,
+            );
+            false
+        }
+        CreateOutcome::Unknown(_) => {
+            // Sent, no answer: the reservation stays and the name is fenced.
+            drop(volume_op.take());
+            reply(
+                &mut conn.stream,
+                502,
+                "the engine did not answer the volume create; the volume name stays reserved until the fence expires",
+                true,
+            );
+            false
+        }
+    }
 }
 
 fn post_actions(scope: &Arc<Scope>, post: &Post) {

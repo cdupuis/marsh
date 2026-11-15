@@ -1,4 +1,5 @@
 use super::*;
+use crate::exec_identity::CaptureStage;
 use std::io::Write;
 use std::os::fd::AsRawFd as _;
 use tempfile::TempDir;

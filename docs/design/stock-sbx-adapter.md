@@ -129,8 +129,11 @@ environment.
 ## Mounts
 
 Sources are opened with `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` at admission and
-their identity (volume UUID and persistent file ID on macOS, via
-`marsh-host-identity`) is checked before and after `sbx mount`. Natural host
+their identity (device, inode, owner and group, from `fstat`;
+`marsh-sbx/src/source_chain.rs`) is checked before and after `sbx mount`. That
+identity can be recycled by a replacement; the APFS volume UUID and persistent
+file ID that `marsh-host-identity` reads are not part of source admission (they
+identify checkpoint directories, `marsh-daemon/src/checkpoint.rs`). Natural host
 paths are only mount targets, never authority. A mount is made on first use
 and retained while the VM is warm; concurrent users share it by reference. An
 idle mount is replaced only when its source identity changed, and mounts are

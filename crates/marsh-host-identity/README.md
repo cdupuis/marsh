@@ -2,11 +2,18 @@
 
 `read(&File)` is a read-only safe Rust API over macOS `fgetattrlist`. The caller
 keeps the file open. No pathname, permission mutation, ACL setter, subprocess,
-FD transfer, or fallback identity is involved.
+FD transfer, or fallback identity is involved. `clone_at` is a second safe API,
+over `clonefileat` with `CLONE_NOFOLLOW`.
 
-The native call is isolated in this small crate because the main adapter forbids
-unsafe Rust. `unsafe_code` is denied here except at the one synchronous syscall
-wrapper. It passes initialized request/output buffers with exact lengths and
+Callers: `marsh-daemon` reads the identity of each checkpoint directory (`read`,
+through `split_fs::Dir::persistent_identity`) to recognize it after its volume is
+mounted again under another device number, and clones split and checkpoint trees
+(`clone_at`). Source admission in `marsh-sbx` does not use this crate: it compares
+device, inode, owner and group from `fstat`.
+
+The native calls are isolated in this small crate because the main adapter forbids
+unsafe Rust. `unsafe_code` is denied here except at the two synchronous syscall
+wrappers, `fgetattrlist` and `clonefileat`. It passes initialized request/output buffers with exact lengths and
 keeps the descriptor alive. Returned bytes are decoded without unaligned typed
 loads or dereferencing returned pointers.
 
@@ -35,5 +42,5 @@ provided by this crate and are not APFS evidence. The native descriptor test mus
 run on an actual supported Mac volume. A trusted host cloning/reformatting a
 volume is outside the identity premise.
 
-This fixes historical inode-incarnation comparisons, not stock's pathname reopen
-race, grant revocation/drain, or VM destruction closure. It is not a mount API.
+This does not fix stock's pathname reopen race, grant revocation/drain, or VM
+destruction closure, and source admission does not rely on it. It is not a mount API.

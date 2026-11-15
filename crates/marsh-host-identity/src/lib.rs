@@ -48,6 +48,9 @@ pub fn read(file: &File) -> io::Result<PersistentIdentity> {
 /// `target_dir`) without following a symlink at either final component
 /// (`clonefileat(..., CLONE_NOFOLLOW)`; a directory clones recursively, and
 /// symlinks inside it are cloned as symlinks). The target must not exist.
+/// `source` and `target` must each be one path component (a `readdir` name):
+/// a `/` in one is not rejected, and the intermediate components it names
+/// would be followed.
 ///
 /// # Errors
 /// Returns the native error, or `Unsupported` off macOS.

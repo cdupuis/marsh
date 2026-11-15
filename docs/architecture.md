@@ -119,7 +119,7 @@ pathname reopen inside `sbx mount` is an accepted upstream limitation.
 | `marsh-contracts` | Validated job, image, mount, limit, and registry values shared across crates |
 | `marsh-acp` | ACP v1 client: framing, sessions, prompts, updates, permissions, phased cancellation |
 | `marsh-mcp` | `marsh-mcp` binary: host MCP server, fixed pipeline exports, published ACP tools |
-| `marsh-host-identity` | macOS descriptor-bound file identity used by source admission |
+| `marsh-host-identity` | macOS descriptor-bound APFS volume UUID and file ID (checkpoint directory identity) and `clonefileat` (split and checkpoint clones); not used by source admission |
 
 `marsh-backend` depends on the daemon interface, `marsh-sbx`, and the worker
 protocol; the daemon does not depend on the backend. Brush imports no marsh

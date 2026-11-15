@@ -514,6 +514,25 @@ pub(super) struct CallRecord {
     pub cause: String,
 }
 
+impl CallRecord {
+    /// Without control or escape characters: the workload chose the
+    /// arguments, and the laptop shows this record to its user.
+    fn plain(self) -> Self {
+        use marsh_sbx::vm_text::plain_text;
+        Self {
+            kit: plain_text(&self.kit, 64),
+            args: self
+                .args
+                .iter()
+                .map(|arg| plain_text(arg, 4 * DISPLAY_ARG_CHARS))
+                .collect(),
+            exit: self.exit,
+            summary: plain_text(&self.summary, 1024),
+            cause: plain_text(&self.cause, 1024),
+        }
+    }
+}
+
 /// The finished calls (`children.jsonl`).
 pub(super) fn call_records(state: &Path) -> Vec<CallRecord> {
     fs::read_to_string(state.join(CALLS_FILE))
@@ -828,7 +847,8 @@ impl Coordinator {
             exit: outcome.code,
             summary: outcome.summary,
             cause: outcome.cause,
-        };
+        }
+        .plain();
         if let Ok(line) = serde_json::to_string(&record) {
             let _ = OpenOptions::new()
                 .create(true)
@@ -1293,6 +1313,24 @@ mod tests {
                 "{file}: lock_privileges()? must come before the workload spawn"
             );
         }
+    }
+
+    #[test]
+    fn a_recorded_call_carries_no_terminal_control() {
+        let record = CallRecord {
+            kit: "codex\u{1b}]52;c;AAAA\u{7}".into(),
+            args: vec!["a\u{1b}[2Jb".into(), "x".repeat(1000)],
+            exit: 0,
+            summary: "ok\u{9b}31m\r\nfake line".into(),
+            cause: String::new(),
+        }
+        .plain();
+        let all = format!("{record:?}");
+        assert!(!all.contains("\\u{1b}") && !all.contains("\\u{7}") && !all.contains("\\u{9b}"));
+        assert_eq!(record.kit, "codex]52;c;AAAA");
+        assert_eq!(record.args[0], "a[2Jb");
+        assert!(record.args[1].len() <= 4 * DISPLAY_ARG_CHARS);
+        assert_eq!(record.summary, "ok31mfake line");
     }
 
     fn facts() -> Isolation {

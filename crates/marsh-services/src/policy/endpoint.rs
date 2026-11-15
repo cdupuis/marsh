@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -153,12 +153,14 @@ pub struct Services {
     tag_res: Mutex<TagRes>,
     /// Volume names with a delete of unknown outcome, and when it was sent.
     fenced: Mutex<HashMap<String, (String, std::time::Instant)>>,
-    /// The in-flight registry: volume names with a create that was sent and has
-    /// not been answered (removed on the answer, or if nothing was sent), and
-    /// when it started. A create whose outcome stays unknown stays here until
-    /// the fence time passes. While a name is here a reconcile keeps its
-    /// ledger record and a delete of it is refused.
-    pending_creates: Mutex<HashMap<String, std::time::Instant>>,
+    /// The in-flight registry: one entry per create ATTEMPT (so a later
+    /// attempt's answer cannot complete an earlier unanswered one). An entry is
+    /// removed by its own attempt on an answer or a failed dial; if the
+    /// attempt's outcome is unknown it becomes `unknown until`, the time of the
+    /// timeout plus the fence time, the very instant the fence uses. A name is
+    /// in flight while any entry for it exists: a reconcile keeps its ledger
+    /// record and a delete of it is refused.
+    pending_creates: Mutex<Vec<PendingCreate>>,
     /// A pin is mounted and then recorded; both happen under the read side, and
     /// the sweep of unrecorded pins runs under the write side, so it can never
     /// see the first without the second.
@@ -569,19 +571,25 @@ impl Services {
             .pending_creates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let wait = self.cfg.delete_fence;
-        pending.retain(|_, sent| sent.elapsed() < wait);
-        pending.keys().cloned().collect()
+        let (fence, call) = (self.cfg.delete_fence, self.cfg.up_progress);
+        pending.retain(|p| match p.unknown_at {
+            // Unknown: until the fence's own instant.
+            Some(at) => at.elapsed() < fence,
+            // Still in flight: its call is bounded (a leaked entry goes).
+            None => p.started.elapsed() < fence + call,
+        });
+        pending.iter().map(|p| p.name.clone()).collect()
     }
 
     fn fence_volume(&self, name: &str, workspace: &str) {
+        self.fence_volume_at(name, workspace, std::time::Instant::now());
+    }
+
+    fn fence_volume_at(&self, name: &str, workspace: &str, at: std::time::Instant) {
         self.fenced
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                name.to_owned(),
-                (workspace.to_owned(), std::time::Instant::now()),
-            );
+            .insert(name.to_owned(), (workspace.to_owned(), at));
     }
 
     /// The one way the agent sends a volume create to the engine, for the
@@ -597,20 +605,27 @@ impl Services {
         name: Option<&str>,
         body: Option<&[u8]>,
     ) -> CreateOutcome {
-        // In flight from before the first byte is sent.
+        // In flight from before the first byte is sent, as this attempt's own
+        // entry.
+        static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+        let attempt = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
         if let Some(name) = name {
             self.pending_creates
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(name.to_owned(), std::time::Instant::now());
+                .push(PendingCreate {
+                    name: name.to_owned(),
+                    id: attempt,
+                    started: std::time::Instant::now(),
+                    unknown_at: None,
+                });
         }
+        // An answer or a failed dial removes only this attempt's entry.
         let done = |this: &Self| {
-            if let Some(name) = name {
-                this.pending_creates
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(name);
-            }
+            this.pending_creates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|p| p.id != attempt);
         };
         let up = match self.dial() {
             Ok(up) => up,
@@ -625,9 +640,19 @@ impl Services {
                 CreateOutcome::Answered(resp, answer)
             }
             Err(e) => {
-                // Unknown: it stays in the registry until the fence time.
+                // Unknown: one instant for the registry entry and the fence.
+                let at = std::time::Instant::now();
                 if let Some(name) = name {
-                    self.fence_volume(name, workspace);
+                    self.fence_volume_at(name, workspace, at);
+                    for p in self
+                        .pending_creates
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter_mut()
+                        .filter(|p| p.id == attempt)
+                    {
+                        p.unknown_at = Some(at);
+                    }
                 }
                 self.log(&format!("create of volume {name:?} did not complete: {e}"));
                 CreateOutcome::Unknown(e)
@@ -2939,6 +2964,15 @@ fn record_container(
         }
     }
     Ok(())
+}
+
+/// One create attempt in the in-flight registry.
+struct PendingCreate {
+    name: String,
+    id: u64,
+    started: std::time::Instant,
+    /// Set when the attempt's outcome became unknown: the timeout's time.
+    unknown_at: Option<std::time::Instant>,
 }
 
 /// What became of a volume create sent by the agent.

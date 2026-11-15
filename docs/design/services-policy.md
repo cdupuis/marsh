@@ -201,10 +201,16 @@ never sent (the engine could not be dialed) fences nothing
 (`a_delete_that_was_never_sent_fences_nothing`). The fence is in memory only: an
 agent restart forgets it. It is time-based, so a delete that lands after the fence
 expired is not stopped; the engine gives no way to cancel or confirm a request it
-has accepted. An in-flight registry holds the name of every volume create from before the
-first byte is sent until the engine answers it (removed then, or when the dial
-failed); a create that stays unknown stays registered for the fence time. While a
-name is registered: a reconcile (a prune or the periodic pass) takes the volume
+has accepted. An in-flight registry holds one entry per volume create attempt, from before the
+first byte is sent. An attempt removes only its own entry, when the engine answers
+it or the dial failed, so a later answered retry cannot complete an earlier
+unanswered attempt
+(`an_answered_retry_does_not_complete_an_earlier_unanswered_create`). An attempt
+whose outcome is unknown keeps its entry until the time of its timeout plus the
+fence time, the same instant the fence ends (one clock, derived once:
+`the_registry_outlasts_the_fence_of_an_unknown_create`,
+`an_unknown_creates_registry_entry_and_fence_end_together`). A name is in flight
+while any entry for it exists. While a name is registered: a reconcile (a prune or the periodic pass) takes the volume
 lock before it reads the engine's lists (so it cannot overtake a create, and its
 snapshot is never older than one it waited for; the three reads, each bounded by
 `up_progress`, run under the lock, so a hung engine delays volume requests by up

@@ -1767,6 +1767,105 @@ fn a_reconcile_cannot_use_a_snapshot_older_than_a_create_it_waited_for() {
     }
 }
 
+/// A later answered attempt does not complete an earlier unanswered one: after
+/// create #1 timed out, a retry that is answered (201, or an error) must not end
+/// the unknown state, so the owner's delete is still refused and the late
+/// create #1 lands with its owner.
+#[test]
+fn an_answered_retry_does_not_complete_an_earlier_unanswered_create() {
+    for implicit in [false, true] {
+        for retry_status in [0_u16, 500] {
+            let engine = VolumeEngine::new();
+            engine.gate.store(true, Ordering::SeqCst);
+            let h = H::new(
+                &format!("retryw4{implicit}{retry_status}"),
+                false,
+                engine.handler(),
+                |cfg| {
+                    cfg.up_progress = Duration::from_millis(250);
+                    cfg.delete_fence = SHORT_FENCE;
+                },
+            );
+            let sock = h.serve(&h.auth);
+            engine.hold_next_create.store(true, Ordering::SeqCst);
+            assert!(create_request(&sock, implicit) >= 500);
+            // The retry is answered.
+            engine.create_status.store(retry_status, Ordering::SeqCst);
+            let _ = create_request(&sock, implicit);
+            engine.create_status.store(0, Ordering::SeqCst);
+            let label = format!("implicit={implicit} retry={retry_status}");
+            let (status, body) = call(&sock, "DELETE", "/volumes/data", None);
+            assert_eq!(status, 503, "{label}: {body}");
+            assert!(h.svc.ledger.has_volume("lane-a", "data"), "{label}");
+            engine.create_release.store(true, Ordering::SeqCst);
+            assert!(wait_for(Duration::from_secs(5), || engine
+                .held_create_done
+                .load(Ordering::SeqCst)));
+            assert!(engine.store.lock().unwrap().contains_key("data"), "{label}");
+            assert!(h.svc.ledger.has_volume("lane-a", "data"), "{label}");
+        }
+    }
+}
+
+/// The in-flight registry and the fence end at the same instant (the time of the
+/// timeout plus the fence time): there is no gap in which the fence still holds
+/// and the owner's delete is answered 404 before the late create lands.
+#[test]
+fn the_registry_outlasts_the_fence_of_an_unknown_create() {
+    for implicit in [false, true] {
+        let engine = VolumeEngine::new();
+        engine.gate.store(true, Ordering::SeqCst);
+        let h = H::new(
+            &format!("lifetimew4{implicit}"),
+            false,
+            engine.handler(),
+            |cfg| {
+                cfg.up_progress = Duration::from_millis(800);
+                cfg.delete_fence = Duration::from_millis(1200);
+            },
+        );
+        let sock = h.serve(&h.auth);
+        engine.hold_next_create.store(true, Ordering::SeqCst);
+        assert!(create_request(&sock, implicit) >= 500);
+        // The fence runs from the timeout; so must the registry.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(h.svc.volume_fenced("data"));
+        let (status, _) = call(&sock, "DELETE", "/volumes/data", None);
+        assert_eq!(
+            status, 503,
+            "implicit={implicit}: the fence held but the registry did not"
+        );
+        engine.create_release.store(true, Ordering::SeqCst);
+        assert!(wait_for(Duration::from_secs(5), || engine
+            .held_create_done
+            .load(Ordering::SeqCst)));
+        assert!(h.svc.ledger.has_volume("lane-a", "data"));
+    }
+}
+
+/// One clock: the registry entry and the fence of an unknown create both end at
+/// the timeout's time plus the fence time, neither earlier nor later.
+#[test]
+fn an_unknown_creates_registry_entry_and_fence_end_together() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("oneclockw4", false, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(250);
+        cfg.delete_fence = Duration::from_millis(1200);
+    });
+    let sock = h.serve(&h.auth);
+    engine.hold_next_create.store(true, Ordering::SeqCst);
+    assert!(create_request(&sock, false) >= 500);
+    assert!(h.svc.volume_fenced("data") && h.svc.create_pending("data"));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(!h.svc.volume_fenced("data"), "the fence outlived its time");
+    assert!(
+        !h.svc.create_pending("data"),
+        "the registry outlived the fence"
+    );
+    engine.create_release.store(true, Ordering::SeqCst);
+}
+
 fn raw_exchange(sock: &Path, request: &str, keep_reading_for: Duration) -> String {
     let mut c = UnixStream::connect(sock).unwrap();
     c.set_read_timeout(Some(keep_reading_for)).unwrap();

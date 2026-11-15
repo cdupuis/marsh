@@ -281,7 +281,7 @@ $(TLA2TOOLS_JAR):
 mcp:
 	@test -x "$(MCP_BIN)" || { echo 'make mcp: install first with make install, or set MCP_BIN=/absolute/marsh-mcp'; exit 1; }
 	@test -x "$(MCP_MARSH)" || { echo 'make mcp: install marsh outside this checkout, or set MCP_MARSH=/absolute/marsh'; exit 1; }
-	@test -x "$(SBX_EXECUTABLE)" || { echo 'make mcp: install stock SBX v0.45.0 or newer on PATH, or set MARSH_SBX=/absolute/sbx'; exit 1; }
+	@test -x "$(SBX_EXECUTABLE)" || { echo 'make mcp: install stock SBX v0.47.0 or newer on PATH, or set MARSH_SBX=/absolute/sbx'; exit 1; }
 	@exec "$(MCP_BIN)" serve --workspace "$(CURDIR)" --marsh "$(MCP_MARSH)" --sbx "$(SBX_EXECUTABLE)"
 
 kits:
@@ -420,7 +420,7 @@ fixture-ref:
 
 acceptance:
 	@test -n "$(ACCEPTANCE_KIT)" || { echo 'make acceptance: publish the fixture with make kit-publish-fixture, or set ACCEPTANCE_KIT to an immutable Kit OCI reference'; exit 1; }
-	@test -x "$(SBX_EXECUTABLE)" || { echo 'make acceptance: install stock SBX v0.45.0 or newer on PATH, or set MARSH_SBX=/absolute/sbx'; exit 1; }
+	@test -x "$(SBX_EXECUTABLE)" || { echo 'make acceptance: install stock SBX v0.47.0 or newer on PATH, or set MARSH_SBX=/absolute/sbx'; exit 1; }
 	$(call observed-acceptance,run)
 
 # A break-mode candidate for the pen test: an explicitly identified path, never a release pass. It builds the host
@@ -436,7 +436,7 @@ acceptance-breaks:
 
 acceptance-smoke:
 	@test -n "$(ACCEPTANCE_KIT)" || { echo 'make acceptance-smoke: publish the fixture with make kit-publish-fixture, or set ACCEPTANCE_KIT to an immutable Kit OCI reference'; exit 1; }
-	@test -x "$(SBX_EXECUTABLE)" || { echo 'make acceptance-smoke: install stock SBX v0.45.0 or newer on PATH, or set MARSH_SBX=/absolute/sbx'; exit 1; }
+	@test -x "$(SBX_EXECUTABLE)" || { echo 'make acceptance-smoke: install stock SBX v0.47.0 or newer on PATH, or set MARSH_SBX=/absolute/sbx'; exit 1; }
 	$(call observed-acceptance,smoke)
 
 # Build and evidence stay outside the guest-writable checkout. Every invocation
@@ -467,7 +467,7 @@ endef
 
 perf:
 	@test -n "$(PERF_KIT)" || { echo 'make perf: set PERF_KIT to an immutable Kit OCI reference'; exit 1; }
-	@test -x "$(SBX_EXECUTABLE)" || { echo 'make perf: install stock SBX v0.45.0 or newer on PATH, or set MARSH_SBX=/absolute/sbx'; exit 1; }
+	@test -x "$(SBX_EXECUTABLE)" || { echo 'make perf: install stock SBX v0.47.0 or newer on PATH, or set MARSH_SBX=/absolute/sbx'; exit 1; }
 	@set -eu; \
 	candidate_root=$$(mktemp -d "$${TMPDIR:-/tmp}/marsh-perf.XXXXXX"); \
 	candidate_root=$$(cd "$$candidate_root" && pwd -P); \

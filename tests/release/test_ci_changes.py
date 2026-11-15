@@ -58,6 +58,8 @@ class CiChanges(unittest.TestCase):
 
     def test_the_model_readme_runs_the_tooling_lane_that_checks_its_code_table(self):
         self.check(["docs/model/README.md"], "tools")
+        self.check(["docs/model/check.sh"], "tools", "model")
+        self.check(["docs/model/state-floors.txt"], "tools", "model")
 
     def test_renovate_configuration_runs_tooling_and_its_validator(self):
         for path in (".github/renovate.json5", ".github/renovate-version",
@@ -65,7 +67,7 @@ class CiChanges(unittest.TestCase):
             self.check([path], "tools", "renovate")
 
     def test_model_inputs_run_only_the_model_lane(self):
-        for path in ("docs/model/Worker.tla", "docs/model/Worker.cfg", "docs/model/check.sh"):
+        for path in ("docs/model/Worker.tla", "docs/model/Worker.cfg"):
             self.check([path], "model")
         self.check([".github/workflows/model.yml"], "tools", "model")
 

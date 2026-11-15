@@ -72,6 +72,17 @@ fn image(requested: Option<&str>) -> Result<OciImage, DaemonError> {
         .map_err(|_| DaemonError::Refused("cloud: not a valid image reference".into()))
 }
 
+/// What of the exported environment may leave the Mac for the sandbox.
+fn cloud_environment(environment: BTreeMap<String, Vec<u8>>) -> BTreeMap<String, Vec<u8>> {
+    environment
+        .into_iter()
+        .filter(|(name, value)| {
+            marsh_daemon::split::cloud_forwardable(name, value)
+                && !LOCAL_ONLY.contains(&name.as_str())
+        })
+        .collect()
+}
+
 /// A pipe whose write end the snapshot writer fills while the read end
 /// feeds the remote unpack: the snapshot is never spooled on the host.
 type SnapshotResult = Result<(cloud_fs::SnapshotStats, cloud_fs::GitOutcome), String>;
@@ -462,6 +473,37 @@ fn parse(arguments: &[Vec<u8>]) -> Result<(Options, CloudMode, Vec<Vec<u8>>), Da
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sandbox's environment goes through the credential filter (not just
+    /// `forwardable`): a block with these exported gets none of the secrets.
+    #[test]
+    fn the_sandbox_environment_drops_credential_shaped_names_and_values() {
+        let env = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.as_bytes().to_vec()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let sent = cloud_environment(env(&[
+            ("DOCKER_AUTH_CONFIG", "{}"),
+            ("NOTES", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+            (
+                "DATABASE_URL",
+                "postgresql://db/app?user=a&password=hunter2",
+            ),
+            ("MYSQL_PWD", "hunter2"),
+            ("DB", "host=db user=alice password = 'abc=def' dbname=app"),
+            ("DB2", "Server=db;Password = abc=def;Database=app"),
+            ("DB3", "Server=db;Password=\"\"\"abc\";Database=app"),
+            ("GIT_AUTHOR_NAME", "Ada"),
+            ("RUST_LOG", "debug"),
+            ("PWD", "/p"),
+        ]));
+        assert_eq!(
+            sent.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["GIT_AUTHOR_NAME", "RUST_LOG"]
+        );
+    }
 
     /// Two spellings of one project take the same import lock.
     #[test]
@@ -988,12 +1030,7 @@ impl StockDaemonBackend {
         };
         let (environment, omitted) =
             merge_exported_environment(&request.environment, &self.config.env)?;
-        let environment = environment
-            .into_iter()
-            .filter(|(name, _)| {
-                marsh_daemon::split::forwardable(name) && !LOCAL_ONLY.contains(&name.as_str())
-            })
-            .collect::<BTreeMap<_, _>>();
+        let environment = cloud_environment(environment);
         let registered = self.command_names();
         let link = request.process.clone().unwrap_or_default();
         let (job_id, _attempt, lineage) = store.begin_cloud_job(

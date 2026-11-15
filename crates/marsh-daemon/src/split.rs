@@ -725,6 +725,200 @@ pub fn forwardable(name: &str) -> bool {
             .any(|word| upper.contains(word))
 }
 
+/// What may leave the Mac for a cloud sandbox: [`forwardable`], without names
+/// that carry a credential's shape (a whole `_`-separated word `AUTH`,
+/// `AUTHORIZATION`, `DSN`, `BEARER`, `JWT`, `PASSWD`, or `CONNECTION_STRING`)
+/// or values that are one (a URL with a password, a PEM block, a well-known
+/// token). Whole words, so `GIT_AUTHOR_NAME` and `OAUTH_CLIENT_ID` still go.
+/// A denylist: a secret under an unremarkable name and value still goes
+/// (docs/cloud.md says so).
+#[must_use]
+pub fn cloud_forwardable(name: &str, value: &[u8]) -> bool {
+    let upper = name.to_ascii_uppercase();
+    forwardable(name)
+        && !upper.contains("CONNECTION_STRING")
+        && !upper.split('_').any(|word| {
+            matches!(
+                word,
+                "AUTH" | "AUTHORIZATION" | "DSN" | "CONNSTR" | "BEARER" | "JWT" | "PASSWD" | "PWD"
+            )
+        })
+        && !looks_like_a_secret(&String::from_utf8_lossy(value))
+}
+
+const CREDENTIAL_WORDS: [&str; 9] = [
+    "password",
+    "passwd",
+    "pwd",
+    "pass",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "access_key",
+];
+
+/// Whether `key` (as written in a query, connection string or JSON) names a
+/// credential. The short words only as a whole word (`compass` is not `pass`).
+fn names_a_credential(key: &str) -> bool {
+    let key = key
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '\''))
+        .to_ascii_lowercase();
+    CREDENTIAL_WORDS.iter().any(|word| {
+        key == *word
+            || key.ends_with(&format!("_{word}"))
+            || key.ends_with(&format!("-{word}"))
+            || (word.len() > 4 && key.ends_with(word))
+    })
+}
+
+/// `%70assword%3Dx` as `password=x`: percent escapes undone (lossily), so a
+/// secret does not hide behind an encoded key.
+fn percent_decoded(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = |byte: u8| char::from(byte).to_digit(16);
+        if bytes[at] == b'%'
+            && let (Some(high), Some(low)) = (
+                bytes.get(at + 1).copied().and_then(hex),
+                bytes.get(at + 2).copied().and_then(hex),
+            )
+        {
+            out.push(u8::try_from(high * 16 + low).unwrap_or(b'?'));
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether what follows a credential's `=` is a value. Fail closed: only what
+/// can be read as empty is empty. A quoted value is empty only when it is
+/// exactly `''` or `""` followed by the end, whitespace or a terminator (a
+/// doubled quote inside is an escaped quote, part of the value: `"""abc"`; a
+/// quote that never closes is a value). An unquoted one (spaces and `=` may be
+/// part of it: `password = a=b c`) is empty only when nothing follows or the
+/// pair ends at once (`;`, `&`, `,`, `}`), so `password= dbname=x` is not read
+/// as an empty password followed by another setting.
+fn has_a_setting(after_equals: &str) -> bool {
+    let setting = after_equals.trim_start();
+    match setting.chars().next() {
+        None | Some(';' | '&' | ',' | '}') => false,
+        Some(quote @ ('\'' | '"')) => {
+            // `''` / `""`, and then something that ends the value.
+            let empty = setting[1..].strip_prefix(quote).is_some_and(|rest| {
+                // A third quote right after is an escaped quote: not empty.
+                !rest.starts_with(quote)
+                    && rest
+                        .chars()
+                        .next()
+                        .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | ',' | '}'))
+            });
+            !empty
+        }
+        Some(_) => true,
+    }
+}
+
+/// A credential parameter with a value, in a URL query (`?password=x`,
+/// `&pwd=x`), a connection string (libpq `host=h password=x`, ADO
+/// `Password=x;`), or JSON (`"password": "x"`), also when percent-encoded.
+fn query_has_a_credential(value: &str) -> bool {
+    [value.to_owned(), percent_decoded(value)]
+        .iter()
+        .any(|text| {
+            let pair = text.match_indices('=').any(|(at, _)| {
+                // The word before the `=` (spaces around it are allowed:
+                // `password = x`) and a value that is not empty or the end of
+                // the pair (`password=;`). The value may hold spaces
+                // (`password='a b'`, `Password=a b;`); only that it exists matters.
+                let key = text[..at]
+                    .trim_end()
+                    .rsplit(|c: char| {
+                        c.is_whitespace() || matches!(c, ';' | '?' | '&' | ',' | '{' | '}')
+                    })
+                    .next()
+                    .unwrap_or_default();
+                names_a_credential(key) && has_a_setting(&text[at + 1..])
+            });
+            // `"password": "x"`
+            let json = text.split(['{', ',']).any(|member| {
+                member.split_once(':').is_some_and(|(key, setting)| {
+                    let setting = setting.trim().trim_end_matches('}').trim();
+                    names_a_credential(key)
+                        && !matches!(setting, "" | "\"\"" | "null" | "''")
+                        && key.trim().starts_with(['"', '\''])
+                })
+            });
+            pair || json
+        })
+}
+
+/// A JSON web token (`eyJ...` header, payload and signature) by itself or in
+/// a longer value.
+fn has_a_jwt(value: &str) -> bool {
+    value
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        .any(|word| word.starts_with("eyJ") && word.len() >= 20 && word.matches('.').count() == 2)
+}
+
+fn looks_like_a_secret(value: &str) -> bool {
+    const PREFIXES: [&str; 15] = [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "github_pat_",
+        "glpat-",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxs-",
+        "xoxr-",
+        "sk_live_",
+        "rk_live_",
+        "dckr_pat_",
+        "npm_",
+    ];
+    if value.contains("-----BEGIN ") {
+        return true;
+    }
+    // `scheme://user:password@host`
+    let mut rest = value;
+    while let Some(at) = rest.find("://") {
+        rest = &rest[at + 3..];
+        let authority = rest
+            .split(['/', '?', '#', ' ', '\t', '\n'])
+            .next()
+            .unwrap_or_default();
+        if let Some((userinfo, _)) = authority.rsplit_once('@')
+            && userinfo
+                .split_once(':')
+                .is_some_and(|(_, password)| !password.is_empty())
+        {
+            return true;
+        }
+    }
+    if query_has_a_credential(value) || has_a_jwt(value) {
+        return true;
+    }
+    value
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+        .any(|word| {
+            PREFIXES.iter().any(|prefix| word.starts_with(prefix))
+                || (word.starts_with("sk-") && word.len() >= 24)
+                || ((word.starts_with("AKIA") || word.starts_with("ASIA"))
+                    && word.len() == 20
+                    && word
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
+        })
+}
+
 impl SplitEngine {
     /// Load the journal; every unfinished split becomes `uncertain` and its
     /// launched branches untrusted (`NoReplay`, `WorkspaceRecorded`).

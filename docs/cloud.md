@@ -32,7 +32,13 @@ works where a command does: in a pipeline, after `&&` or `;`, a
 
 The block is evaluated by a fresh shell in the sandbox, like a split shell
 branch. Exported variables and the current directory go with it (marsh drops
-credential-like names such as `*TOKEN*` or `*KEY*`, as it does for jobs).
+credential-like names such as `*TOKEN*`, `*KEY*`, `*_AUTH`, `AUTHORIZATION` or `*_DSN`, and
+values that are one: a URL with a password or a `password=`, `pwd=`, `token=` or
+`api_key=` parameter (in a URL query, a libpq or ADO connection string, or JSON, also
+percent-encoded), a JWT, a PEM block, a GitHub, Slack,
+Docker, npm or AWS token. This is a denylist of shapes, not an allowlist and not a promise: a secret
+under an ordinary name and value is sent, so keep such values out of the
+environment of a shell that runs `cloud`).
 Aliases, functions, unexported variables, and shell options do not. Changes
 to the directory or variables inside the block do not affect your shell.
 

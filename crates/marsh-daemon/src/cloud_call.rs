@@ -422,6 +422,21 @@ impl marsh_runtime::AttachedProcess for Exited {
     }
 }
 
+/// What of an agent call's requested environment reaches its own sandbox:
+/// the credential filter, and nothing marsh reserves or binds to a place.
+fn child_environment(
+    env: std::collections::BTreeMap<String, Vec<u8>>,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    env.into_iter()
+        .filter(|(name, value)| {
+            crate::split::cloud_forwardable(name, value)
+                && !marsh_contracts::reserved_exported_environment_name(name)
+                && !marsh_contracts::placement_bound_environment_name(name)
+                && !LOCAL_ONLY.contains(&name.as_str())
+        })
+        .collect()
+}
+
 /// One attempt's copy of a step's input (it may carry the delegation token),
 /// overwritten when the attempt ends rather than freed as it is.
 struct Scrubbed {
@@ -1293,16 +1308,7 @@ pub fn run_child(
         root: call.root.as_bytes().to_vec(),
         mode: marsh_contracts::cloud::CloudMode::Argv,
         argv,
-        env: request
-            .env
-            .into_iter()
-            .filter(|(name, _)| {
-                crate::split::forwardable(name)
-                    && !marsh_contracts::reserved_exported_environment_name(name)
-                    && !marsh_contracts::placement_bound_environment_name(name)
-                    && !LOCAL_ONLY.contains(&name.as_str())
-            })
-            .collect(),
+        env: child_environment(request.env),
         terminal: None,
         // An agent call's own sandbox has no command links: no further calls.
         kits: Vec::new(),
@@ -1482,6 +1488,29 @@ pub fn apply_report(stdout: &[u8], ok: bool, diagnostic: &str) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent call's sandbox gets the same credential filter as a block's.
+    #[test]
+    fn an_agent_calls_environment_drops_credential_shaped_names_and_values() {
+        let env = [
+            ("DOCKER_AUTH_CONFIG", "{}"),
+            ("NOTES", "xoxs-1234-abcd"),
+            ("DATABASE_URL", "mysql://app:hunter2@db/app"),
+            ("DB", "host=db password = 'abc=def' dbname=app"),
+            ("DB2", "Server=db;Password = \"abc=def\";Database=app"),
+            ("DB3", "Server=db;Password=\"\"\"abc\";Database=app"),
+            ("GIT_AUTHOR_EMAIL", "ada@example.com"),
+            ("RUST_LOG", "debug"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.as_bytes().to_vec()))
+        .collect();
+        let sent = child_environment(env);
+        assert_eq!(
+            sent.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["GIT_AUTHOR_EMAIL", "RUST_LOG"]
+        );
+    }
 
     /// A stock exec that never exits until it is terminated, whose output
     /// pipe stays open (a half-open connection).

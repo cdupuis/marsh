@@ -1544,8 +1544,10 @@ impl Write for WorkerInput {
 }
 
 impl CommandRunner for StockModel {
+    /// Production never calls this: a stock call without a deadline can hang
+    /// forever under a per-VM lock (audit B-03).
     fn run(&self, invocation: &Invocation) -> io::Result<CommandOutput> {
-        self.respond(&Call::new(invocation))
+        panic!("unbounded stock call: {:?}", Call::new(invocation));
     }
 
     fn run_bounded(&self, invocation: &Invocation, bound: Duration) -> io::Result<CommandOutput> {

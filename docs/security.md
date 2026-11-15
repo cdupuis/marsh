@@ -580,6 +580,14 @@ home.
 - When marsh cannot confirm that a container was removed, it does not retry the
   job. It marks the job `cleanup uncertain` and quarantines the VM until you
   run `marsh workers reset KIT`.
+- Nothing caps how many jobs one job tree launches in total, or reserves pool
+  slots for other trees. The launch rate (60 per minute by default), the depth,
+  the fan-out and the pool bound how fast and how wide a tree grows, not how
+  long it keeps going: an agent tree that keeps calling itself can use up to the
+  rate in launches, and hold up to the whole `daemon-jobs` pool, until its root
+  reaches its wall time (24 hours by default). Long unattended trees can run up
+  substantial provider charges. This is an accepted limit; Ctrl-C at the root job's caller ends a tree, and
+  lowering `tree-launch-rate`, `job-children` or `daemon-jobs` narrows it.
 - Binaries are not signed or notarized.
 
 Next: [Split and join](split.md), [Troubleshooting](troubleshooting.md).

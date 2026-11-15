@@ -3298,16 +3298,24 @@ fn is_allowed_platform_temp_root(path: &Path, mode: u32) -> bool {
         .any(|candidate| candidate == path)
 }
 
-fn prepare_home(path: &Path) -> Result<PathBuf, String> {
-    if !path.is_absolute() {
-        return Err("home must be an absolute path".into());
-    }
-    let product_root = path.ancestors().find(|ancestor| {
+/// `path` or its nearest ancestor that is a `*-mcp-scopes` product directory
+/// (`marsh-mcp-scopes`, or `<state root>-mcp-scopes` under `MARSH_CONTROL_HOME`):
+/// the owner-only directory `prepare_home` checks above every generated scope
+/// root, including the per-client roots (`clients/sbx/<hash>`).
+pub(crate) fn mcp_product_root(path: &Path) -> Option<&Path> {
+    path.ancestors().find(|ancestor| {
         ancestor
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.ends_with("-mcp-scopes"))
-    });
+    })
+}
+
+fn prepare_home(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("home must be an absolute path".into());
+    }
+    let product_root = mcp_product_root(path);
     if let Some(product_root) = product_root {
         let host_home = product_root.parent();
         for directory in path

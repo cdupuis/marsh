@@ -95,6 +95,22 @@ load the same SBX registration concurrently without starting competing scope
 owners. Legacy `--home` mode has no managed root registry or broker; its
 lifecycle state lasts only for that direct MCP process.
 
+The broker's socket, token, pid and log sit in `b-<key>/` in the owner-only
+`*-mcp-scopes` directory above the scope root (`marsh-mcp-scopes`, or the one
+beside a `MARSH_CONTROL_HOME` override; for every generated root, including
+`clients/sbx/<hash>`), keyed on the canonical scope root so every spelling of it
+names one broker. A long home gets a shorter directory name (`b<key6>/`). Only
+a scope root outside any such directory, or a path too long for any socket
+path, uses `/tmp/marsh-mcp-<uid>-<key>`; the broker then says so on stderr when
+it starts, because another local user can block that directory by creating it
+first (a denial of service, not access).
+A broker started by an earlier build listens under `/tmp` and holds the scope
+lease; this build cannot see or stop it. `broker-start` detects it (a socket
+under `/tmp` keyed on the scope root as spelled or as canonicalized, and the held lease; a stale pid
+in an unlocked `control.lock` is never reported) and fails with its pid and the command that
+works without the old binary: `kill <pid>`. Sandboxes loaded through that
+broker lose their MCP connection until they reload.
+
 Before creating or using a scope home, the server binds every managed root to
 the canonical path and filesystem identity of the configured workspace. A
 later process can reuse that root only for that exact workspace identity. This

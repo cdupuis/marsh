@@ -68,7 +68,10 @@ marsh cloud --cpus 4 -- ./train.sh
 
 - `--cpus N`: 1, 2, 4, 8, or 16, with 2 GiB of memory per CPU. Default 2.
 - `--ttl DURATION`: the sandbox's lifetime limit, from `1m` to `24h`. Default
-  `4h`. A command still running when it expires is lost, not written back.
+  `4h`. A command still running when it expires is lost, not written back. An
+  attached block that Docker Cloud's limit did not end (a connection that went
+  quiet) is ended on your Mac two minutes after the limit, and its end is then
+  confirmed from the sandbox as usual.
 - `--image REF`: another image, pinned by digest
   (`REPOSITORY@sha256:...`), Linux ARM64. It must provide `sudo` for the
   `agent` user, `useradd`, `setsid`, and `gzip`, as the default image does.

@@ -217,7 +217,9 @@ run.
 
 ## Out of scope
 
-Cloud execution, general M:N scheduling, isolating shell-VM commands in a
+This local contract excludes cloud execution (explicit placement ships as a
+preview, [cloud.md](../cloud.md); cloud to laptop crossings and
+`marsh run --place` are not built), and also general M:N scheduling, isolating shell-VM commands in a
 `split` branch, copying ignored files into split forks, workload restart recovery,
 multi-device history, additional host architectures, and public signing or
 notarization. Split artifacts retain branch output;

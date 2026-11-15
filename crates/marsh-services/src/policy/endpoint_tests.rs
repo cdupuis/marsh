@@ -590,6 +590,13 @@ struct VolumeEngine {
     gate: Arc<AtomicBool>,
     /// 0: delete normally; otherwise answer every DELETE with this status.
     delete_status: Arc<std::sync::atomic::AtomicU16>,
+    /// Hold every DELETE (not only the first) until `gate`.
+    hold_all_deletes: Arc<AtomicBool>,
+    /// Hold the next volume CREATE until `create_release`; `held_create_done`
+    /// is set when it has been answered.
+    hold_next_create: Arc<AtomicBool>,
+    create_release: Arc<AtomicBool>,
+    held_create_done: Arc<AtomicBool>,
 }
 
 impl VolumeEngine {
@@ -600,6 +607,10 @@ impl VolumeEngine {
             first_done: Arc::default(),
             gate: Arc::default(),
             delete_status: Arc::default(),
+            hold_all_deletes: Arc::default(),
+            hold_next_create: Arc::default(),
+            create_release: Arc::default(),
+            held_create_done: Arc::default(),
         }
     }
 
@@ -610,6 +621,12 @@ impl VolumeEngine {
             self.gate.clone(),
             self.first_done.clone(),
             self.delete_status.clone(),
+        );
+        let (hold_all, hold_create, release, create_done) = (
+            self.hold_all_deletes.clone(),
+            self.hold_next_create.clone(),
+            self.create_release.clone(),
+            self.held_create_done.clone(),
         );
         // One removal of a name at a time, in no particular order.
         let by_name: Arc<Mutex<()>> = Arc::default();
@@ -626,6 +643,12 @@ impl VolumeEngine {
                     true
                 }
                 ("POST", "/volumes/create") => {
+                    let held = hold_create.swap(false, Ordering::SeqCst);
+                    if held {
+                        while !release.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
                     let body = String::from_utf8_lossy(&req.body).into_owned();
                     let named = body
                         .split("\"Name\":\"")
@@ -635,6 +658,9 @@ impl VolumeEngine {
                         .to_owned();
                     store.lock().unwrap().insert(named, body.clone());
                     answer(s, 201, &body);
+                    if held {
+                        create_done.store(true, Ordering::SeqCst);
+                    }
                     true
                 }
                 ("GET", t) if t.starts_with("/volumes/") => {
@@ -660,7 +686,7 @@ impl VolumeEngine {
                     // a request can be delayed before the lock while a later one
                     // runs (arrival order is not execution order).
                     let first = deletes.fetch_add(1, Ordering::SeqCst) == 0;
-                    if first {
+                    if first || hold_all.load(Ordering::SeqCst) {
                         while !gate.load(Ordering::SeqCst) {
                             std::thread::sleep(Duration::from_millis(10));
                         }
@@ -908,6 +934,157 @@ fn an_engine_error_on_delete_keeps_the_owner_and_is_passed_on() {
         assert!(!h.svc.volume_fenced("data"), "{status}");
         assert!(engine.store.lock().unwrap().contains_key("data"));
     }
+}
+
+/// A create that was admitted before a delete (and so before any fence) must
+/// not publish its ownership after that delete and a later fence: volume
+/// creates and deletes of a name run one at a time from admission to the end
+/// of the engine call, so the delete waits for the create instead of
+/// overtaking it.
+#[test]
+fn a_volume_create_holds_the_name_from_admission_to_the_end_of_its_engine_call() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("createhold", false, engine.handler(), |_| {});
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    assert_eq!(call(&sock_b, "POST", "/volumes/create", DATA).0, 201);
+    engine.hold_next_create.store(true, Ordering::SeqCst);
+    let second_create = {
+        let sock = sock_b.clone();
+        std::thread::spawn(move || call(&sock, "POST", "/volumes/create", DATA).0)
+    };
+    // Admitted and at the engine.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !engine.hold_next_create.load(Ordering::SeqCst),
+        "the create never reached the engine"
+    );
+    let delete_b = {
+        let sock = sock_b.clone();
+        std::thread::spawn(move || call(&sock, "DELETE", "/volumes/data", None).0)
+    };
+    let create_a = {
+        let sock = sock_a.clone();
+        std::thread::spawn(move || call(&sock, "POST", "/volumes/create", DATA).0)
+    };
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !delete_b.is_finished(),
+        "a delete overtook a create at the engine"
+    );
+    assert!(
+        !create_a.is_finished(),
+        "another workspace claimed the name meanwhile"
+    );
+    engine.create_release.store(true, Ordering::SeqCst);
+    assert_eq!(second_create.join().unwrap(), 201);
+    assert!(engine.held_create_done.load(Ordering::SeqCst));
+    assert_eq!(delete_b.join().unwrap(), 204);
+    // Whichever of the two waiting requests ran first decides lane A's answer:
+    // refused while lane B still owned the name, or created after B's delete.
+    let a_status = create_a.join().unwrap();
+    assert!(matches!(a_status, 201 | 403), "{a_status}");
+    assert_eq!(h.svc.ledger.has_volume("lane-a", "data"), a_status == 201);
+    assert!(
+        !h.svc.ledger.has_volume("lane-b", "data"),
+        "lane B deleted it"
+    );
+}
+
+/// A retry that the engine answers 404 (the first request finished late)
+/// releases the name like any answered delete.
+#[test]
+fn a_delete_retry_answered_404_releases_the_name() {
+    let (engine, h, sock_a, _) = timed_out_delete("dt6");
+    release_first_delete(&engine);
+    assert_eq!(call(&sock_a, "DELETE", "/volumes/data", None).0, 404);
+    assert!(!h.svc.ledger.has_volume("lane-a", "data"));
+}
+
+/// Each unanswered delete refreshes the fence: a second failure well after the
+/// first extends it past the first one's expiry.
+#[test]
+fn a_repeated_unanswered_delete_refreshes_the_fence_time() {
+    let (engine, h, sock_a, sock_b) = timed_out_delete("dt7");
+    engine.hold_all_deletes.store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(1700));
+    assert_eq!(call(&sock_a, "DELETE", "/volumes/data", None).0, 502);
+    // Past the first failure's expiry (2.5 s), inside the second's.
+    std::thread::sleep(Duration::from_millis(900));
+    assert!(h.svc.volume_fenced("data"));
+    assert_eq!(call(&sock_b, "POST", "/volumes/create", DATA).0, 503);
+    engine.gate.store(true, Ordering::SeqCst);
+}
+
+/// The terminal chunk arriving a byte at a time (each piece inside the
+/// per-read limit) is cut off by the call's absolute deadline, in time.
+#[test]
+fn a_drip_fed_terminal_chunk_obeys_the_whole_call_deadline() {
+    let h = H::new(
+        "dripterminalw4",
+        false,
+        Arc::new(|req, s| {
+            if req.method != "DELETE" {
+                return false;
+            }
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            for byte in b"0\r\n\r\n" {
+                std::thread::sleep(Duration::from_millis(120));
+                if s.write_all(&[*byte]).is_err() {
+                    return true;
+                }
+            }
+            true
+        }),
+        |cfg| cfg.up_progress = Duration::from_millis(200),
+    );
+    let sock = h.serve(&h.auth);
+    h.svc.ledger.claim_volume("lane-a", "att1", "data").unwrap();
+    let started = Instant::now();
+    let (status, _) = call(&sock, "DELETE", "/volumes/data", None);
+    assert_eq!(
+        status,
+        502,
+        "accepted a reply after {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(450),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(h.svc.volume_fenced("data"));
+}
+
+/// A request that the engine reads slowly (partial writes, each inside the
+/// write timeout) is cut off by the same deadline.
+#[test]
+fn a_slowly_read_request_obeys_the_whole_call_deadline() {
+    let h = H::new("slowwritew4", false, no_custom(), |cfg| {
+        cfg.up_progress = Duration::from_millis(200);
+    });
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut buf = vec![0_u8; 8 * 1024];
+        while let Ok(n) = server.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    });
+    let body = vec![b'x'; 8 * 1024 * 1024];
+    let started = Instant::now();
+    let result = h
+        .svc
+        .exchange(client, "POST", "/volumes/create", Some(&body));
+    assert!(result.is_err());
+    assert!(
+        started.elapsed() < Duration::from_millis(600),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(reader);
 }
 
 fn raw_exchange(sock: &Path, request: &str, keep_reading_for: Duration) -> String {

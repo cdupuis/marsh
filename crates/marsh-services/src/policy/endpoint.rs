@@ -521,6 +521,19 @@ impl Services {
         Ok(s)
     }
 
+    /// `vol_lock`, unless this thread already holds it for the whole request
+    /// (a volume create or delete: [`VolHold`]).
+    fn vol_enter(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        if VOL_HELD.with(std::cell::Cell::get) {
+            return None;
+        }
+        Some(
+            self.vol_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     /// Whether a delete of this volume's name, of unknown outcome, may still
     /// land at the engine (the fence only ever ends by time).
     #[cfg(test)]
@@ -576,20 +589,33 @@ impl Services {
                 .saturating_duration_since(std::time::Instant::now())
                 .max(Duration::from_millis(1))
         };
-        s.set_write_timeout(Some(remaining()))?;
-        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n");
+        let mut request =
+            format!("{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n");
         if let Some(b) = body {
-            head.push_str(&format!(
+            request.push_str(&format!(
                 "Content-Type: application/json\r\nContent-Length: {}\r\n",
                 b.len()
             ));
         } else if method != "GET" {
-            head.push_str("Content-Length: 0\r\n");
+            request.push_str("Content-Length: 0\r\n");
         }
-        head.push_str("\r\n");
-        s.write_all(head.as_bytes())?;
-        if let Some(b) = body {
-            s.write_all(b)?;
+        request.push_str("\r\n");
+        // Every write attempt waits only for what is left of the call.
+        for mut part in [request.as_bytes(), body.unwrap_or_default()] {
+            while !part.is_empty() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                s.set_write_timeout(Some(remaining()))?;
+                // Small writes: one large `write` renews the timeout while it
+                // makes progress, so the deadline is checked between pieces.
+                match s.write(&part[..part.len().min(16 * 1024)]) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n) => part = &part[n..],
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
         }
         let mut conn = Conn::new(
             s,
@@ -599,6 +625,7 @@ impl Services {
                 ..HttpLimits::default()
             },
         );
+        conn.hard_deadline = Some(deadline);
         let resp = conn.read_response_head(method == "HEAD").map_err(http_io)?;
         let body = read_resp_body(&mut conn, &resp, 32 << 20, Some(deadline)).map_err(http_io)?;
         Ok((resp, body))
@@ -1478,11 +1505,7 @@ impl Env for Scope {
     }
 
     fn ensure_volume(&self, name: &str) -> Result<(), Refusal> {
-        let _g = self
-            .svc
-            .vol_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = self.svc.vol_enter();
         self.svc.check_fence(name, &self.auth.workspace)?;
         let fail = |m: String| Refusal {
             status: 500,
@@ -1538,11 +1561,7 @@ impl Env for Scope {
     }
 
     fn reserve_volume(&self, name: &str) -> Result<bool, Refusal> {
-        let _g = self
-            .svc
-            .vol_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = self.svc.vol_enter();
         self.svc.check_fence(name, &self.auth.workspace)?;
         let ws = &self.auth.workspace;
         let claim = self
@@ -1977,15 +1996,13 @@ fn handle_request(scope: &Arc<Scope>, conn: &mut Conn, head: &Head) -> io::Resul
         BodyPolicy::Stream => None,
     };
     let client_body = body.clone();
-    // A volume delete is checked (the caller owns the name), sent to the engine
-    // and recorded under the lock every volume claim takes: a delete that
-    // waited at the engine cannot land after the name was released and given to
-    // another workspace, and nobody can claim the name while it is in flight.
-    let _volume_delete = (m.kind == Kind::VolumeDelete).then(|| {
-        svc.vol_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    });
+    // A volume create or delete holds the name from admission (the ownership
+    // check or the claim) through the engine call to the ledger record, under
+    // the lock every volume claim takes: nothing admitted earlier can publish
+    // after a later operation or fence, and nobody can claim the name while an
+    // operation on it is in flight.
+    let _volume_op =
+        matches!(m.kind, Kind::VolumeCreate | Kind::VolumeDelete).then(|| VolHold::take(svc));
     let mut adm = match admit(&m, head, body, scope.as_ref()) {
         Ok(a) => a,
         Err(r) => {
@@ -2337,7 +2354,12 @@ fn read_resp_body(
         tighten(c)?;
         let n = c.read_body(&mut st, &mut buf)?;
         if n == 0 {
-            return Ok(out);
+            // The end of the body is only accepted inside the deadline.
+            return if late() {
+                Err(HttpError::Timeout)
+            } else {
+                Ok(out)
+            };
         }
         if out.len() + n > cap {
             return Err(HttpError::BodyTooLarge);
@@ -2790,12 +2812,41 @@ fn record_container(
     Ok(())
 }
 
+thread_local! {
+    /// This thread holds `vol_lock` for the request it is handling.
+    static VOL_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `vol_lock` held from the admission of a volume create or delete to the end
+/// of its handling; the claim paths inside admission see the flag and do not
+/// take the lock again.
+struct VolHold<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+impl<'a> VolHold<'a> {
+    fn take(svc: &'a Services) -> Self {
+        let guard = svc
+            .vol_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        VOL_HELD.with(|held| held.set(true));
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for VolHold<'_> {
+    fn drop(&mut self) {
+        VOL_HELD.with(|held| held.set(false));
+    }
+}
+
 /// A volume delete, made by the agent itself rather than streamed through the
 /// client's connection, so that the client leaving cannot end it early: the
 /// caller (holding `vol_lock`) waits for the engine. The ledger releases the
 /// name only on an answer that says it is gone. If the engine does not answer,
 /// the delete may still land later, so the name stays with its owner and is
-/// fenced against every claim for `delete_fence`.
+/// fenced against other workspaces' claims for `delete_fence`.
 fn delete_volume(
     scope: &Arc<Scope>,
     conn: &mut Conn,
@@ -2824,9 +2875,9 @@ fn delete_volume(
     };
     match svc.exchange(up, "DELETE", &path, None) {
         Ok((resp, body)) => {
-            // The engine answered, so the delete is over. Dockerd removes one
-            // name at a time, so this answer also means any earlier unanswered
-            // delete of the name has finished: the fence ends.
+            // The engine answered this delete. That does not show that an
+            // earlier unanswered delete of the name has finished, so an
+            // existing fence is left to expire.
             if matches!(resp.status, 200 | 204 | 404) {
                 post_actions(scope, &adm.post);
             }

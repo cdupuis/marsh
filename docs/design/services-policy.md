@@ -140,10 +140,17 @@ recorded protected identities (`.git`, `.marsh`) cannot be trusted, so binding a
 project folder is refused (and restore marks pins failed) until an operator
 checks them and removes that file. The serving agent also holds `ledger.serve`
 for its lifetime, so a replacement that starts early waits, then fails, rather
-than answering from a stale view. A volume delete is checked, sent and recorded
-under the lock every volume claim takes (`vol_lock`), so an old delete cannot land
-after the name was given to another workspace
-(`a_delayed_delete_cannot_remove_a_volume_another_workspace_now_owns`). The agent
+than answering from a stale view. A volume create or delete holds the name from its
+admission (the claim, or the ownership check) through the engine call to the
+ledger record, under the lock every volume claim takes (`vol_lock`): an operation
+admitted earlier cannot publish its ownership after a later operation or fence,
+and an old delete cannot land after the name was given to another workspace
+(`a_delayed_delete_cannot_remove_a_volume_another_workspace_now_owns`,
+`a_volume_create_holds_the_name_from_admission_to_the_end_of_its_engine_call`).
+This was chosen over fencing at the start of every delete and re-checking the
+fence after a create's engine call, because that would have to undo a volume the
+create may or may not have made; holding the lock needs no undo and fails closed
+(the cost is the queue below). The agent
 makes the engine call itself, so the client leaving does not end it early
 (`a_delete_whose_client_disconnected_still_holds_the_name_until_the_engine_finishes`).
 The ledger releases the name only when the engine answers 200, 204 or 404. If a
@@ -168,16 +175,24 @@ expired is not stopped; the engine gives no way to cancel or confirm a request i
 has accepted. An engine error on a delete (409, 5xx) is an answer: the owner keeps
 the volume and the reply is passed on. The reply to a delete is the engine's
 (status line, headers, body; keep-alive when the client asked for it). Every
-engine call the agent makes itself is bounded as a whole (the write, the head and
-every read of the body) by `up_progress`, 30 s
+engine call the agent makes itself ends at one absolute deadline, `up_progress` (30 s)
+after it started: each write attempt (in pieces of 16 KiB), the response head, every
+read of the body including chunk-size lines, trailers and the terminal chunk, and
+the acceptance of the end of the body
 (`a_drip_fed_response_head_obeys_the_whole_call_deadline`,
 `a_drip_fed_chunked_reply_obeys_the_whole_call_deadline`,
+`a_drip_fed_terminal_chunk_obeys_the_whole_call_deadline`,
+`a_slowly_read_request_obeys_the_whole_call_deadline`,
 `a_trickling_engine_reply_is_bounded_by_the_whole_call`). This covers
 DELETE of a volume against volume claims. Container and network deletes (they
 address the engine by the ID the ledger resolved), volume prune and other
 label-filtered engine calls are not serialized this way and are not covered.
-Volume claims and deletes queue behind one lock for every workspace, so a hung
-engine call delays them all until its answer or the 30 s response deadline. A ledger that goes corrupt while the agent
+Volume creates, deletes and named-volume container creates queue behind one lock
+for every workspace (not per name), so a hung engine call delays them all until
+its answer or the 30 s deadline, and the lock is not fair; a per-name lock would
+narrow this and is not done. The engine DELETE that undoes a volume after a
+ledger write failed (`undo`) is neither locked nor fenced; it needs a degraded
+ledger, which refuses every claim. A ledger that goes corrupt while the agent
 runs is not set aside: the ledger degrades and refuses writes until restart.
 Enforced by the ledger tests `a_change_is_published_in_the_durable_order`,
 `a_corrupt_ledger_quarantines_until_an_operator_clears_it`,

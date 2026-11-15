@@ -362,6 +362,57 @@ fn quarantine_stop_waits_for_an_inflight_retained_start() {
 }
 
 #[test]
+fn a_start_write_to_a_worker_that_stopped_reading_expires_and_quarantines() {
+    let model = StockModel::new();
+    let adapter = model
+        .adapter()
+        .with_preparation_timeouts(PreparationTimeouts {
+            start_write: Duration::from_millis(200),
+            ..PreparationTimeouts::default()
+        });
+    let kit = KitFixture::published(KIT);
+    let ready = adapter.ensure_kit_vm(&kit.spec).unwrap();
+    let source = directory(kit.dir.path(), "project");
+    let grants = adapter
+        .prepare_job_grants(
+            &ready,
+            "session-one",
+            "attempt-stuck-start",
+            &[grant(
+                source,
+                "/Users/alice/project",
+                MountAccess::ReadWrite,
+            )],
+        )
+        .unwrap();
+    let input = model.gate_worker_input();
+    let adapter = Arc::new(adapter);
+    let (send, receive) = mpsc::channel();
+    {
+        let adapter = Arc::clone(&adapter);
+        let ready = ready.clone();
+        thread::spawn(move || {
+            let _ = send.send(
+                adapter
+                    .launch_worker(&ready, &grants, "attempt-stuck-start", job_spec())
+                    .map(drop),
+            );
+        });
+    }
+    let result = receive.recv_timeout(Duration::from_secs(10));
+    input.release();
+    assert!(
+        matches!(result, Ok(Err(SbxError::AmbiguousWorkerStart { .. }))),
+        "{result:?}"
+    );
+    assert!(!model.vm(KIT).unwrap().running);
+    assert!(matches!(
+        adapter.ensure_kit_vm(&kit.spec),
+        Err(SbxError::QuarantinedVm(_))
+    ));
+}
+
+#[test]
 fn ambiguous_retained_start_write_quarantines_and_stops_the_exact_vm() {
     let model = StockModel::new();
     model.seed_vm("user-vm");
@@ -513,6 +564,100 @@ fn a_quarantine_stop_that_never_answers_expires_typed_instead_of_hanging() {
     ));
     assert!(model.vm(KIT).unwrap().running);
     assert_eq!(model.bounds_of("stop").len(), 1);
+}
+
+#[test]
+fn recovery_times_out_instead_of_queueing_behind_a_wedged_stop() {
+    let model = StockModel::new();
+    let (adapter, kit, ready) = warm_kit(&model, KIT);
+    let adapter = Arc::new(adapter);
+    let stop = model.gate(verb("stop"));
+    let wedged = {
+        let adapter = Arc::clone(&adapter);
+        let ready = ready.clone();
+        thread::spawn(move || adapter.stop_quarantined(&ready))
+    };
+    stop.wait_entered(1);
+
+    // `marsh workers reset`, `marsh stop`/`reset`, `marsh workers stop` and
+    // garbage collection each reach the VM's write fence while the stop above
+    // holds it. Each must give up at its own deadline.
+    let attempt =
+        |label: &str, call: fn(&StockSbx, &KitVmSpec, Instant) -> Result<(), SbxError>| {
+            let (send, receive) = mpsc::channel();
+            let adapter = Arc::clone(&adapter);
+            let spec = kit.spec.clone();
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_millis(200);
+                let _ = send.send(call(&adapter, &spec, deadline));
+            });
+            let result = receive.recv_timeout(Duration::from_secs(10));
+            if result.is_err() {
+                stop.release();
+            }
+            assert!(
+                matches!(result, Ok(Err(SbxError::LifecycleDeadline { .. }))),
+                "{label} did not time out behind the wedged stop: {result:?}"
+            );
+        };
+    attempt("workers reset", |adapter, spec, deadline| {
+        adapter.retire_kit_vm_before(spec, deadline, None).map(drop)
+    });
+    attempt("stop and reset", |adapter, _, deadline| {
+        adapter.reset_stale_scope_kit_vms_before(deadline).map(drop)
+    });
+    attempt("workers stop", |adapter, spec, deadline| {
+        let live = BTreeSet::new();
+        adapter
+            .stop_idle_kit_vm(&spec.name, &live, deadline)
+            .map(drop)
+    });
+    attempt("gc", |adapter, spec, deadline| {
+        let live = BTreeSet::new();
+        adapter
+            .remove_unused_kit_vm(&spec.name, "fixture", &live, deadline)
+            .map(drop)
+    });
+    stop.release();
+    wedged.join().unwrap().unwrap();
+}
+
+/// The stock-operation lock is polled against the deadline at its call sites
+/// too: held alone (no fence), it must still end a recovery at its deadline.
+#[test]
+fn recovery_times_out_on_a_held_stock_operation_lock() {
+    let model = StockModel::new();
+    let (adapter, kit, _ready) = warm_kit(&model, KIT);
+    let adapter = Arc::new(adapter);
+    let (operation, _cleanup) =
+        weak_mutex_transition_lock(&adapter.grant_stock_operation_locks, KIT.to_owned());
+    let _held = operation.lock().unwrap();
+    let attempt = |call: fn(&StockSbx, &KitVmSpec, Instant) -> Result<(), SbxError>| {
+        let (send, receive) = mpsc::channel();
+        let adapter = Arc::clone(&adapter);
+        let spec = kit.spec.clone();
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(200);
+            let _ = send.send(call(&adapter, &spec, deadline));
+        });
+        receive.recv_timeout(Duration::from_secs(10))
+    };
+    let reset = attempt(|adapter, spec, deadline| {
+        adapter.retire_kit_vm_before(spec, deadline, None).map(drop)
+    });
+    assert!(
+        matches!(reset, Ok(Err(SbxError::LifecycleDeadline { .. }))),
+        "{reset:?}"
+    );
+    let stop = attempt(|adapter, spec, deadline| {
+        adapter
+            .stop_idle_kit_vm(&spec.name, &BTreeSet::new(), deadline)
+            .map(drop)
+    });
+    assert!(
+        matches!(stop, Ok(Err(SbxError::LifecycleDeadline { .. }))),
+        "{stop:?}"
+    );
 }
 
 #[test]

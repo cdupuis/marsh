@@ -68,6 +68,17 @@ pub struct VolRec {
     pub created: u64,
 }
 
+/// Who created an image tag (`repo:tag`, canonical spelling).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TagRec {
+    pub scope: String,
+    pub created: u64,
+}
+
+/// Most tag records kept. At the cap, records whose image is gone are dropped
+/// first (`Ledger::retain_tags`); a request that still would not fit is refused.
+pub const MAX_TAGS: usize = 8192;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PinRec {
     pub scope: String,
@@ -122,6 +133,9 @@ struct State {
     containers: BTreeMap<String, ContainerRec>,
     networks: BTreeMap<String, NetRec>,
     volumes: BTreeMap<String, VolRec>,
+    /// Older ledgers have none.
+    #[serde(default)]
+    tags: BTreeMap<String, TagRec>,
     execs: BTreeMap<String, String>,
     pins: BTreeMap<String, PinRec>,
     scope_networks: BTreeMap<String, String>,
@@ -153,6 +167,44 @@ pub enum VolumeClaim {
     New,
     Own,
     Foreign,
+}
+
+/// What the engine says about an image tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagImage {
+    /// No image has the name.
+    Absent,
+    /// The image was pulled (it has registry digests): shared, nobody's to move.
+    Pulled,
+    /// Built, committed or tagged here.
+    Local,
+}
+
+/// What a scope may do with an image tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagClaim {
+    /// The caller created it already.
+    Own,
+    /// Free to take: nobody holds it, or its holder's image is gone.
+    New,
+    /// Another scope created it and its image is there.
+    Foreign,
+    /// A pulled image: not the caller's to move.
+    Unowned,
+}
+
+/// The rule for moving a tag, given the ledger's record and what the engine
+/// has under that name. A record whose image is gone holds nothing (so a
+/// `docker rmi` frees the name at once); an image built here that no record
+/// covers (its scope was dropped, or it predates the ledger) is adopted.
+#[must_use]
+pub fn tag_claim(rec: Option<&TagRec>, scope: &str, image: TagImage) -> TagClaim {
+    match (rec, image) {
+        (Some(r), _) if r.scope == scope => TagClaim::Own,
+        (Some(_), TagImage::Local | TagImage::Pulled) => TagClaim::Foreign,
+        (None, TagImage::Pulled) => TagClaim::Unowned,
+        (Some(_) | None, TagImage::Absent) | (None, TagImage::Local) => TagClaim::New,
+    }
 }
 
 pub struct Ledger {
@@ -372,7 +424,10 @@ impl Ledger {
             let before = (s.sockets.len(), s.scope_networks.len());
             s.sockets.retain(|_, rec| rec.scope != scope);
             s.scope_networks.remove(scope);
-            let changed = before != (s.sockets.len(), s.scope_networks.len());
+            let tags = s.tags.len();
+            s.tags.retain(|_, rec| rec.scope != scope);
+            let changed =
+                before != (s.sockets.len(), s.scope_networks.len()) || tags != s.tags.len();
             ((), changed)
         })
     }
@@ -569,6 +624,44 @@ impl Ledger {
     #[must_use]
     pub fn has_volume(&self, scope: &str, name: &str) -> bool {
         self.volume(scope, name) == VolumeScope::Own
+    }
+
+    #[must_use]
+    pub fn tag_owner(&self, name: &str) -> Option<TagRec> {
+        self.with(|s| s.tags.get(name).cloned())
+    }
+
+    #[must_use]
+    pub fn tag_count(&self) -> usize {
+        self.with(|s| s.tags.len())
+    }
+
+    /// Keep only the tag records `keep` accepts; returns how many went.
+    pub fn retain_tags(&self, keep: impl Fn(&str, &TagRec) -> bool) -> LedgerResult<usize> {
+        self.mutate(|s| {
+            let before = s.tags.len();
+            s.tags.retain(|name, rec| keep(name, rec));
+            let gone = before - s.tags.len();
+            (gone, gone > 0)
+        })
+    }
+
+    /// Record `scope` as the creator of a tag (taking over a stale record).
+    /// `Ok(false)`: the ledger holds too many tags and kept the record out.
+    pub fn set_tag(&self, scope: &str, name: &str) -> LedgerResult<bool> {
+        self.mutate(|s| {
+            if s.tags.len() >= MAX_TAGS && !s.tags.contains_key(name) {
+                return (false, false);
+            }
+            s.tags.insert(
+                name.to_string(),
+                TagRec {
+                    scope: scope.to_string(),
+                    created: now(),
+                },
+            );
+            (true, true)
+        })
     }
 
     pub fn add_exec(&self, exec: &str, container: &str) -> LedgerResult<()> {
@@ -828,6 +921,104 @@ mod tests {
                 .count();
             assert_eq!(wins, 1, "round {round}");
         }
+    }
+
+    /// A tag is the creator's; pulled images are nobody's to move; a record
+    /// for an image that is gone holds nothing.
+    #[test]
+    fn a_tag_belongs_to_the_scope_that_created_it() {
+        let rec = |scope: &str| TagRec {
+            scope: scope.into(),
+            created: 0,
+        };
+        for (what, held, image, want) in [
+            ("nobody, no image", None, TagImage::Absent, TagClaim::New),
+            (
+                "nobody, pulled image",
+                None,
+                TagImage::Pulled,
+                TagClaim::Unowned,
+            ),
+            ("nobody, built here", None, TagImage::Local, TagClaim::New),
+            (
+                "own, image there",
+                Some(rec("a")),
+                TagImage::Local,
+                TagClaim::Own,
+            ),
+            (
+                "own, image gone",
+                Some(rec("a")),
+                TagImage::Absent,
+                TagClaim::Own,
+            ),
+            (
+                "other's, image there",
+                Some(rec("b")),
+                TagImage::Local,
+                TagClaim::Foreign,
+            ),
+            (
+                "other's, pulled",
+                Some(rec("b")),
+                TagImage::Pulled,
+                TagClaim::Foreign,
+            ),
+            (
+                "other's, image gone",
+                Some(rec("b")),
+                TagImage::Absent,
+                TagClaim::New,
+            ),
+        ] {
+            assert_eq!(tag_claim(held.as_ref(), "a", image), want, "{what}");
+        }
+    }
+
+    #[test]
+    fn a_dropped_scope_and_stale_records_free_the_tag_table() {
+        let l = Ledger::in_memory();
+        for n in 0..MAX_TAGS {
+            assert!(l.set_tag("dead", &format!("dead:{n}")).unwrap());
+        }
+        assert!(!l.set_tag("live", "new:1").unwrap(), "full");
+        l.forget_scope("dead").unwrap();
+        assert_eq!(l.tag_count(), 0);
+        assert!(l.set_tag("live", "keep:1").unwrap());
+        assert!(l.set_tag("live", "gone:1").unwrap());
+        assert!(l.set_tag("other", "keep:2").unwrap());
+        // Records of images the engine no longer has go; the others stay.
+        let gone = l.retain_tags(|name, _| name.starts_with("keep:")).unwrap();
+        assert_eq!(gone, 1);
+        assert!(l.tag_owner("gone:1").is_none());
+        assert_eq!(l.tag_owner("keep:1").map(|r| r.scope), Some("live".into()));
+        assert_eq!(l.tag_owner("keep:2").map(|r| r.scope), Some("other".into()));
+    }
+
+    #[test]
+    fn tag_records_persist_and_are_bounded() {
+        let dir = scratch("tags");
+        let path = dir.join("ledger.json");
+        let l = Ledger::open(&path).unwrap();
+        assert!(l.set_tag("a", "app:1").unwrap());
+        assert_eq!(l.tag_owner("app:1").map(|r| r.scope), Some("a".into()));
+        assert_eq!(
+            Ledger::open(&path)
+                .unwrap()
+                .tag_owner("app:1")
+                .map(|r| r.scope),
+            Some("a".into())
+        );
+        let l = Ledger::in_memory();
+        assert!(l.set_tag("a", "app:1").unwrap());
+        for n in 1..MAX_TAGS {
+            assert!(l.set_tag("a", &format!("t:{n}")).unwrap());
+        }
+        assert!(!l.set_tag("a", "one-too-many:1").unwrap());
+        assert!(l.tag_owner("one-too-many:1").is_none());
+        // A known name can still be taken over when it is stale.
+        assert!(l.set_tag("b", "app:1").unwrap());
+        assert_eq!(l.tag_owner("app:1").map(|r| r.scope), Some("b".into()));
     }
 
     /// A write that fails is reported, changes nothing in memory, stops further

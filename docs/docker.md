@@ -634,7 +634,37 @@ In plain words:
   default) and runs while anything uses it, then idles out. The containers
   inside share what the VM has.
 - **Images are shared by a project's lanes**, and so are the names of networks
-  and volumes: a name another lane already uses is refused.
+  and volumes: a name another lane already uses is refused. Image tags are partly protected:
+  `docker tag`, `docker commit`, `docker pull` and `docker rmi` refuse to move or
+  remove a tag another workspace created (a pull also while another workspace is
+  making the tag), `docker tag` and `docker commit` also refuse a pulled image's tag such as
+  `postgres:16`, and `docker rmi` refuses to remove one (pulling it again is
+  allowed). A build sent over Docker's REST API (the legacy
+  builder, `DOCKER_BUILDKIT=0`) is checked the same way. **A normal `docker build -t` or `docker buildx
+  build -t` is not covered**: those talk to BuildKit over the stream described
+  under [Builds and the cache](#builds-and-the-cache), which the filter does not
+  read, so a lane can still build an image under a tag the base runs. Do not rely
+  on tag ownership to keep lanes' images apart until that stream is filtered. Where
+  it applies, the workspace that creates a tag may move it; a name stays free until
+  an image has it (another workspace can create it first), and it is free again
+  after `docker rmi`. Two lanes cannot both build `-t app` over the REST API; give
+  each its own name. Because a pulled image's tags are protected, a workspace
+  cannot `docker rmi` a pulled tag such as `busybox:latest`, and `docker compose
+  down --rmi all` (which removes the images of every service, pulled ones
+  included) fails with a 403 for them; `--rmi local` and `docker rmi` of your own
+  tag or alias work. `docker pull -a` (every tag of a repository, also `name:` with nothing after the
+  colon) is refused: name a tag. Digest pulls (`name@sha256:...`, which the Docker
+  client sends as `tag=sha256:...`) are not affected. A `docker rmi` of an image
+  ID (short or full) or digest is refused if any tag of the image is another
+  workspace's or a pulled image's, and it is never forced: `docker rmi -f <id>`
+  acts as `docker rmi <id>`, so the engine refuses an image that has several tags
+  ("referenced in multiple repositories", or in use by a stopped container). That
+  includes the cleanup idiom `docker rmi -f $(docker images -q)` (it passes IDs): images with
+  several tags, or used by a stopped container, fail with the engine's 409. Remove such an
+  image by its tag names (`docker rmi name1 name2`), which keeps `-f`. A tag named like the
+  start of an image's ID counts as an ID. `docker compose down --rmi` is not affected (it
+  never forces, and removes tagged images by name). If the services VM cannot write its records at the moment a tag is
+  made, the tag is left unowned and the next workspace to ask may take it.
 - **Docker's built-in `bridge` network is refused.** Containers without a
   network join their workspace's own network, so a plain `docker run` in two
   lanes cannot reach each other. Containers in one stack reach each other by

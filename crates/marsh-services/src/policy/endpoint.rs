@@ -23,12 +23,13 @@ use super::http::{
 use super::json::Json;
 use super::routes::{Kind, classify};
 use super::{
-    Authority, CurrentLimits, Env, Lookup, PinRequest, PinnedBind, Refusal, ResourceLimits,
-    VolumeScope,
+    Authority, CurrentLimits, DeleteGrant, Env, Lookup, PinRequest, PinnedBind, Refusal,
+    ResourceLimits, TagCommit, TagHold, VolumeScope,
 };
 use crate::breaks::break_mode;
 use crate::ledger::{
-    ContainerRec, Ledger, LedgerError, NetRec, Paths, PinRec, SockRec, VolumeClaim, now,
+    ContainerRec, Ledger, LedgerError, MAX_TAGS, NetRec, Paths, PinRec, SockRec, TagClaim,
+    TagImage, VolumeClaim, now, tag_claim,
 };
 use crate::pins::{PinError, PinManager, ProjectRoot, observe};
 
@@ -131,6 +132,12 @@ pub struct Services {
     /// Serializes the claim, look and create of one volume name (and the
     /// ledger entry) so two scopes cannot both win it.
     vol_lock: Mutex<()>,
+    /// Image tags a request in flight holds (tag to workspace and how many of
+    /// its requests). One lock covers the look at the engine, the ledger's
+    /// decision and the reservation, so two scopes cannot both win a name; it is
+    /// held across one engine inspect (bounded by `up_request`'s 30 s progress
+    /// timeout), which serializes tag claims while the engine hangs.
+    tag_res: Mutex<TagRes>,
     /// A pin is mounted and then recorded; both happen under the read side, and
     /// the sweep of unrecorded pins runs under the write side, so it can never
     /// see the first without the second.
@@ -256,6 +263,7 @@ impl Services {
             open_connections: AtomicUsize::new(0),
             gate: Gate::default(),
             vol_lock: Mutex::new(()),
+            tag_res: Mutex::new(HashMap::new()),
             pin_gate: RwLock::new(()),
         }))
     }
@@ -530,6 +538,78 @@ impl Services {
         Ok((resp.status, body))
     }
 
+    fn lock_tags(&self) -> std::sync::MutexGuard<'_, TagRes> {
+        self.tag_res
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What the engine has under an image reference, and the tags of that image.
+    fn image_state(&self, reference: &str) -> Result<(TagImage, Vec<String>), Refusal> {
+        self.image_info(reference)
+            .map(|(image, tags, _)| (image, tags))
+    }
+
+    /// As `image_state`, with the image's ID (`None` when there is no image).
+    fn image_info(
+        &self,
+        reference: &str,
+    ) -> Result<(TagImage, Vec<String>, Option<String>), Refusal> {
+        match self.up_request("GET", &format!("/images/{reference}/json"), None) {
+            Ok((200, body)) => {
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                let list = |key: &str| -> Vec<String> {
+                    v.get(key)
+                        .and_then(|l| l.as_array())
+                        .map(|l| {
+                            l.iter()
+                                .filter_map(|x| x.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let image = if list("RepoDigests").is_empty() {
+                    TagImage::Local
+                } else {
+                    TagImage::Pulled
+                };
+                let id = v.get("Id").and_then(|i| i.as_str()).map(str::to_owned);
+                Ok((image, list("RepoTags"), id))
+            }
+            Ok((404, _)) => Ok((TagImage::Absent, Vec::new(), None)),
+            _ => Err(Refusal {
+                status: 503,
+                msg: "the engine could not say whether the image exists".into(),
+                close: false,
+            }),
+        }
+    }
+
+    /// Drop the tag records of images the engine no longer has, except the ones
+    /// a request in flight holds (`reserved` is the locked reservation table, so
+    /// no claim can slip in). A record of an image that is there is never dropped.
+    fn evict_stale_tags(&self, reserved: &TagRes) {
+        let Ok((200, body)) = self.up_request("GET", "/images/json", None) else {
+            return;
+        };
+        let Ok(list) = serde_json::from_slice::<Vec<serde_json::Value>>(&body) else {
+            return;
+        };
+        let present: std::collections::HashSet<String> = list
+            .iter()
+            .filter_map(|i| i.get("RepoTags").and_then(|t| t.as_array()))
+            .flatten()
+            .filter_map(|t| t.as_str())
+            .filter_map(|t| super::admit::canonical_tag(t, None).ok())
+            .collect();
+        if let Err(e) = self
+            .ledger
+            .retain_tags(|name, _| present.contains(name) || reserved.contains_key(name))
+        {
+            self.log(&format!("image tag records not pruned: {e}"));
+        }
+    }
+
     /// Drop ledger entries for things the engine no longer has; unmount pins
     /// nothing references. Run on a timer and after prunes.
     pub fn reconcile(&self) {
@@ -560,6 +640,7 @@ impl Services {
             Ok(freed) => self.unpin_freed(freed),
             Err(e) => self.log(&format!("reconcile: {e}")),
         }
+        self.evict_stale_tags(&self.lock_tags());
         self.sweep_pins();
     }
 
@@ -849,6 +930,163 @@ impl Services {
 /// A ledger that cannot be written refuses the request (503): nothing may be
 /// admitted that the agent could not remember after a restart.
 /// Does an engine object (inspect output) carry this scope's label?
+impl Scope {
+    fn hold(
+        &self,
+        res: &mut TagRes,
+        tags: &[String],
+        kind: HoldKind,
+        images: Vec<(String, HoldKind)>,
+    ) -> TagHold {
+        let ws = &self.auth.workspace;
+        for tag in tags {
+            res.entry(tag.clone()).or_default().add(ws, kind);
+        }
+        for (id, k) in &images {
+            res.entry(id.clone()).or_default().add(ws, *k);
+        }
+        Arc::new(ScopeTagHold {
+            svc: Arc::clone(&self.svc),
+            ws: ws.clone(),
+            tags: tags.to_vec(),
+            kind,
+            images,
+        })
+    }
+}
+
+fn tag_refusal(tag: &str, why: &str) -> Refusal {
+    Refusal::forbid(format!("image tag {tag:?} {why}"))
+}
+
+/// What a request holds an image tag for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldKind {
+    /// Build, tag, commit: records the creator when the engine accepts.
+    Claim,
+    /// A pull: records nothing and coexists with other pulls.
+    Pull,
+    /// A delete: records nothing, and excludes other workspaces' claims and
+    /// pulls of the same name (not other deletes).
+    Delete,
+}
+
+/// Who holds an image tag right now: workspaces with a request that will record
+/// it, pulling it, or deleting it, each with how many requests.
+#[derive(Debug, Default)]
+struct TagHeld {
+    claims: HashMap<String, usize>,
+    pulls: HashMap<String, usize>,
+    deletes: HashMap<String, usize>,
+}
+
+type TagRes = HashMap<String, TagHeld>;
+
+impl TagHeld {
+    fn other(map: &HashMap<String, usize>, ws: &str) -> bool {
+        map.keys().any(|w| w != ws)
+    }
+
+    /// A claim waits for every other kind of hold.
+    fn blocks_claim(&self, ws: &str) -> bool {
+        Self::other(&self.claims, ws)
+            || Self::other(&self.pulls, ws)
+            || Self::other(&self.deletes, ws)
+    }
+
+    /// A pull coexists with other pulls, not with a claim or a delete.
+    fn blocks_pull(&self, ws: &str) -> bool {
+        Self::other(&self.claims, ws) || Self::other(&self.deletes, ws)
+    }
+
+    /// A delete coexists with other deletes, not with a claim or a pull.
+    fn blocks_delete(&self, ws: &str) -> bool {
+        Self::other(&self.claims, ws) || Self::other(&self.pulls, ws)
+    }
+
+    fn map(&mut self, kind: HoldKind) -> &mut HashMap<String, usize> {
+        match kind {
+            HoldKind::Claim => &mut self.claims,
+            HoldKind::Pull => &mut self.pulls,
+            HoldKind::Delete => &mut self.deletes,
+        }
+    }
+
+    fn add(&mut self, ws: &str, kind: HoldKind) {
+        *self.map(kind).entry(ws.to_owned()).or_insert(0) += 1;
+    }
+
+    /// One request of `ws` ended; true when nobody holds the name any more.
+    fn release(&mut self, ws: &str, kind: HoldKind) -> bool {
+        let map = self.map(kind);
+        if let Some(n) = map.get_mut(ws) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(ws);
+            }
+        }
+        self.claims.is_empty() && self.pulls.is_empty() && self.deletes.is_empty()
+    }
+}
+
+/// The tags a request reserved. Dropping it ends the reservation, however the
+/// request ended. A claim records its creator once the engine answered 2xx (see
+/// `respond`); a pull holds the name but records nothing.
+struct ScopeTagHold {
+    svc: Arc<Services>,
+    ws: String,
+    tags: Vec<String>,
+    kind: HoldKind,
+    /// Holds on an image by ID (`id:<Id>`), so that an ID delete and a tag of
+    /// that image exclude each other for the engine call.
+    images: Vec<(String, HoldKind)>,
+}
+
+impl std::fmt::Debug for ScopeTagHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopeTagHold")
+            .field("ws", &self.ws)
+            .field("tags", &self.tags)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TagCommit for ScopeTagHold {
+    fn commit(&self) {
+        if self.kind != HoldKind::Claim {
+            return;
+        }
+        for tag in &self.tags {
+            match self.svc.ledger.set_tag(&self.ws, tag) {
+                Ok(true) => {}
+                Ok(false) => self.svc.log("image tag table is full; not recorded"),
+                Err(e) => self.svc.log(&format!("image tag not recorded: {e}")),
+            }
+        }
+    }
+}
+
+impl Drop for ScopeTagHold {
+    fn drop(&mut self) {
+        let mut res = self.svc.lock_tags();
+        for tag in &self.tags {
+            if let Some(held) = res.get_mut(tag)
+                && held.release(&self.ws, self.kind)
+            {
+                res.remove(tag);
+            }
+        }
+        for (id, kind) in &self.images {
+            if let Some(held) = res.get_mut(id)
+                && held.release(&self.ws, *kind)
+            {
+                res.remove(id);
+            }
+        }
+    }
+}
+
 fn labelled_for(inspect: &[u8], ws: &str) -> bool {
     serde_json::from_slice::<serde_json::Value>(inspect).is_ok_and(|v| {
         v.pointer("/Labels/dev.marsh.scope")
@@ -1241,6 +1479,172 @@ impl Env for Scope {
 
     fn release_volume(&self, name: &str) {
         let _ = self.svc.ledger.unclaim_volume(&self.auth.workspace, name);
+    }
+
+    fn reserve_tags(
+        &self,
+        tags: &[String],
+        source: Option<&str>,
+    ) -> Result<Option<TagHold>, Refusal> {
+        if tags.is_empty() {
+            return Ok(None);
+        }
+        let ws = &self.auth.workspace;
+        let mut res = self.svc.lock_tags();
+        for tag in tags {
+            if res.get(tag).is_some_and(|h| h.blocks_claim(ws)) {
+                return Err(tag_refusal(tag, "is being made by another workspace"));
+            }
+        }
+        // Capacity covers the records plus every new name a request is making
+        // (this one included), decided here, under the same lock as the hold.
+        let needed = |res: &TagRes| {
+            let recorded = |t: &str| self.svc.ledger.tag_owner(t).is_some();
+            let pending = res
+                .iter()
+                .filter(|(t, h)| !h.claims.is_empty() && !recorded(t))
+                .count();
+            let fresh = tags
+                .iter()
+                .filter(|t| !recorded(t) && res.get(*t).is_none_or(|h| h.claims.is_empty()))
+                .count();
+            self.svc.ledger.tag_count() + pending + fresh
+        };
+        if needed(&res) > MAX_TAGS {
+            self.svc.evict_stale_tags(&res);
+            if needed(&res) > MAX_TAGS {
+                return Err(Refusal::forbid("too many image tags are in use"));
+            }
+        }
+        for tag in tags {
+            let rec = self.svc.ledger.tag_owner(tag);
+            if rec.as_ref().is_some_and(|r| r.scope == *ws) {
+                continue;
+            }
+            let (image, _) = self.svc.image_state(tag)?;
+            match tag_claim(rec.as_ref(), ws, image) {
+                TagClaim::Own | TagClaim::New => {}
+                TagClaim::Foreign => {
+                    return Err(tag_refusal(
+                        tag,
+                        "belongs to another workspace of this project",
+                    ));
+                }
+                TagClaim::Unowned => {
+                    return Err(tag_refusal(
+                        tag,
+                        "is a pulled image, not this workspace's to move",
+                    ));
+                }
+            }
+        }
+        // A tag put on an existing image excludes an ID delete of that image.
+        let mut images = Vec::new();
+        if let Some(source) = source
+            && let (_, _, Some(id)) = self.svc.image_info(source)?
+        {
+            let key = format!("id:{id}");
+            if res.get(&key).is_some_and(|h| h.blocks_pull(ws)) {
+                return Err(Refusal::forbid(
+                    "the image is being deleted by another workspace",
+                ));
+            }
+            images.push((key, HoldKind::Pull));
+        }
+        Ok(Some(self.hold(&mut res, tags, HoldKind::Claim, images)))
+    }
+
+    fn reserve_pull(&self, tags: &[String]) -> Result<Option<TagHold>, Refusal> {
+        let ws = &self.auth.workspace;
+        let mut res = self.svc.lock_tags();
+        for tag in tags {
+            if res.get(tag).is_some_and(|h| h.blocks_pull(ws)) {
+                return Err(tag_refusal(tag, "is being made by another workspace"));
+            }
+            if let Some(rec) = self.svc.ledger.tag_owner(tag)
+                && rec.scope != *ws
+                && self.svc.image_state(tag)?.0 != TagImage::Absent
+            {
+                return Err(tag_refusal(
+                    tag,
+                    "belongs to another workspace of this project",
+                ));
+            }
+        }
+        Ok(Some(self.hold(&mut res, tags, HoldKind::Pull, Vec::new())))
+    }
+
+    fn reserve_delete(&self, reference: &str) -> Result<DeleteGrant, Refusal> {
+        if !reference
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-:/@".contains(&b))
+        {
+            return Err(Refusal::forbid("invalid image reference"));
+        }
+        let ws = &self.auth.workspace;
+        let mut res = self.svc.lock_tags();
+        let (image, repo_tags, id) = self.svc.image_info(reference)?;
+        let canon = |n: &str| super::admit::canonical_tag(n, None).ok();
+        let tags: Vec<String> = repo_tags.iter().filter_map(|n| canon(n)).collect();
+        // A reference that is one of the image's tags untags just that name;
+        // anything else (a full or short image ID, a digest) removes the image and
+        // so every tag it has. An absent image still holds the name asked for.
+        // The engine decides first whether the reference is a prefix of the image's
+        // ID, and then it is an ID delete even when it is also a tag name (a tag
+        // named like an ID prefix). So a name is only "by name" when it is not one;
+        // an absent image keeps the name hold but is never "by name", because the
+        // engine may have an image under it that was not there at the inspect.
+        let id_prefix = id.as_deref().is_some_and(|id| {
+            id.starts_with(reference)
+                || id
+                    .split_once(':')
+                    .is_some_and(|(_, hex)| hex.starts_with(reference))
+        });
+        let by_name = !id_prefix && canon(reference).is_some_and(|n| tags.contains(&n));
+        let names: Vec<String> = match canon(reference) {
+            Some(name) if by_name || image == TagImage::Absent => vec![name],
+            _ => tags,
+        };
+        if image != TagImage::Absent {
+            for tag in &names {
+                let other_holds = res.get(tag).is_some_and(|h| h.blocks_delete(ws));
+                let rec = self.svc.ledger.tag_owner(tag);
+                let foreign = rec.as_ref().is_some_and(|r| r.scope != *ws);
+                if other_holds || foreign || (rec.is_none() && image == TagImage::Pulled) {
+                    return Err(tag_refusal(tag, "is not this workspace's to delete"));
+                }
+            }
+        } else if names
+            .iter()
+            .any(|t| res.get(t).is_some_and(|h| h.blocks_delete(ws)))
+        {
+            return Err(Refusal::forbid(
+                "image tag is being made by another workspace",
+            ));
+        }
+        // A delete that is not of one of the image's own tags removes the image,
+        // so a tag put on it by `docker tag` meanwhile would go too: it holds the
+        // image as well. (Any other way a tag can appear on the image meanwhile, a
+        // cached build, a commit, a pull, is caught by the engine: the delete is
+        // not forced, see `DeleteGrant`.)
+        let mut images = Vec::new();
+        if let (Some(id), false) = (id, by_name) {
+            let key = format!("id:{id}");
+            if res.get(&key).is_some_and(|h| h.blocks_delete(ws)) {
+                return Err(Refusal::forbid(
+                    "a tag is being put on the image by another workspace",
+                ));
+            }
+            images.push((key, HoldKind::Delete));
+        }
+        let hold = if names.is_empty() && images.is_empty() {
+            None
+        } else {
+            // Held while the engine deletes (recording nothing), so that no one
+            // claims a name the delete is about to remove from under them.
+            Some(self.hold(&mut res, &names, HoldKind::Delete, images))
+        };
+        Ok(DeleteGrant { hold, by_name })
     }
 
     fn socket_aliases(&self) -> &[String] {
@@ -1970,6 +2374,12 @@ fn respond(
     let svc = &scope.svc;
     let keep = !head.close;
     let ok = resp.status / 100 == 2;
+    if ok && let Some(hold) = &adm.tags {
+        // The engine accepted it: ownership follows that, not whether the client
+        // is still there to read the answer. A build the client abandons records
+        // a name whose image never appears, which the next claimant takes over.
+        hold.commit();
+    }
     let buffered = matches!(
         adm.post,
         Post::ContainerCreate { .. }

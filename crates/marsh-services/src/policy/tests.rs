@@ -28,9 +28,17 @@ struct Fake {
     blocked: bool,
     inherited: Vec<String>,
     image_volumes: Vec<String>,
+    claimed: RefCell<Vec<String>>,
 }
 
 impl Fake {
+    fn not_foreign(tag: &str) -> Result<(), Refusal> {
+        if FOREIGN_TAGS.contains(&tag) {
+            return Err(Refusal::forbid("image tag belongs to another workspace"));
+        }
+        Ok(())
+    }
+
     fn new() -> Self {
         Self {
             permissive: false,
@@ -45,9 +53,13 @@ impl Fake {
             blocked: false,
             inherited: Vec::new(),
             image_volumes: Vec::new(),
+            claimed: RefCell::new(Vec::new()),
         }
     }
 }
+
+/// Tags another workspace of the project holds in the fake's world.
+const FOREIGN_TAGS: [&str; 3] = ["postgres:16", "lane-b/app:latest", "lane-a/taken:1"];
 
 impl Env for Fake {
     fn authority(&self) -> &Authority {
@@ -143,6 +155,28 @@ impl Env for Fake {
     }
     fn socket_aliases(&self) -> &[String] {
         &[]
+    }
+    fn reserve_tags(
+        &self,
+        tags: &[String],
+        _source: Option<&str>,
+    ) -> Result<Option<super::TagHold>, Refusal> {
+        for tag in tags {
+            Self::not_foreign(tag)?;
+        }
+        self.claimed.borrow_mut().extend(tags.iter().cloned());
+        Ok(None)
+    }
+    fn reserve_pull(&self, tags: &[String]) -> Result<Option<super::TagHold>, Refusal> {
+        tags.iter().try_for_each(|t| Self::not_foreign(t))?;
+        Ok(None)
+    }
+    fn reserve_delete(&self, reference: &str) -> Result<super::DeleteGrant, Refusal> {
+        Self::not_foreign(reference)?;
+        Ok(super::DeleteGrant {
+            hold: None,
+            by_name: !reference.starts_with("sha256:") && !reference.starts_with("id"),
+        })
     }
     fn registry_allowed(&self, image: &str) -> bool {
         !image.starts_with("evil.example/")
@@ -1323,4 +1357,124 @@ fn a_websocket_attach_carries_its_handshake_key_and_version_only() {
         None,
     );
     assert!(r.is_err());
+}
+
+fn enc(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn every_path_that_names_an_image_checks_the_tag_against_the_other_workspaces() {
+    let tar = [("Content-Type", "application/x-tar")];
+    let outputs = |name: &str| {
+        enc(&format!(
+            r#"[{{"Type":"moby","Attrs":{{"name":"{name}"}}}}]"#
+        ))
+    };
+    for (what, target, headers) in [
+        (
+            "tag",
+            "/images/own-image/tag?repo=postgres&tag=16".to_owned(),
+            &[][..],
+        ),
+        (
+            "tag, name with the tag in it",
+            "/images/own-image/tag?repo=postgres%3A16".to_owned(),
+            &[][..],
+        ),
+        (
+            "tag, the default registry spelled out",
+            "/images/own-image/tag?repo=docker.io%2Flibrary%2Fpostgres&tag=16".to_owned(),
+            &[][..],
+        ),
+        ("build -t", "/build?t=postgres%3A16".to_owned(), &tar[..]),
+        (
+            "build outputs name",
+            format!("/build?outputs={}", outputs("postgres:16")),
+            &tar[..],
+        ),
+        (
+            "build outputs name list",
+            format!(
+                "/build?outputs={}",
+                outputs("mine:1,docker.io/library/postgres:16")
+            ),
+            &tar[..],
+        ),
+        (
+            "commit onto a tag a workspace held in this namespace",
+            "/commit?container=own&repo=lane-a%2Ftaken&tag=1".to_owned(),
+            &[][..],
+        ),
+    ] {
+        let fake = Fake::new();
+        let r = eval_with(&fake, "POST", &target, headers, None);
+        assert!(
+            matches!(&r, Err(e) if e.status == 403),
+            "{what} must be refused, got {:?}",
+            r.map(|a| a.query)
+        );
+    }
+}
+
+#[test]
+fn a_new_tag_is_claimed_once_under_its_canonical_name() {
+    let tar = [("Content-Type", "application/x-tar")];
+    let claimed = |target: &str, headers: &[(&str, &str)]| {
+        let fake = Fake::new();
+        eval_with(&fake, "POST", target, headers, None).unwrap();
+        fake.claimed.into_inner()
+    };
+    assert_eq!(
+        claimed("/images/own-image/tag?repo=mine", &[]),
+        ["mine:latest"]
+    );
+    // The `tag` parameter replaces a `:tag` in `repo` (as in moby).
+    assert_eq!(
+        claimed("/images/own-image/tag?repo=mine%3Av1&tag=v2", &[]),
+        ["mine:v2"]
+    );
+    assert_eq!(
+        claimed("/images/own-image/tag?repo=mine%3Av1", &[]),
+        ["mine:v1"]
+    );
+    assert_eq!(
+        claimed("/commit?container=own&repo=lane-a%2Fapp", &[]),
+        ["lane-a/app:latest"]
+    );
+    assert_eq!(
+        claimed(
+            "/images/own-image/tag?repo=localhost%3A5000%2FMine%2FApp&tag=v1",
+            &[]
+        ),
+        ["localhost:5000/mine/app:v1"]
+    );
+    let target = format!(
+        "/build?t=docker.io%2Fmine&outputs={}",
+        enc(r#"[{"Type":"moby","Attrs":{"name":"mine:latest,mine:2"}}]"#)
+    );
+    assert_eq!(claimed(&target, &tar), ["mine:2", "mine:latest"]);
+}
+
+#[test]
+fn reserved_names_are_refused_in_build_outputs_as_in_tag_and_build() {
+    let tar = [("Content-Type", "application/x-tar")];
+    for name in ["marsh-x", "nf-x:1", "registry.example/marsh-y"] {
+        let target = format!(
+            "/build?outputs={}",
+            enc(&format!(
+                r#"[{{"Type":"moby","Attrs":{{"name":"{name}"}}}}]"#
+            ))
+        );
+        let r = eval("POST", &target, &tar, None);
+        assert!(matches!(&r, Err(e) if e.status == 403), "{name}: {r:?}");
+    }
 }

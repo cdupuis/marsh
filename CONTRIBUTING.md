@@ -50,7 +50,7 @@ real `sbx` stack:
 | command | runs | where |
 |---|---|---|
 | `make test` | `test-rust`, `test-harness`, `test-model` (below); no VMs, no credentials | your machine; CI on Linux arm64 and macOS |
-| `make test-rust` | `make lint` (`cargo fmt --check`, clippy), `make test-unit` (every workspace test under `cargo-nextest`, one process per test, and doctests), `make test-callers` (the ignored binary callers and the typed ACP host caller) | CI on both |
+| `make test-rust` | `make lint` (`cargo fmt --check`, clippy, and a budget on `#[allow(clippy::too_many_lines)]`: split the function instead, and lower `scripts/too-many-lines.budget` when you remove one), `make test-unit` (every workspace test under `cargo-nextest`, one process per test, and doctests), `make test-callers` (the ignored binary callers and the typed ACP host caller) | CI on both |
 | `make test-harness` | `make test-bash` (Linux: the Bash differential suites, `tests/acceptance/bash_suites.py`, GNU Bash 5.3.0), `make test-entrypoints` (onboarding journeys through the shipped binaries, MCP protocol callers), `make test-tools` (the Kit publisher, kit adapter scripts, self-tests of the acceptance/perf/release tooling) | CI on both (suites: Linux; tools: Linux, and macOS on `main`) |
 | `make test-model` | quick TLA+ sweep (Docker, or `TLC_RUNNER=java`) | CI's model job runs every config |
 | `make check` | real smoke test of the installed dev product | Mac, after `make dev` |

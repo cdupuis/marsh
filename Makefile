@@ -185,6 +185,7 @@ lint:
 	$(CARGO) fmt --all -- --check
 	$(PYTHON) scripts/check-provenance-wiring.py
 	sh scripts/check-no-vendored-deps.sh
+	sh scripts/check-too-many-lines.sh
 	$(CARGO) clippy --workspace --all-targets --locked --target-dir "$(TARGET_DIR)" -- -D warnings
 
 # Every workspace test, one process per test (cargo-nextest; .config/nextest.toml

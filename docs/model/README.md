@@ -343,6 +343,31 @@ mirrored as a release of this repository because upstream replaces its v1.8.0 as
 Makefile). Run directly, `check.sh` takes the jar from `TLA2TOOLS_JAR`. The script exits nonzero if a
 positive config fails or a negative control passes or fails for the wrong reason. The jar is not committed.
 
+**What a pass means, and does not.**
+- *State floor.* A positive config must also reach the minimum number of distinct states
+  that [`state-floors.txt`](state-floors.txt) records for it (half of the count measured
+  on 2026-11-14), and a positive config with no line there fails. A model edit that leaves
+  a handful of reachable states (a guard that is never true, a bound of 0) would otherwise
+  pass: TLC reports "no error" for a model that explores nothing. A deliberate shrink
+  lowers the line, with the reason in the commit message.
+- *Deadlock checking is off* (`tlc2.TLC -deadlock`) because the models bound their environment
+  with counters (restarts, jobs, labels, UUIDs), so a run ends in states where no action is
+  enabled, and TLC cannot tell such a bounded end from a stuck state. With the check on,
+  `KitSwitch`, `Sbxenv`, `ServicesReap`, `ServicesLanes`, `CloudOwnership`,
+  `Placement_nested_pass` and `Workspace_restart_pass` stop with "Deadlock reached" at a bound
+  (the same configs of `Ownership`, `Pins`, `Grants`, `ServicesVm` and `Process_limits_pass`
+  do not). Progress is checked by the liveness configs (`*_live_pass`), not by deadlock
+  freedom, and nothing checks that a state where something should be enabled is not stuck.
+- *Properties with no negative control.* A control makes one invariant fail by removing one
+  guard of a real action, which shows the invariant can fail. Taking the first invariant or
+  property listed in each `Module_<bug>.cfg` as its target, these properties of a positive
+  config are not the target of any control: `CloudOwnership` `OwnedAreOurs`, `KitSwitch`
+  `RunningHasVM` and `DrainEnds`, `Pins` `RunningHasMounts`, `Placement` `DetachedApart`,
+  `LossIsUncertain`, `NoEarlyRelease` and `ReturnLease`, `Process` `EventuallySettled` (the
+  `_live_pass` config), `ServicesVm` `ResetKeepsServices`, `Worker` `QuarantineHeals`, and every
+  module's `TypeOK`. A pass of these shows the model has no counterexample, not that the
+  invariant would notice one.
+
 | Spec action | Code location |
 |---|---|
 | Sbxenv: Create / Register / Load / Ready / Remove / Reload | `marsh-backend/src/sbxenv.rs` `with_sbxenvs` (first snapshot), `refresh_sbxenv` (live reload; `register_new_servers` before a change is accepted; Reload), `watch_sbxenv_pass` (warm VMs), `lib.rs` `kit_spec` (one VM per workload, independent of the files), `prepare_one_authorized` (required setup before ready cache, and again for a cached VM: `configure_prepared_mcp` loads a stale VM before the job), `configure_kit_mcp`/`sync_mcp`; `marsh-sbx/src/mcp_environment.rs` `ensure_mcp_server` (inspect/reuse or add, no overwrite), `load_mcp_server` / `load_shell_mcp_server` (owned UUID); worker reset and scope teardown |

@@ -1913,15 +1913,22 @@ mod tests {
         assert_eq!(connections.lock().unwrap().len(), 1);
         drop(peer);
         forward_data(&connections, &tunnel, 1, b"late response".to_vec()).unwrap();
-        wait_until("the failed write releases the connection", || {
-            connections.lock().unwrap().is_empty()
+        // The connection is removed before its `Finished` is sent, so wait for
+        // the frame itself, not for the removal.
+        let tunnel_frames = || {
+            let sent = tunnel.lock().unwrap().clone();
+            let mut sent = Cursor::new(sent);
+            let mut frames = Vec::new();
+            while let Ok(frame) = read_frame::<TunnelFrame>(&mut sent) {
+                frames.push(frame);
+            }
+            frames
+        };
+        wait_until("the failed write ends the connection with Finished", || {
+            tunnel_frames().contains(&TunnelFrame::Finished { connection: 1 })
         });
-        let sent = tunnel.lock().unwrap().clone();
-        let mut sent = Cursor::new(sent);
-        let mut frames = Vec::new();
-        while let Ok(frame) = read_frame::<TunnelFrame>(&mut sent) {
-            frames.push(frame);
-        }
+        assert!(connections.lock().unwrap().is_empty());
+        let frames = tunnel_frames();
         assert!(
             frames.contains(&TunnelFrame::Eof { connection: 1 }),
             "{frames:?}"
@@ -2094,16 +2101,24 @@ mod tests {
             }
             credits
         };
-        // The peer's buffers fill, and the writer blocks with chunks queued.
-        thread::sleep(Duration::from_millis(300));
-        let before = credits();
-        assert!(before < MAX_PENDING_CHUNKS, "the writer never blocked");
+        let writer = connections.lock().unwrap().get(&1).unwrap().writer.clone();
         close_all_connections(&connections);
-        thread::sleep(Duration::from_millis(300));
-        // At most the chunk that was being written when the peer was cut.
+        // Barrier: the writer has returned. A `Finish` after the queued chunks
+        // is harmless to it (the connection is gone), and once the writer has
+        // dropped its receiver a send fails: so by then it has either returned
+        // at its first failed write or gone through every queued chunk, and the
+        // credits below are all it will ever send.
+        wait_until("the connection's writer has returned", || {
+            matches!(
+                writer.try_send(ConnectionWrite::Finish),
+                Err(mpsc::TrySendError::Disconnected(_))
+            )
+        });
+        // What the peer's buffers took before it was cut, at most: far fewer
+        // than the 64 chunks queued, whose credit is what must not be sent.
         assert!(
-            credits() <= before + 1,
-            "{} credits after {before}",
+            credits() < MAX_PENDING_CHUNKS / 2,
+            "{} credits for {MAX_PENDING_CHUNKS} queued chunks",
             credits()
         );
     }

@@ -3098,6 +3098,325 @@ mod linux {
             std::fs::remove_dir_all(&f.root).unwrap();
         }
     }
+    /// SEC-13 without a VM: `confine` and `drop_privileges` run in a child
+    /// process (both are irreversible, and the test binary must stay whole),
+    /// the test binary itself re-executed on `child_main`. The parent checks
+    /// what the child could and could not do.
+    #[cfg(test)]
+    mod confinement_tests {
+        use super::*;
+        use std::net::{TcpListener, TcpStream};
+
+        const CHILD_ENV: &str = "MARSH_RESTORE_CONFINEMENT_CHILD";
+
+        fn scratch(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("confine-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// Re-run this binary on `child_main` and return its stdout lines.
+        fn run_child(mode: &str, root: &Path, port: u16) -> (bool, Vec<String>, String) {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "restore::linux::confinement_tests::child_main",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, format!("{mode}|{}|{port}", root.display()))
+                .output()
+                .unwrap();
+            let lines = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.split_once("child: "))
+                .map(|(_, line)| line.to_owned())
+                .collect();
+            (
+                output.status.success(),
+                lines,
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        }
+
+        fn say(line: &str) {
+            println!("child: {line}");
+        }
+
+        /// Not a test of its own: the body that runs in the child. Without the
+        /// environment variable it does nothing.
+        #[test]
+        fn child_main() {
+            let Ok(spec) = std::env::var(CHILD_ENV) else {
+                return;
+            };
+            let parts: Vec<&str> = spec.splitn(3, '|').collect();
+            let (mode, root, port) = (parts[0], PathBuf::from(parts[1]), parts[2]);
+            let code = match mode {
+                "confined" | "unconfined" => child_files(mode == "confined", &root, port),
+                "drop" => child_drop(&root),
+                other => panic!("unknown child mode {other}"),
+            };
+            std::process::exit(code);
+        }
+
+        fn child_files(confined: bool, root: &Path, port: &str) -> i32 {
+            let (lane, scratch, outside) = (
+                root.join("lane"),
+                root.join("scratch"),
+                root.join("outside"),
+            );
+            if confined {
+                let spec = ClientSpec {
+                    lane_path: lane.display().to_string(),
+                    cwd_path: lane.display().to_string(),
+                    uid: 0,
+                    gid: 0,
+                    confine: true,
+                    scratch: vec![scratch.display().to_string()],
+                    argv: Vec::new(),
+                    env: BTreeMap::new(),
+                };
+                if let Err(why) = confine(&spec) {
+                    say(&format!("unconfinable: {why}"));
+                    return 0;
+                }
+            }
+            let target = format!("127.0.0.1:{port}");
+            let results = [
+                ("read-lane", std::fs::read(lane.join("project")).is_ok()),
+                (
+                    "write-lane",
+                    std::fs::write(lane.join("planted"), b"x").is_ok(),
+                ),
+                (
+                    "delete-lane",
+                    std::fs::remove_file(lane.join("project")).is_ok(),
+                ),
+                (
+                    "read-outside",
+                    std::fs::read(outside.join("secret")).is_ok(),
+                ),
+                ("list-outside", std::fs::read_dir(&outside).is_ok()),
+                (
+                    "write-outside",
+                    std::fs::write(outside.join("planted"), b"x").is_ok(),
+                ),
+                (
+                    "write-scratch",
+                    std::fs::write(scratch.join("work"), b"x").is_ok(),
+                ),
+                (
+                    "read-system",
+                    std::fs::read("/etc/hostname").is_ok() || std::fs::read("/etc/passwd").is_ok(),
+                ),
+                ("write-null", std::fs::write("/dev/null", b"x").is_ok()),
+                ("read-urandom", std::fs::File::open("/dev/urandom").is_ok()),
+                ("tcp-connect", TcpStream::connect(&target).is_ok()),
+                ("tcp-bind", TcpListener::bind("127.0.0.1:0").is_ok()),
+            ];
+            for (name, ok) in results {
+                say(&format!(
+                    "{name}={}",
+                    if ok { "allowed" } else { "refused" }
+                ));
+            }
+            0
+        }
+
+        fn child_drop(root: &Path) -> i32 {
+            let privileged = rustix::process::geteuid().is_root();
+            let outcome = drop_privileges(65534, 65534);
+            if !privileged {
+                say(&format!(
+                    "unprivileged: drop {}",
+                    if outcome.is_ok() {
+                        "allowed"
+                    } else {
+                        "refused"
+                    }
+                ));
+                return 0;
+            }
+            if let Err(error) = outcome {
+                say(&format!("failed: {error}"));
+                return 1;
+            }
+            let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+            let field = |name: &str| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned()
+            };
+            say(&format!("uid={}", field("Uid:")));
+            say(&format!("gid={}", field("Gid:")));
+            say(&format!("groups={}", field("Groups:")));
+            say(&format!("no_new_privs={}", field("NoNewPrivs:")));
+            say(&format!("cap_eff={}", field("CapEff:")));
+            let regained = rustix::thread::set_thread_res_uid(
+                Some(rustix::fs::Uid::from_raw(0)),
+                Some(rustix::fs::Uid::from_raw(0)),
+                Some(rustix::fs::Uid::from_raw(0)),
+            );
+            say(&format!(
+                "regain-root={}",
+                if regained.is_ok() {
+                    "allowed"
+                } else {
+                    "refused"
+                }
+            ));
+            say(&format!(
+                "read-root-file={}",
+                if std::fs::read(root.join("root-only")).is_ok() {
+                    "allowed"
+                } else {
+                    "refused"
+                }
+            ));
+            0
+        }
+
+        fn lines_to_map(lines: &[String]) -> BTreeMap<String, String> {
+            lines
+                .iter()
+                .filter_map(|line| line.split_once('='))
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect()
+        }
+
+        fn world(name: &str) -> (PathBuf, TcpListener) {
+            let root = scratch(name);
+            for dir in ["lane", "scratch", "outside"] {
+                std::fs::create_dir(root.join(dir)).unwrap();
+            }
+            std::fs::write(root.join("lane/project"), b"project").unwrap();
+            std::fs::write(root.join("outside/secret"), b"secret").unwrap();
+            (root, TcpListener::bind("127.0.0.1:0").unwrap())
+        }
+
+        /// SEC-13 (the unconfined-client break): with the Landlock rules the
+        /// compose client reads the lane and the system, writes only its
+        /// scratch, reads nothing else, and has no TCP; unconfined, the same
+        /// client reads the file outside the lane. A kernel that cannot
+        /// enforce the rules refuses (`confine` fails closed): that is reported
+        /// and the test is skipped, unless `MARSH_REQUIRE_LANDLOCK` is set.
+        #[test]
+        fn sec13_a_confined_client_reaches_only_its_lane_and_scratch() {
+            let (root, listener) = world("files");
+            let port = listener.local_addr().unwrap().port();
+
+            let (ok, lines, stderr) = run_child("confined", &root, port);
+            assert!(ok, "the child failed: {lines:?}\n{stderr}");
+            if let Some(why) = lines.iter().find(|line| line.starts_with("unconfinable")) {
+                eprintln!("SKIPPED: Landlock cannot be enforced here ({why})");
+                assert!(
+                    std::env::var_os("MARSH_REQUIRE_LANDLOCK").is_none(),
+                    "Landlock is required: {why}"
+                );
+                std::fs::remove_dir_all(&root).unwrap();
+                return;
+            }
+            let got = lines_to_map(&lines);
+            for (what, expected) in [
+                ("read-lane", "allowed"),
+                ("write-lane", "refused"),
+                ("delete-lane", "refused"),
+                ("read-outside", "refused"),
+                ("list-outside", "refused"),
+                ("write-outside", "refused"),
+                ("write-scratch", "allowed"),
+                ("read-system", "allowed"),
+                ("write-null", "allowed"),
+                ("read-urandom", "allowed"),
+                ("tcp-connect", "refused"),
+                ("tcp-bind", "refused"),
+            ] {
+                assert_eq!(
+                    got.get(what).map(String::as_str),
+                    Some(expected),
+                    "{what}: {lines:?}"
+                );
+            }
+            assert!(root.lane_untouched());
+            std::fs::remove_dir_all(&root).unwrap();
+
+            // The control: the same client unconfined reads outside the lane,
+            // writes the lane and connects, so the checks above can fail.
+            let (root, listener) = world("control");
+            let port = listener.local_addr().unwrap().port();
+            let (ok, lines, stderr) = run_child("unconfined", &root, port);
+            assert!(ok, "{lines:?}\n{stderr}");
+            let got = lines_to_map(&lines);
+            for what in [
+                "read-outside",
+                "write-lane",
+                "write-outside",
+                "tcp-connect",
+                "tcp-bind",
+            ] {
+                assert_eq!(
+                    got.get(what).map(String::as_str),
+                    Some("allowed"),
+                    "{what}: {lines:?}"
+                );
+            }
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+
+        trait LaneUntouched {
+            fn lane_untouched(&self) -> bool;
+        }
+
+        impl LaneUntouched for PathBuf {
+            fn lane_untouched(&self) -> bool {
+                self.join("lane/project").exists()
+                    && !self.join("lane/planted").exists()
+                    && !self.join("outside/planted").exists()
+            }
+        }
+
+        /// Dropping privileges leaves no way back: the real, effective and saved
+        /// ids are the client's, no supplementary groups, no capabilities,
+        /// `no_new_privs`, and root cannot be regained. Without root there is
+        /// nothing to drop: the call fails (the client then refuses to run).
+        #[test]
+        fn the_client_drops_to_its_own_ids_for_good() {
+            let root = scratch("drop");
+            std::fs::write(root.join("root-only"), b"root").unwrap();
+            if rustix::process::geteuid().is_root() {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+                std::fs::set_permissions(
+                    root.join("root-only"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+            let (ok, lines, stderr) = run_child("drop", &root, 0);
+            assert!(ok, "{lines:?}\n{stderr}");
+            if rustix::process::geteuid().is_root() {
+                let got = lines_to_map(&lines);
+                assert_eq!(got["uid"], "65534\t65534\t65534\t65534", "{lines:?}");
+                assert_eq!(got["gid"], "65534\t65534\t65534\t65534", "{lines:?}");
+                assert_eq!(got["groups"], "", "{lines:?}");
+                assert_eq!(got["no_new_privs"], "1", "{lines:?}");
+                assert_eq!(got["cap_eff"], "0000000000000000", "{lines:?}");
+                assert_eq!(got["regain-root"], "refused", "{lines:?}");
+                assert_eq!(got["read-root-file"], "refused", "{lines:?}");
+            } else {
+                eprintln!(
+                    "SKIPPED the privileged half: not root; checking that the drop fails closed"
+                );
+                assert_eq!(lines, ["unprivileged: drop refused"]);
+            }
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+    }
 }
 
 #[cfg(test)]

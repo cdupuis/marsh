@@ -208,12 +208,15 @@ impl CloudPlacement {
         })
     }
 
+    /// The lock of one destination, keyed by where the path really points: a
+    /// symlink or `/private/...` spelling of a project shares its lock.
     fn import_lock(&self, root: &Path) -> Arc<Mutex<()>> {
+        let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         Arc::clone(
             self.imports
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(root.to_path_buf())
+                .entry(key)
                 .or_default(),
         )
     }
@@ -436,6 +439,22 @@ fn parse(arguments: &[Vec<u8>]) -> Result<(Options, CloudMode, Vec<Vec<u8>>), Da
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two spellings of one project take the same import lock.
+    #[test]
+    fn a_symlinked_spelling_of_a_root_takes_the_same_import_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let alias = home.path().join("alias");
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let direct = backend.cloud.import_lock(&project);
+        assert!(Arc::ptr_eq(&direct, &backend.cloud.import_lock(&alias)));
+        let other = home.path().join("other");
+        fs::create_dir(&other).unwrap();
+        assert!(!Arc::ptr_eq(&direct, &backend.cloud.import_lock(&other)));
+    }
 
     /// The token reaches the sandbox only on one step's stdin: no
     /// serialized form marsh writes (the request in the snapshot, the

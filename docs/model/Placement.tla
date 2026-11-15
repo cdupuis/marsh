@@ -25,7 +25,8 @@ ASSUME \A j \in Jobs : j <= Cardinality(Jobs)
 ASSUME Bug \in {"none", "ancestorReturn", "hostSnapshot", "widen",
                "captureLive", "copySnapshot", "lateReturn", "replay",
                "ackIsAbsent", "earlyComplete", "noCap", "pendingReturn",
-               "noBaseCheck", "restartDetached", "noDetachCap"}
+               "noBaseCheck", "restartDetached", "noDetachCap",
+               "checkOutsideLock", "editInWindow"}
 
 User == 0
 Fork == Cardinality(Jobs) + 1
@@ -91,6 +92,12 @@ Slots == Cardinality({j \in Jobs : held[j]})
 DSlots == Cardinality({j \in Jobs : dheld[j]})
 \* Every path the return touches still has its base contents at the destination.
 BaseUnchanged(j) == \A f \in Delta(j) : fs[dest[j]][f] = baseline[j][f]
+\* A detached write-back holds its destination's import lock from its base
+\* check until its return is applied (or its attempt ends). Every other writer
+\* the daemon runs (attached returns, other detached returns, sync, apply)
+\* takes the same lock.
+LockedBy(j) == detached[j] /\ checked[j] /\ phase[j] = "applying"
+LockFree(j) == \A k \in Jobs : k # j /\ LockedBy(k) => dest[k] # dest[j]
 
 (* Persist transfer binding + admission before provisioning or execution. *)
 Stage(j, p, root, loc) ==
@@ -147,8 +154,12 @@ Write(j, f, v) ==
                   badCapture, badEpoch, badComplete>>
   /\ UNCHANGED dvars
 
+\* The user's own editor takes no daemon lock: the model keeps it out of the
+\* window of a detached write-back (the residual that a per-entry recheck
+\* could narrow), and the control editInWindow shows what that leaves.
 CallerEdit(root, f, v) ==
   /\ <<root, f>> \notin edited
+  /\ Bug = "editInWindow" \/ \A k \in Jobs : ~(LockedBy(k) /\ dest[k] = root)
   /\ v # fs[root][f]
   /\ fs' = [fs EXCEPT ![root][f] = v]
   /\ edited' = edited \cup {<<root, f>>}
@@ -191,10 +202,16 @@ Apply(j, f) ==
   \* A detached return writes only after its base check passed. Bug
   \* noBaseCheck: it is applied as an attached return is.
   /\ ~detached[j] \/ checked[j] \/ Bug = "noBaseCheck"
+  \* Writers into one destination take turns (the import lock). Bug
+  \* checkOutsideLock: the check and the apply are not one locked step.
+  /\ LockFree(j) \/ Bug = "checkOutsideLock" \/ Bug = "editInWindow"
   /\ fs' = [fs EXCEPT ![dest[j]][f] = final[j][f]]
   /\ applied' = [applied EXCEPT ![j] = @ \cup {f}]
   /\ badEpoch' = (badEpoch \/ epoch[j] # generation \/ phase[j] = "uncertain")
-  /\ badStale' = (badStale \/ (detached[j] /\ ~checked[j] /\ ~BaseUnchanged(j)))
+  \* On state: the destination's entry, as it is when written, is the base
+  \* one or this run's own result (a path another writer changed is stale).
+  /\ badStale' = (badStale \/ (detached[j]
+        /\ fs[dest[j]][f] # baseline[j][f] /\ fs[dest[j]][f] # final[j][f]))
   /\ UNCHANGED <<phase, parent, place, scope, rights, dest, source, baseline, final,
                   alive, captured, held, runs, cap, epoch, generation, present, deleteAck,
                   absentObserved, wrote, edited, lost, badCapture, badComplete,
@@ -309,6 +326,7 @@ Collect(j) ==
 (* here since the start keeps the whole return as a patch.                 *)
 BaseCheck(j) ==
   /\ detached[j] /\ phase[j] = "applying" /\ captured[j] /\ ~checked[j]
+  /\ LockFree(j) \/ Bug = "checkOutsideLock" \/ Bug = "editInWindow"
   /\ applied[j] = {} /\ epoch[j] = generation
   /\ IF BaseUnchanged(j)
      THEN /\ checked' = [checked EXCEPT ![j] = TRUE]
@@ -399,7 +417,9 @@ NoEarlyRelease == \A j \in Jobs :
   phase[j] # "none" /\ ~held[j] /\ ~dheld[j] =>
     absentObserved[j] /\ phase[j] \in {"done", "uncertain", "kept"}
 DetachedBudget == DSlots <= DCAP
-\* A detached return is written only when no touched path changed here.
+\* A detached return overwrites a path only while it is as uploaded or already
+\* the run's own result: judged on the destination's state at each write, not
+\* on whether the check was taken.
 NoStaleApply == ~badStale
 \* A detached job is given up only once its sandbox is observed gone.
 DetachedSurvives == \A j \in Jobs :

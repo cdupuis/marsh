@@ -466,18 +466,41 @@ pub(super) fn read_result(path: &Path) -> Result<Vec<(Vec<u8>, Entry)>, String> 
     Ok(entries)
 }
 
-/// The last check and the import, one step under the root's import lock:
-/// `None` (nothing written) when the run's lane split was cancelled first.
-fn import_unless_cancelled<R>(
+/// What [`import_checked`] did.
+enum Imported<R> {
+    /// The run's lane split was cancelled first: nothing written.
+    Cancelled,
+    /// These touched paths changed here since the run started: nothing written.
+    Conflicts(Vec<String>),
+    /// The import ran.
+    Done(R),
+}
+
+/// The base check, the last cancel check and the import, one step under the
+/// root's import lock, so a write-back, attached return, sync or `apply` that
+/// lands first is seen by the check instead of overwritten. Nothing is
+/// written when the run's lane split was cancelled first or a touched path
+/// changed here.
+fn import_checked<R>(
     store: &DaemonStore,
     job: &str,
     lock: &Mutex<()>,
+    root: &Dir,
+    base: &BTreeMap<Vec<u8>, Entry>,
+    result: &[(Vec<u8>, Entry)],
     import: impl FnOnce() -> R,
-) -> Option<R> {
+) -> Imported<R> {
     let _held = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    (!store.in_cancelled_split(job)).then(import)
+    let changed = conflicts(root, base, result);
+    if !changed.is_empty() {
+        return Imported::Conflicts(changed);
+    }
+    if store.in_cancelled_split(job) {
+        return Imported::Cancelled;
+    }
+    Imported::Done(import())
 }
 
 struct HashSink<'a>(&'a mut Sha256);
@@ -1155,16 +1178,6 @@ impl StockDaemonBackend {
             Ok(result) => result,
             Err(message) => return keep(record, format!("its changes are unreadable: {message}")),
         };
-        let changed = conflicts(&root, &base, &result);
-        if !changed.is_empty() {
-            return keep(
-                record,
-                format!(
-                    "{} changed here since it started",
-                    plural(changed.len(), "file", "files")
-                ),
-            );
-        }
         // A scope lifecycle transition (`marsh stop`) waits for this write.
         let Ok(_admission) = store.begin_background_request(format!(
             "the write-back of detached cloud run {}",
@@ -1179,14 +1192,27 @@ impl StockDaemonBackend {
         // lock) that came before this check discards the run instead; one
         // that comes after it finds the run live (a lane waits for it), so
         // nothing is written into a copy after its cancel has finished.
-        let applied = import_unless_cancelled(
+        let applied = import_checked(
             store,
             &record.job_id,
             &self.cloud.import_lock(&record.root),
+            &root,
+            &base,
+            &result,
             || cloud_fs::apply_delta(&record.root, record.root_identity, &payload, MAX_ARCHIVE),
         );
-        let Some(applied) = applied else {
-            return self.discard_loaded(store, paths, record);
+        let applied = match applied {
+            Imported::Cancelled => return self.discard_loaded(store, paths, record),
+            Imported::Conflicts(changed) => {
+                return keep(
+                    record,
+                    format!(
+                        "{} changed here since it started",
+                        plural(changed.len(), "file", "files")
+                    ),
+                );
+            }
+            Imported::Done(applied) => applied,
         };
         match applied {
             Ok(report) => {
@@ -2120,20 +2146,92 @@ mod tests {
         let (first, second) = (job(&store), job(&store));
         let lock = Mutex::new(());
         let ran = std::cell::Cell::new(0);
+        let dir = tempfile::tempdir().unwrap();
+        let root = Dir::open_root(dir.path()).unwrap();
+        let import = |job: &str, run: &dyn Fn()| {
+            import_checked(&store, job, &lock, &root, &BTreeMap::new(), &[], run)
+        };
         // Not cancelled: the import runs.
-        assert!(
-            import_unless_cancelled(&store, &first, &lock, || ran.set(ran.get() + 1)).is_some()
-        );
+        assert!(matches!(
+            import(&first, &|| ran.set(ran.get() + 1)),
+            Imported::Done(())
+        ));
         // A cancel that arrives while the import runs is not held up by it
         // (the lane waits for the run), and the import completes.
-        let during = import_unless_cancelled(&store, &second, &lock, || {
+        let during = import(&second, &|| {
             store.cancel_split("abc123def456");
             ran.set(ran.get() + 1);
         });
-        assert!(during.is_some() && ran.get() == 2);
+        assert!(matches!(during, Imported::Done(())) && ran.get() == 2);
         // A cancel that came first: nothing is imported, for any run of it.
-        assert!(import_unless_cancelled(&store, &first, &lock, || ran.set(99)).is_none());
+        assert!(matches!(
+            import(&first, &|| ran.set(99)),
+            Imported::Cancelled
+        ));
         assert_eq!(ran.get(), 2);
+    }
+
+    #[test]
+    fn an_edit_that_lands_while_the_import_waits_for_the_lock_is_kept_not_overwritten() {
+        use marsh_daemon::{NewJob, SessionAuthority, process::ProcessLink};
+        let home = tempfile::tempdir().unwrap();
+        let store = DaemonStore::new(home.path());
+        let session = store.attach_shell(
+            1,
+            SessionAuthority {
+                username: "alice".into(),
+                uid: 501,
+                gid: 20,
+                launch_directory: "/Users/example/project".into(),
+                guest_home: "/Users/example".into(),
+                home_backing: home.path().join("home"),
+                ephemeral_home: false,
+            },
+        );
+        let (job, _, _) = store
+            .begin_cloud_job(
+                NewJob {
+                    label: None,
+                    session_id: session,
+                    command: "cloud".into(),
+                    kit_ref: "cloud-shell".into(),
+                    workload_image: format!("fixture@sha256:{}", "a".repeat(64)),
+                    mounts: Vec::new(),
+                },
+                &ProcessLink::default(),
+                &[],
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f"), b"base").unwrap();
+        let digest = |bytes: &[u8]| Sha256::digest(bytes).to_vec();
+        let base = BTreeMap::from([(b"f".to_vec(), Entry::File(0o644, digest(b"base")))]);
+        let result = vec![(b"f".to_vec(), Entry::File(0o644, digest(b"cloud")))];
+        let root = Dir::open_root(dir.path()).unwrap();
+        let lock = Mutex::new(());
+        let applied = std::sync::atomic::AtomicBool::new(false);
+        // Another write-back into the root holds the lock while this one
+        // starts; it lands `f` (as a sibling job or an attached return would)
+        // and releases the lock.
+        let held = lock.lock().unwrap();
+        let outcome = thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                import_checked(&store, &job, &lock, &root, &base, &result, || {
+                    applied.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+            });
+            // Let the import reach the lock (it checks, or waits, first).
+            thread::sleep(Duration::from_millis(300));
+            fs::write(dir.path().join("f"), b"local").unwrap();
+            drop(held);
+            waiting.join().unwrap()
+        });
+        assert!(
+            matches!(&outcome, Imported::Conflicts(paths) if paths == &["f"]),
+            "the edit that landed first must be kept"
+        );
+        assert!(!applied.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(fs::read(dir.path().join("f")).unwrap(), b"local");
     }
 
     #[test]

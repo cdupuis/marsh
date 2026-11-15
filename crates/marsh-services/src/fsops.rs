@@ -1022,3 +1022,336 @@ pub fn open_dir_by_path(path: &std::path::Path) -> io::Result<OwnedFd> {
         Mode::empty(),
     )?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fsops-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn dir_fd(path: &Path) -> OwnedFd {
+        open_dir_by_path(path).unwrap()
+    }
+
+    fn cstr(name: &str) -> CString {
+        CString::new(name).unwrap()
+    }
+
+    /// Copy `from` into the empty directory `to` with real worker threads.
+    fn copy_tree(from: &Path, to: &Path, deadline: Option<Instant>) -> VolumeResult {
+        let copier = Copier::new(false);
+        copier.set_deadline(deadline);
+        let index = copier
+            .submit(vec![VolumeCopy {
+                display: "v".into(),
+                src: dir_fd(from),
+                dst: dir_fd(to),
+            }])
+            .unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| copier.worker());
+            }
+            copier.wait(&mut || {});
+            copier.shutdown();
+        });
+        copier.result(index)
+    }
+
+    /// A tree with a link to `/`, a relative link, a hard-linked pair and a
+    /// FIFO is cloned as itself: links stay links (never followed), the pair
+    /// stays one inode, the FIFO is a reported gap, and nothing of `/` appears.
+    #[test]
+    fn copying_a_tree_keeps_links_as_links_and_reports_special_files() {
+        let root = scratch("copy");
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        std::fs::create_dir_all(src.join("a/b")).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(src.join("a/b/file"), b"payload").unwrap();
+        std::fs::set_permissions(src.join("a/b/file"), std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        symlink("/", src.join("escape")).unwrap();
+        symlink("a/b/file", src.join("relative")).unwrap();
+        std::fs::write(src.join("one"), b"shared").unwrap();
+        std::fs::hard_link(src.join("one"), src.join("two")).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            src.join("pipe"),
+            FileType::Fifo,
+            Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+
+        let result = copy_tree(&src, &dst, None);
+
+        assert!(result.complete, "{result:?}");
+        assert_eq!(result.files, 5, "{result:?}"); // file, 2 links, 2 hard links
+        assert_eq!(result.gaps.len(), 1, "{:?}", result.gaps);
+        assert!(result.gaps[0].contains("pipe"), "{:?}", result.gaps);
+        assert!(result.gaps[0].contains("named pipe"), "{:?}", result.gaps);
+        let mut names: Vec<_> = std::fs::read_dir(&dst)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a", "escape", "one", "relative", "two"]);
+        assert_eq!(
+            std::fs::read_link(dst.join("escape")).unwrap(),
+            Path::new("/")
+        );
+        assert!(dst.join("escape").symlink_metadata().unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read_link(dst.join("relative")).unwrap(),
+            Path::new("a/b/file")
+        );
+        assert_eq!(std::fs::read(dst.join("a/b/file")).unwrap(), b"payload");
+        assert_eq!(
+            std::fs::metadata(dst.join("a/b/file")).unwrap().mode() & 0o7777,
+            0o640
+        );
+        let (one, two) = (
+            std::fs::metadata(dst.join("one")).unwrap(),
+            std::fs::metadata(dst.join("two")).unwrap(),
+        );
+        assert_eq!(one.ino(), two.ino(), "the hard-linked pair was split");
+        assert_eq!(one.nlink(), 2);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A clone that is out of time says so and is not complete.
+    #[test]
+    fn a_copy_past_its_deadline_is_not_complete() {
+        let root = scratch("deadline");
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(src.join("f"), b"x").unwrap();
+        let result = copy_tree(&src, &dst, Some(Instant::now()));
+        assert!(!result.complete, "{result:?}");
+        assert!(
+            result.gaps.iter().any(|gap| gap.contains("took too long")),
+            "{:?}",
+            result.gaps
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Removal unlinks a link and never follows it: the files it pointed at,
+    /// outside the tree, survive.
+    #[test]
+    fn removing_a_tree_never_follows_a_link_out_of_it() {
+        let root = scratch("remove");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("deep")).unwrap();
+        std::fs::write(outside.join("deep/canary"), b"keep").unwrap();
+        let victim = root.join("victim");
+        std::fs::create_dir_all(victim.join("x/y")).unwrap();
+        std::fs::write(victim.join("x/y/file"), b"gone").unwrap();
+        symlink(&outside, victim.join("x/to-outside")).unwrap();
+        symlink(outside.join("deep"), victim.join("to-deep")).unwrap();
+        let parent = dir_fd(&root);
+        remove_tree_at(&parent, &cstr("victim")).unwrap();
+        assert!(!victim.exists() && victim.symlink_metadata().is_err());
+        assert_eq!(std::fs::read(outside.join("deep/canary")).unwrap(), b"keep");
+
+        // A link at the root of the removal is itself the thing removed.
+        symlink(&outside, root.join("root-link")).unwrap();
+        remove_tree_at(&parent, &cstr("root-link")).unwrap();
+        assert!(root.join("root-link").symlink_metadata().is_err());
+        assert_eq!(std::fs::read(outside.join("deep/canary")).unwrap(), b"keep");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A tree nested past the walker's bound is refused, not followed to the
+    /// bottom.
+    #[test]
+    fn removing_a_tree_nested_too_deeply_is_refused() {
+        let root = scratch("deep");
+        let top = root.join("top");
+        std::fs::create_dir(&top).unwrap();
+        let mut fd = dir_fd(&top);
+        for _ in 0..(MAX_DEPTH + 8) {
+            fd = mkdir_new(&fd, "d").unwrap();
+        }
+        let parent = dir_fd(&root);
+        let error = remove_tree_at(&parent, &cstr("top")).unwrap_err();
+        assert!(error.to_string().contains("too deep"), "{error}");
+        drop(fd);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn pool_with_volume(root: &Path, name: &str) -> Pool {
+        std::fs::create_dir_all(
+            root.join(DATA_ROOT)
+                .join("volumes")
+                .join(name)
+                .join("_data"),
+        )
+        .unwrap();
+        Pool::open(root).unwrap()
+    }
+
+    /// The volume's data directory is found by layout only: a bad name, a
+    /// symlinked volume, `_data` or data root, and a missing one are refused.
+    #[test]
+    fn a_volume_is_found_only_by_the_engines_layout() {
+        let root = scratch("pool");
+        let pool = pool_with_volume(&root, "db");
+        std::fs::write(root.join(DATA_ROOT).join("volumes/db/_data/row"), b"data").unwrap();
+        let source = pool.volume_source("db").unwrap();
+        assert_eq!(list_names(&source).unwrap(), [b"row".to_vec()]);
+        assert!(pool.volume_dir("db").is_ok());
+
+        for bad in ["", "..", ".", "a/b", "../db", "-x", ".hidden", "a\0b"] {
+            let error = pool.volume_source(bad).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+            assert!(pool.volume_dir(bad).is_err(), "{bad:?}");
+        }
+        assert!(pool.volume_source("missing").is_err());
+
+        // A volume directory replaced by a link to another one.
+        let volumes = root.join(DATA_ROOT).join("volumes");
+        std::fs::create_dir_all(root.join("elsewhere/_data")).unwrap();
+        symlink(root.join("elsewhere"), volumes.join("linked")).unwrap();
+        assert!(pool.volume_source("linked").is_err());
+        assert!(pool.volume_dir("linked").is_err());
+        // `_data` replaced by a link.
+        std::fs::create_dir_all(volumes.join("odd")).unwrap();
+        symlink(root.join("elsewhere/_data"), volumes.join("odd/_data")).unwrap();
+        assert!(pool.volume_source("odd").is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // The data root itself replaced by a link.
+        let root = scratch("pool-link");
+        std::fs::create_dir_all(root.join("real/volumes/db/_data")).unwrap();
+        symlink(root.join("real"), root.join(DATA_ROOT)).unwrap();
+        let pool = Pool::open(&root).unwrap();
+        assert!(pool.volume_source("db").is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_snapshots_directory_is_private_and_never_a_link() {
+        let root = scratch("snapshots");
+        let pool = Pool::open(&root).unwrap();
+        pool.snapshots().unwrap();
+        assert_eq!(
+            std::fs::metadata(root.join("snapshots")).unwrap().mode() & 0o777,
+            0o700
+        );
+        pool.snapshots().unwrap();
+        std::fs::remove_dir(root.join("snapshots")).unwrap();
+        std::fs::create_dir(root.join("target")).unwrap();
+        symlink(root.join("target"), root.join("snapshots")).unwrap();
+        assert!(pool.snapshots().is_err());
+        // A pool path that is a link is refused too.
+        symlink(&root, root.join("alias")).unwrap();
+        assert!(Pool::open(&root.join("alias")).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The small file operations never follow a link and never replace what
+    /// they must not.
+    #[test]
+    fn file_operations_refuse_links_and_replacements() {
+        let root = scratch("files");
+        let dir = dir_fd(&root);
+        let outside = root.join("outside");
+        std::fs::write(&outside, b"original").unwrap();
+
+        write_new_file_at(&dir, "new", b"one").unwrap();
+        assert!(write_new_file_at(&dir, "new", b"two").is_err());
+        assert_eq!(read_file_at(&dir, "new", 16).unwrap(), b"one");
+
+        symlink(&outside, root.join("trap")).unwrap();
+        assert!(write_new_file_at(&dir, "trap", b"hijack").is_err());
+        assert!(read_file_at(&dir, "trap", 16).is_err());
+        assert!(open_for_write_at(&dir, "trap").is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"original");
+
+        assert!(read_file_at(&dir, "new", 2).is_err(), "over the cap");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            root.join("fifo"),
+            FileType::Fifo,
+            Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        assert!(
+            read_file_at(&dir, "fifo", 16).is_err(),
+            "not a regular file"
+        );
+
+        replace_file_at(&dir, "new", b"three").unwrap();
+        assert_eq!(read_file_at(&dir, "new", 16).unwrap(), b"three");
+        assert!(!exists_at(&dir, ".new.new"));
+        // A replace over a planted link replaces the link, not its target.
+        replace_file_at(&dir, "trap", b"swapped").unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"original");
+        assert_eq!(read_file_at(&dir, "trap", 16).unwrap(), b"swapped");
+
+        remove_file_at(&dir, "new").unwrap();
+        remove_file_at(&dir, "new").unwrap(); // already gone: fine
+        assert!(!exists_at(&dir, "new"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn publish_exchange_and_the_directory_lock() {
+        let root = scratch("publish");
+        let dir = dir_fd(&root);
+        let first = mkdir_new(&dir, "first").unwrap();
+        write_new_file_at(&first, "marker", b"1").unwrap();
+        let second = mkdir_new(&dir, "second").unwrap();
+        assert!(mkdir_new(&dir, "first").is_err());
+
+        // publish never replaces; exchange swaps in one step.
+        assert!(publish(&dir, "first", "second").is_err());
+        publish(&dir, "first", "third").unwrap();
+        assert!(!exists_at(&dir, "first") && exists_at(&dir, "third"));
+        exchange(&dir, "third", "second").unwrap();
+        assert!(exists_at(&dir_fd(&root.join("second")), "marker"));
+        assert!(!exists_at(&dir_fd(&root.join("third")), "marker"));
+
+        let mut names = list_names(&dir).unwrap();
+        names.sort();
+        assert_eq!(names, [b"second".to_vec(), b"third".to_vec()]);
+
+        // A live holder is seen by a second descriptor of the same directory
+        // (`second` is the directory now named `third`).
+        assert!(try_lock_dir(&second));
+        assert!(!try_lock_dir(&dir_fd(&root.join("third"))));
+        drop(second);
+        assert!(try_lock_dir(&dir_fd(&root.join("third"))));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn volume_names_are_one_safe_component() {
+        for good in ["db", "a", "Data_1.x-y", &"a".repeat(255)] {
+            assert!(valid_volume_name(good), "{good}");
+        }
+        for bad in [
+            "",
+            "_a",
+            ".a",
+            "-a",
+            "a/b",
+            "a b",
+            "a\n",
+            &"a".repeat(256),
+            "é",
+        ] {
+            assert!(!valid_volume_name(bad), "{bad:?}");
+        }
+    }
+}

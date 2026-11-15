@@ -255,8 +255,10 @@ real `fsync` is issued), and
 `racing_writers_never_tear_or_lose_the_ledger` and
 `an_unparseable_ledger_is_set_aside_not_deleted`.
 
-`ledger.json` on the pool records the owner scope of containers, networks,
-volumes and exec IDs, plus pins and substituted sockets. Every object route
+`ledger.json` on the pool records the owner scope of containers, networks and
+volumes, plus pins and substituted sockets. Exec IDs are remembered in memory
+only, at most 256 per container (`execs_are_bounded_and_not_persisted`), so a
+job's `docker exec` loop cannot grow the file. Every object route
 resolves names, short IDs and full IDs inside the caller's scope only and
 rewrites to the full ID; other scopes' objects answer exactly like missing
 ones. Lists and prunes carry a scope label filter, list responses are filtered

@@ -152,7 +152,7 @@ pub struct Services {
     /// timeout), which serializes tag claims while the engine hangs.
     tag_res: Mutex<TagRes>,
     /// Volume names with a delete of unknown outcome, and when it was sent.
-    fenced: Mutex<HashMap<String, std::time::Instant>>,
+    fenced: Mutex<HashMap<String, (String, std::time::Instant)>>,
     /// A pin is mounted and then recorded; both happen under the read side, and
     /// the sweep of unrecorded pins runs under the write side, so it can never
     /// see the first without the second.
@@ -521,22 +521,32 @@ impl Services {
         Ok(s)
     }
 
-    /// Whether a delete of this volume's name is still unconfirmed.
+    /// Whether a delete of this volume's name, of unknown outcome, may still
+    /// land at the engine (the fence only ever ends by time).
+    #[cfg(test)]
     fn volume_fenced(&self, name: &str) -> bool {
+        self.fence_holder(name).is_some()
+    }
+
+    /// The workspace whose uncertain delete of `name` is still fenced.
+    fn fence_holder(&self, name: &str) -> Option<String> {
         let mut fenced = self
             .fenced
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let wait = self.cfg.delete_fence;
-        fenced.retain(|_, sent| sent.elapsed() < wait);
-        fenced.contains_key(name)
+        fenced.retain(|_, (_, sent)| sent.elapsed() < wait);
+        fenced.get(name).map(|(workspace, _)| workspace.clone())
     }
 
-    fn fence_volume(&self, name: &str) {
+    fn fence_volume(&self, name: &str, workspace: &str) {
         self.fenced
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(name.to_owned(), std::time::Instant::now());
+            .insert(
+                name.to_owned(),
+                (workspace.to_owned(), std::time::Instant::now()),
+            );
     }
 
     pub(crate) fn up_request(
@@ -549,8 +559,9 @@ impl Services {
         Ok((resp.status, body))
     }
 
-    /// One request on an already dialed engine connection: the whole answer
-    /// must arrive within `up_progress` (a reply that trickles in is cut off).
+    /// One request on an already dialed engine connection: the whole exchange
+    /// (the write, the head, every read of the body) must finish within
+    /// `up_progress`; a reply that trickles in is cut off.
     fn exchange(
         &self,
         mut s: UnixStream,
@@ -558,7 +569,14 @@ impl Services {
         path: &str,
         body: Option<&[u8]>,
     ) -> io::Result<(RespHead, Vec<u8>)> {
-        let deadline = std::time::Instant::now() + self.cfg.up_progress;
+        let budget = self.cfg.up_progress;
+        let deadline = std::time::Instant::now() + budget;
+        let remaining = || {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(Duration::from_millis(1))
+        };
+        s.set_write_timeout(Some(remaining()))?;
         let mut head = format!("{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n");
         if let Some(b) = body {
             head.push_str(&format!(
@@ -576,7 +594,8 @@ impl Services {
         let mut conn = Conn::new(
             s,
             HttpLimits {
-                progress: self.cfg.up_progress,
+                head_deadline: remaining(),
+                progress: remaining(),
                 ..HttpLimits::default()
             },
         );
@@ -585,31 +604,23 @@ impl Services {
         Ok((resp, body))
     }
 
-    /// Refuse a claim of a name whose delete may still be pending at the
-    /// engine, unless the engine now shows the volume absent (the delete has
-    /// finished). Called with `vol_lock` held.
-    fn check_fence(&self, name: &str) -> Result<(), Refusal> {
-        if !self.volume_fenced(name) {
-            return Ok(());
+    /// Refuse a claim by `workspace` of a name that another workspace sent an
+    /// unanswered delete for, until the fence expires. The workspace that sent
+    /// the delete is exempt: a late landing of its own delete can only remove
+    /// its own volume. Nothing else ends the fence: neither a later delete's
+    /// answer nor the engine showing the name absent proves the earlier
+    /// request has finished.
+    fn check_fence(&self, name: &str, workspace: &str) -> Result<(), Refusal> {
+        match self.fence_holder(name) {
+            Some(holder) if holder != workspace => Err(Refusal {
+                status: 503,
+                msg: format!(
+                    "a delete of volume {name:?} by another workspace has not been answered by the engine; try again later"
+                ),
+                close: false,
+            }),
+            _ => Ok(()),
         }
-        if let Ok((404, _)) = self.up_request("GET", &format!("/volumes/{name}"), None) {
-            self.unfence_volume(name);
-            return Ok(());
-        }
-        Err(Refusal {
-            status: 503,
-            msg: format!(
-                "a delete of volume {name:?} has not been confirmed by the engine; try again later"
-            ),
-            close: false,
-        })
-    }
-
-    fn unfence_volume(&self, name: &str) {
-        self.fenced
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(name);
     }
 
     fn lock_tags(&self) -> std::sync::MutexGuard<'_, TagRes> {
@@ -1472,7 +1483,7 @@ impl Env for Scope {
             .vol_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.svc.check_fence(name)?;
+        self.svc.check_fence(name, &self.auth.workspace)?;
         let fail = |m: String| Refusal {
             status: 500,
             msg: m,
@@ -1532,7 +1543,7 @@ impl Env for Scope {
             .vol_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.svc.check_fence(name)?;
+        self.svc.check_fence(name, &self.auth.workspace)?;
         let ws = &self.auth.workspace;
         let claim = self
             .svc
@@ -2289,6 +2300,18 @@ fn read_resp_body(
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>, HttpError> {
     let late = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
+    // Each read may wait only for what is left of the whole call.
+    let tighten = |c: &mut Conn| -> Result<(), HttpError> {
+        if let Some(d) = deadline {
+            let left = d.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(HttpError::Timeout);
+            }
+            c.limits.progress = left;
+        }
+        Ok(())
+    };
+    tighten(c)?;
     let mut out = Vec::new();
     let mut buf = vec![0u8; 16 * 1024];
     let mut st = match resp.framing {
@@ -2296,6 +2319,7 @@ fn read_resp_body(
         RespFraming::Length(n) => BodyState::new(Framing::Length(n)),
         RespFraming::Chunked => BodyState::new(Framing::Chunked),
         RespFraming::UntilClose => loop {
+            tighten(c)?;
             let n = c.read_until_close(&mut buf)?;
             if n == 0 {
                 return Ok(out);
@@ -2310,6 +2334,7 @@ fn read_resp_body(
         },
     };
     loop {
+        tighten(c)?;
         let n = c.read_body(&mut st, &mut buf)?;
         if n == 0 {
             return Ok(out);
@@ -2804,7 +2829,6 @@ fn delete_volume(
             // delete of the name has finished: the fence ends.
             if matches!(resp.status, 200 | 204 | 404) {
                 post_actions(scope, &adm.post);
-                svc.unfence_volume(name);
             }
             let out = if resp.framing == RespFraming::NoBody {
                 Out::Bodiless
@@ -2817,7 +2841,7 @@ fn delete_volume(
             keep && sent.is_ok()
         }
         Err(e) => {
-            svc.fence_volume(name);
+            svc.fence_volume(name, &scope.auth.workspace);
             svc.log(&format!("delete of volume {name} did not complete: {e}"));
             reply(
                 &mut conn.stream,

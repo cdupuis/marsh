@@ -147,24 +147,32 @@ after the name was given to another workspace
 makes the engine call itself, so the client leaving does not end it early
 (`a_delete_whose_client_disconnected_still_holds_the_name_until_the_engine_finishes`).
 The ledger releases the name only when the engine answers 200, 204 or 404. If a
-delete was sent and the engine does not answer (timeout, a reply that trickles
-past the whole-call deadline `up_progress`, an error after the send), the owner
-keeps the name and every claim of it is refused for `delete_fence` (5 minutes),
-because the request may land later
-(`a_delete_the_engine_did_not_answer_fences_the_name_before_it_can_be_reassigned`).
-A delete that was never sent (the engine could not be dialed) fences nothing
-(`a_delete_that_was_never_sent_fences_nothing`). The fence ends early when a later
-delete of the name gets 200, 204 or 404, or when an inspect (on the next claim)
-finds the volume absent (`a_confirmed_retry_clears_the_fence_for_the_owners_own_recreate`,
-`an_inspect_that_finds_the_volume_absent_clears_the_fence`); both rest on dockerd
-doing one removal of a name at a time and on its requests running promptly, which
-the endpoint cannot verify. Volume creates and container creates with a named
-volume (`ensure_volume`) both honor the fence. An engine error on a delete (409,
-5xx) is an answer: the owner keeps the volume and the reply is passed on. The
-reply to a delete is the engine's (status line, headers, body; keep-alive when
-the client asked for it). The fence is in memory only (an agent restart forgets
-it), and it is time-based: the engine gives no way to cancel or confirm a request
-it has accepted. This covers
+delete was sent and the engine does not answer (timeout, a reply cut off by the
+whole-call deadline `up_progress`, an error after the send), the owner keeps the
+name and the name is fenced against OTHER workspaces for `delete_fence`
+(5 minutes): their volume creates and container creates with that named volume
+(`ensure_volume`) get a 503 (`another_workspace_waits_out_the_fence_of_a_delete_that_was_not_answered`,
+`a_container_create_by_another_workspace_honors_the_fence`,
+`a_disconnected_delete_that_timed_out_fences_the_name_too`). The workspace that
+sent the delete is not refused by its own fence, because a late landing of its
+own delete can only remove its own volume
+(`the_workspace_that_sent_the_delete_is_not_refused_by_its_own_fence`). The fence
+only expires by time. Nothing else ends it: a later delete of the name that
+succeeds, an inspect that finds the volume absent and the reconciler dropping the
+ledger entry do not show that the earlier request has finished (a request can be
+accepted, then wait at the engine while a later one runs first). A delete that was
+never sent (the engine could not be dialed) fences nothing
+(`a_delete_that_was_never_sent_fences_nothing`). The fence is in memory only: an
+agent restart forgets it. It is time-based, so a delete that lands after the fence
+expired is not stopped; the engine gives no way to cancel or confirm a request it
+has accepted. An engine error on a delete (409, 5xx) is an answer: the owner keeps
+the volume and the reply is passed on. The reply to a delete is the engine's
+(status line, headers, body; keep-alive when the client asked for it). Every
+engine call the agent makes itself is bounded as a whole (the write, the head and
+every read of the body) by `up_progress`, 30 s
+(`a_drip_fed_response_head_obeys_the_whole_call_deadline`,
+`a_drip_fed_chunked_reply_obeys_the_whole_call_deadline`,
+`a_trickling_engine_reply_is_bounded_by_the_whole_call`). This covers
 DELETE of a volume against volume claims. Container and network deletes (they
 address the engine by the ID the ledger resolved), volume prune and other
 label-filtered engine calls are not serialized this way and are not covered.

@@ -137,9 +137,10 @@ a fake `sbx` and temporary homes. Nothing in CI starts a microVM, so `make check
   VMs on Apple Silicon without nested virtualization, and the hosted Linux
   arm64 runners have no KVM.
 - Hosted Linux x64 runners have KVM, and stock `sbx` runs on Linux with it. But
-  marsh's shell image and Kits are `linux/arm64`, and the host side admits a
-  workspace with APFS file IDs and `clonefileat`
-  (`crates/marsh-host-identity`), which exist only on macOS.
+  marsh's shell image and Kits are `linux/arm64`, and the host side clones
+  split and checkpoint trees with `clonefileat` and identifies checkpoint
+  directories by APFS file ID (`crates/marsh-host-identity`), which exist only on
+  macOS. (Source admission itself compares device and inode.)
 
 A Linux lane for the real stack would need a Linux workspace-identity backend
 and amd64 guests, which is product work. Until then, the real gate is a Mac:

@@ -12,9 +12,9 @@ fanout destinations of unit 3.
 |---|---|---|
 | `cloud { LIST; }` | Brush patch `0097` (`ast::Command::Placement`, `interp::placement_as_simple`) | One external stage: `marsh cloud -c SOURCE`, source quoted and unexpanded; caller redirections stay local |
 | `marsh cloud -c` / `--` | `crates/marsh/src/main.rs` `cloud_command` | `Execute` with `Placement::Cloud`, argv bytes; a closed stdout cancels and settles, then exits 141 |
-| Admission, receipt | `marsh-daemon` `begin_cloud_job`, `record_cloud_sandbox`, `mark_cloud_running`; journal validation for cloud receipts | Session-origin only; counts toward the shared job pool; `vm_id` is the cloud sandbox ID, no worker/container |
+| Admission, receipt | `marsh-daemon` `begin_cloud_job`, `record_cloud_sandbox`, `mark_cloud_running`; journal validation for cloud receipts | Session-origin, or job-origin (a job's `marsh cloud` is admitted as its child); counts toward the shared job pool; `vm_id` is the cloud sandbox ID, no worker/container |
 | Snapshot | `marsh-daemon/src/cloud_fs.rs` `write_snapshot` | Caller's view: the split fork when cwd is in one, else the project. Descriptor walk, Git ignore rules for a project (as split), never `.git`/`.marsh`/special files, stable reads; streamed gzip, never spooled |
-| Provision / cleanup | `marsh-sbx/src/cloud.rs` `CloudSbx` | Owned ID-bound lifecycle; retire observes absence; 4 h TTL, delete on timeout |
+| Provision / cleanup | `marsh-sbx/src/cloud.rs` `CloudSbx` | Owned ID-bound lifecycle; retire observes absence; TTL from `--ttl` (4 h attached, 2 h detached by default): an attached sandbox is deleted when it runs out, a detached one is stopped (suspended) and resumed by the next collector check; an uncollected detached run is deleted after its retention |
 | Remote helper | `crates/marsh/src/cloud_helper.rs` (static `marsh-local`) | Control steps run as root via `sudo -n` from a root-owned installed copy, with state in root-only `/var/lib/marsh-cloud`: `prepare` (workload user, natural path), `unpack` (baseline with hashes), `run` (workload as `marsh-run`: no sudo/Docker, environment rebuilt from the sandbox's proxy/CA settings plus the filtered request; after exit every process of that uid is killed, then the status is recorded), `status`, `signal`, `delta` (refuses without a status) |
 | Orchestration | `marsh-backend/src/cloud.rs` `execute_cloud` | Phases admit → snapshot → provision → upload → execute → confirm end → capture to owner-only `cloud/results/JOB.delta` → retire → apply |
 | Apply | `cloud_fs::apply_delta` | Full validation first (paths, protected names, ASCII case aliases, duplicates, descendants of replaced entries); archive end record; root identity check; descriptor-relative `O_NOFOLLOW` walk; destination alias check (`statat` vs exact directory entry); order: retype deletions, directories (owner-writable), files/symlinks via staged `renameat`, other deletions (a non-empty directory is kept and reported), directory modes last; serialized per destination root |
@@ -23,9 +23,10 @@ fanout destinations of unit 3.
 | Failure retention | `execute_cloud` | A failed capture keeps the sandbox (quarantined, owned) instead of deleting the only copy; a failed apply keeps `cloud/results/JOB.delta` |
 | Recovery | `marsh workers reset cloud` | Retires every owned cloud sandbox and releases slots of uncertain cloud jobs. A daemon restart marks running cloud jobs unknown/uncertain; nothing is replayed or written back |
 
-The block runs the session shell profile directly in the sandbox (as user
-`agent`, with the image's tools), not the cloud worker profile: no registered
-Kits run in cloud yet.
+A block that names no registered command runs the session shell profile directly
+in the sandbox (as user `agent`, with the image's tools), not the cloud worker
+profile. A registered command runs in its own digest-pinned Kit's cloud form
+(see "Registered Kits in cloud and job-origin placement" below).
 
 ## Evidence
 

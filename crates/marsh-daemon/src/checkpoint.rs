@@ -585,7 +585,8 @@ pub struct Checkpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub services: Option<ServicesRecord>,
     /// The git-ignored state cloned into `<checkpoint>/ignored/` (C5), or
-    /// `None` when services are off for the project.
+    /// `None` when no backend is attached (the backend saves it whether or not
+    /// services are on for the project, DECISIONS 26).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignored: Option<crate::ignored::IgnoredRecord>,
     /// For a checkpoint of a lane: that lane's port map (original port number

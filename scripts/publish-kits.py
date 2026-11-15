@@ -35,10 +35,19 @@ SHARED_PATH = Path(__file__).with_name("build_inputs.py")
 _SHARED_SPEC = importlib.util.spec_from_file_location("marsh_build_inputs", SHARED_PATH)
 _SHARED = importlib.util.module_from_spec(_SHARED_SPEC)
 _SHARED_SPEC.loader.exec_module(_SHARED)
-for _name in ("JSON_LIMIT", "FILE_LIMIT", "STAGE_LIMIT", "MAX_FILES", "parts",
-              "directory", "regular_file", "read_file", "copy_regular",
-              "file_record", "tree_inventory", "json_bytes", "sha", "retained_walks"):
-    globals()[_name] = getattr(_SHARED, _name)
+JSON_LIMIT = _SHARED.JSON_LIMIT
+STAGE_LIMIT = _SHARED.STAGE_LIMIT
+MAX_FILES = _SHARED.MAX_FILES
+parts = _SHARED.parts
+directory = _SHARED.directory
+regular_file = _SHARED.regular_file
+read_file = _SHARED.read_file
+copy_regular = _SHARED.copy_regular
+file_record = _SHARED.file_record
+tree_inventory = _SHARED.tree_inventory
+json_bytes = _SHARED.json_bytes
+sha = _SHARED.sha
+retained_walks = _SHARED.retained_walks
 
 
 def unique(pairs):

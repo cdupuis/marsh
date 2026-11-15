@@ -116,7 +116,16 @@ impl std::error::Error for LocalCleanupUncertain {}
 pub(crate) fn uncertainty(retained: Option<RetainedProcess>) -> io::Error {
     io::Error::other(LocalCleanupUncertain { retained })
 }
+/// Every new host attachment passes here. It drops the retained children that
+/// have already exited, so they do not fill the registry. It only observes
+/// (`try_wait`, nonblocking): signalling and waiting for confirmation belong to
+/// [`poll_retained_processes`], whose waits must never delay a command or hold
+/// the registry across them.
 pub(crate) fn check_capacity() -> io::Result<()> {
+    entries()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain_mut(|entry| !matches!(entry.process.try_wait(), Ok(Some(_))));
     let entries = entries()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

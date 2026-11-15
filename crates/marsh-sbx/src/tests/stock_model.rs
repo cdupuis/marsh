@@ -267,6 +267,8 @@ struct ProcState {
     changed: Condvar,
     socket: Mutex<Option<UnixStream>>,
     wedge: Option<Arc<Gate>>,
+    /// `terminate` returns but the process keeps running until `finish`.
+    survives_terminate: bool,
 }
 
 impl ProcState {
@@ -300,7 +302,9 @@ impl AttachedProcess for ModelProcess {
         if let Some(wedge) = &self.0.wedge {
             wedge.pass();
         }
-        self.0.finish(143);
+        if !self.0.survives_terminate {
+            self.0.finish(143);
+        }
         Ok(())
     }
 }
@@ -318,6 +322,7 @@ struct Running {
 }
 
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent one-shot faults.
 struct State {
     vms: BTreeMap<String, Vm>,
     calls: Vec<Call>,
@@ -352,6 +357,7 @@ struct State {
     worker_input_gate: Option<Arc<Gate>>,
     fail_worker_flush: bool,
     wedge_worker_termination: Option<Arc<Gate>>,
+    survive_worker_termination: bool,
     wrong_supervisor_generation: bool,
 }
 
@@ -534,6 +540,11 @@ impl StockModel {
         let gate = Arc::new(Gate::default());
         self.state.lock().unwrap().wedge_worker_termination = Some(Arc::clone(&gate));
         gate
+    }
+
+    /// Workers started from now on ignore termination: they never exit.
+    pub fn survive_worker_termination(&self) {
+        self.state.lock().unwrap().survive_worker_termination = true;
     }
 
     pub fn answer_next_supervisor_with_wrong_generation(&self) {
@@ -1363,17 +1374,19 @@ impl StockModel {
 
     fn spawn_worker(&self, vm: &str, generation: u64) -> io::Result<Attachment> {
         let (controller, mut worker) = UnixStream::pair()?;
-        let (ready_gate, wedge, fault) = {
+        let (ready_gate, wedge, survives_terminate, fault) = {
             let mut state = self.state.lock().unwrap();
             (
                 state.worker_ready_gate.clone(),
                 state.wedge_worker_termination.clone(),
+                state.survive_worker_termination,
                 state.worker_ready_fault.take(),
             )
         };
         let state = Arc::new(ProcState {
             socket: Mutex::new(Some(worker.try_clone()?)),
             wedge,
+            survives_terminate,
             ..ProcState::default()
         });
         self.register(vm, ProcKind::Worker, &state);

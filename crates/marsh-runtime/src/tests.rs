@@ -2080,3 +2080,50 @@ fn a_skills_folder_never_follows_a_link_in_the_home() {
         Path::new("/Users/alice/.agents/skills")
     ));
 }
+
+/// A retained child that has exited is reaped by the host's next attachment
+/// check; one still running is neither signalled nor waited for there, however
+/// slowly it would terminate.
+#[test]
+fn the_attachment_check_reaps_exited_children_without_signalling_or_waiting() {
+    struct Child {
+        exited: Arc<AtomicBool>,
+        terminated: Arc<AtomicBool>,
+    }
+    impl AttachedProcess for Child {
+        fn wait(&mut self) -> io::Result<i32> {
+            Ok(0)
+        }
+        fn try_wait(&mut self) -> io::Result<Option<i32>> {
+            Ok(self.exited.load(Ordering::SeqCst).then_some(0))
+        }
+        fn terminate(&mut self) -> io::Result<()> {
+            self.terminated.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(200));
+            Ok(())
+        }
+    }
+    let terminated = Arc::new(AtomicBool::new(false));
+    let exits = || Arc::new(AtomicBool::new(false));
+    let (gone, alive) = (exits(), exits());
+    for exited in [&gone, &alive, &alive] {
+        retain_for_reaping(Box::new(Child {
+            exited: Arc::clone(exited),
+            terminated: Arc::clone(&terminated),
+        }));
+    }
+    assert_eq!(retained_processes().len(), 3);
+    gone.store(true, Ordering::SeqCst);
+
+    let started = std::time::Instant::now();
+    process_owner::check_capacity().unwrap();
+    assert!(started.elapsed() < Duration::from_millis(150));
+    assert!(
+        !terminated.load(Ordering::SeqCst),
+        "the check signalled a child"
+    );
+    assert_eq!(retained_processes().len(), 2);
+    alive.store(true, Ordering::SeqCst);
+    process_owner::check_capacity().unwrap();
+    assert_eq!(retained_processes().len(), 0);
+}

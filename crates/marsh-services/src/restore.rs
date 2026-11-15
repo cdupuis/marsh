@@ -1181,8 +1181,19 @@ mod linux {
             snapshot: &OwnedFd,
             jobs: &[(String, VolumeSource, u64)],
         ) -> Vec<Option<String>> {
+            self.install_with(snapshot, jobs, !break_mode("restore-copy"))
+        }
+
+        /// [`Self::install`] with the copy method chosen: reflink clones, or
+        /// plain copies (the filesystem under a test cannot always reflink).
+        fn install_with(
+            &self,
+            snapshot: &OwnedFd,
+            jobs: &[(String, VolumeSource, u64)],
+            use_clone: bool,
+        ) -> Vec<Option<String>> {
             let mut outcome: Vec<Option<String>> = vec![None; jobs.len()];
-            let copier = Arc::new(Copier::new(!break_mode("restore-copy")));
+            let copier = Arc::new(Copier::new(use_clone));
             for _ in 0..self.config.workers.clamp(1, 16) {
                 let copier = Arc::clone(&copier);
                 std::thread::spawn(move || copier.worker());

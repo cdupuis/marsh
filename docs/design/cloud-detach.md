@@ -360,4 +360,7 @@ Where the built version differs from, or adds to, the sections above:
   `cloud`), not by the shell prompt.
 - **Collection timing.** At daemon start and every 2 minutes while a run is
   outstanding. `MARSH_CLOUD_DETACHED_RETENTION` (daemon environment)
-  overrides the 14-day retention, for testing.
+  overrides the 14-day retention, for testing. Local files are bounded: 256
+  MiB per output stream (the head is kept), kept patches until applied or
+  discarded (`MARSH_CLOUD_KEPT_PATCH_RETENTION` sets a limit), unowned `results`
+  diffs the retention period, `.delta` files no record names never, `.part` files 24 hours.

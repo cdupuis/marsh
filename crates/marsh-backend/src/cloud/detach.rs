@@ -21,7 +21,7 @@ use marsh_daemon::{
 use marsh_sbx::cloud::{CloudError, CloudSandboxId, CloudSbx};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
@@ -38,6 +38,19 @@ pub(super) const DEFAULT_TTL: Duration = Duration::from_hours(2);
 const COLLECT_INTERVAL: Duration = Duration::from_mins(2);
 /// How long an uncollected sandbox is kept (from the job's start).
 const RETENTION: Duration = Duration::from_hours(14 * 24);
+/// A kept patch is the only copy of a run's result (its sandbox is gone), so
+/// it stays until applied or discarded, unless this limit is configured
+/// (`MARSH_CLOUD_KEPT_PATCH_RETENTION`, in the daemon's environment).
+fn kept_patch_retention() -> Option<Duration> {
+    std::env::var("MARSH_CLOUD_KEPT_PATCH_RETENTION")
+        .ok()
+        .and_then(|text| super::duration(&text))
+}
+/// How long a half-fetched `.part` file may sit before it is removed.
+const PART_RETENTION: Duration = Duration::from_hours(24);
+/// The most of each output stream a run keeps on this Mac (the local jobs'
+/// `output_bytes`): later output is dropped here, not fetched.
+const OUTPUT_CAP: u64 = 256 << 20;
 /// INT, then KILL after this grace (`marsh cloud stop`).
 const STOP_GRACE: Duration = Duration::from_secs(10);
 /// A stopped (paused) sandbox starts on the next exec; allow for that.
@@ -206,6 +219,47 @@ impl Record {
             )));
         }
         Ok(record)
+    }
+
+    fn offset_mut(&mut self, stream: u8) -> &mut u64 {
+        if stream == 1 {
+            &mut self.stdout
+        } else {
+            &mut self.stderr
+        }
+    }
+
+    /// The stream's local file is full ([`OUTPUT_CAP`]): later output is
+    /// dropped, not fetched; the offset jumps to `end` and the run is marked
+    /// truncated. Whether it was full.
+    fn drop_if_full(&mut self, paths: &Paths, stream: u8, end: u64) -> bool {
+        let held = fs::metadata(paths.output(&self.job_id, stream)).map_or(0, |m| m.len());
+        if held < OUTPUT_CAP {
+            return false;
+        }
+        self.truncated = true;
+        *self.offset_mut(stream) = end;
+        true
+    }
+
+    /// Append one fetched chunk (`start` is where the helper's reply began;
+    /// `offset` what was asked for) up to [`OUTPUT_CAP`] bytes in all, and
+    /// move the stream's offset past it.
+    fn store_chunk(
+        &mut self,
+        paths: &Paths,
+        stream: u8,
+        offset: u64,
+        start: u64,
+        data: &[u8],
+    ) -> io::Result<()> {
+        if start > offset {
+            self.truncated = true;
+        }
+        let dropped = append_capped(&paths.output(&self.job_id, stream), data, OUTPUT_CAP)?;
+        self.truncated |= dropped;
+        *self.offset_mut(stream) = start.saturating_add(data.len() as u64);
+        Ok(())
     }
 
     pub(super) fn save(&self, paths: &Paths) -> Result<(), DaemonError> {
@@ -1086,6 +1140,9 @@ impl StockDaemonBackend {
                 if offset >= range.end {
                     break;
                 }
+                if record.drop_if_full(paths, stream, range.end) {
+                    break;
+                }
                 let offset_text = offset.to_string();
                 let stream_text = stream.to_string();
                 let Ok((step, bytes)) = small_control(
@@ -1111,23 +1168,11 @@ impl StockDaemonBackend {
                     return;
                 };
                 let data = &bytes[newline + 1..];
-                if start > offset {
-                    record.truncated = true;
-                }
-                let appended = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .mode(0o600)
-                    .open(paths.output(&record.job_id, stream))
-                    .and_then(|mut file| file.write_all(data).and_then(|()| file.sync_data()));
-                if appended.is_err() {
+                if record
+                    .store_chunk(paths, stream, offset, start, data)
+                    .is_err()
+                {
                     return;
-                }
-                let next = start + data.len() as u64;
-                if stream == 1 {
-                    record.stdout = next;
-                } else {
-                    record.stderr = next;
                 }
                 if data.is_empty() {
                     break;
@@ -1409,22 +1454,13 @@ impl StockDaemonBackend {
         let paths = self.detached_paths();
         let records = Record::all(&paths);
         // Settled records (and their output) are kept for the retention period.
-        for record in records.iter().filter(|record| record.settled) {
-            let finished = record.finished_unix_ms.unwrap_or(record.created_unix_ms);
-            if Duration::from_millis(now_ms().saturating_sub(finished)) > retention()
-                && record.state != "kept-as-patch"
-            {
-                for path in [
-                    paths.record(&record.job_id),
-                    paths.base(&record.job_id),
-                    paths.output(&record.job_id, 1),
-                    paths.output(&record.job_id, 2),
-                    paths.diff(&record.job_id),
-                ] {
-                    let _ = fs::remove_file(path);
-                }
-            }
-        }
+        sweep(
+            &paths,
+            &records,
+            now_ms(),
+            retention(),
+            kept_patch_retention(),
+        );
         let outstanding = records
             .iter()
             .filter(|record| !record.settled)
@@ -1730,7 +1766,9 @@ impl StockDaemonBackend {
         let job = record.job_id.clone();
         let job = job.as_str();
         let _ = fs::remove_file(paths.payload(job));
+        let _ = fs::remove_file(paths.results.join(format!("{job}.delta.part")));
         let _ = fs::remove_file(paths.diff(job));
+        let _ = fs::remove_file(paths.detached.join(format!("{job}.base.part")));
         if record.settled {
             if record.state == "kept-as-patch" {
                 record.state = "discarded".into();
@@ -1845,6 +1883,108 @@ struct Settle {
     execution: ExecutionOutcome,
     exit: i32,
     final_state: Option<JobState>,
+}
+
+/// Append `data` to `path` as far as `cap` bytes in all; whether any was
+/// dropped.
+fn append_capped(path: &Path, data: &[u8], cap: u64) -> io::Result<bool> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    let room = cap.saturating_sub(file.metadata()?.len());
+    let keep = usize::try_from(room).unwrap_or(usize::MAX).min(data.len());
+    file.write_all(&data[..keep])?;
+    file.sync_data()?;
+    Ok(keep < data.len())
+}
+
+/// Remove what has outlived its keep: a settled run's files after
+/// `retention` (a kept patch only after `kept`, if a limit is set), `.part`
+/// files after [`PART_RETENTION`], and diffs in `results` that no record
+/// file names after `retention`. Nothing whose record file exists is removed
+/// unless the record was read and says it expired: a record this build
+/// cannot read (another version, a read error) may still own the only copy
+/// of a result. A `.delta` without any record file is never removed here (it
+/// may be an attached return's kept patch, whose path the job's notes gave).
+fn sweep(
+    paths: &Paths,
+    records: &[Record],
+    now_ms: u64,
+    retention: Duration,
+    kept: Option<Duration>,
+) {
+    let age = |at_ms: u64| Duration::from_millis(now_ms.saturating_sub(at_ms));
+    for record in records {
+        let finished = record.finished_unix_ms.unwrap_or(record.created_unix_ms);
+        let limit = if record.state == "kept-as-patch" {
+            kept
+        } else {
+            Some(retention)
+        };
+        if record.settled && limit.is_some_and(|limit| age(finished) > limit) {
+            for path in [
+                paths.record(&record.job_id),
+                paths.base(&record.job_id),
+                paths.output(&record.job_id, 1),
+                paths.output(&record.job_id, 2),
+                paths.diff(&record.job_id),
+                paths.payload(&record.job_id),
+            ] {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    // Every record file that exists, readable or not, owns its results.
+    let recorded = fs::read_dir(&paths.detached)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".json").map(str::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    let Ok(entries) = fs::read_dir(&paths.results) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let job = name.split('.').next().unwrap_or_default();
+        let idle = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .unwrap_or_default();
+        let extension = Path::new(&name).extension().and_then(|ext| ext.to_str());
+        let remove = match extension {
+            Some("part") => idle > PART_RETENTION,
+            Some("diff") => !recorded.contains(job) && idle > retention,
+            _ => false,
+        };
+        if remove && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    // Half-fetched base files beside the records.
+    if let Ok(entries) = fs::read_dir(&paths.detached) {
+        for entry in entries.filter_map(Result::ok) {
+            let stale = Path::new(&entry.file_name())
+                .extension()
+                .is_some_and(|ext| ext == "part")
+                && entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|idle| idle > PART_RETENTION);
+            if stale {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 fn retention() -> Duration {
@@ -2232,6 +2372,187 @@ mod tests {
         );
         assert!(!applied.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(fs::read(dir.path().join("f")).unwrap(), b"local");
+    }
+
+    fn stored(paths: &Paths, job: &str, state: &str, settled: bool, finished_ms: u64) -> Record {
+        let record: Record = serde_json::from_value(serde_json::json!({
+            "version": RECORD_VERSION, "job_id": job, "cursor": 1, "sandbox_id": "x",
+            "sandbox_name": "marsh-x", "kit": false, "command": [], "cwd": "/p", "root": "/p",
+            "root_identity": [1, 2], "fork": false, "ttl_seconds": 1, "base_sha256": "",
+            "created_unix_ms": 1000, "state": state, "settled": settled,
+            "finished_unix_ms": finished_ms,
+        }))
+        .unwrap();
+        record.save(paths).unwrap();
+        for path in [
+            paths.base(job),
+            paths.output(job, 1),
+            paths.output(job, 2),
+            paths.payload(job),
+            paths.diff(job),
+        ] {
+            fs::write(path, b"x").unwrap();
+        }
+        record
+    }
+
+    /// C-03: a run's local output stops at the cap, with the drop reported;
+    /// settled runs, kept patches, half-fetched files and orphaned payloads
+    /// all leave the disk after their documented keep.
+    #[test]
+    fn output_is_capped_and_every_store_ages_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        assert!(!append_capped(&out, b"abcd", 6).unwrap());
+        assert!(append_capped(&out, b"efgh", 6).unwrap());
+        assert!(append_capped(&out, b"ijkl", 6).unwrap());
+        assert_eq!(fs::read(&out).unwrap(), b"abcdef");
+
+        let paths = Paths::new(dir.path());
+        fs::create_dir_all(&paths.detached).unwrap();
+        fs::create_dir_all(&paths.results).unwrap();
+        let day = 24 * 3600 * 1000_u64;
+        let (old_run, new_run, old_patch, new_patch) = (
+            "0000aaaa-0000-0000-0000-000000000001",
+            "0000aaaa-0000-0000-0000-000000000002",
+            "0000aaaa-0000-0000-0000-000000000003",
+            "0000aaaa-0000-0000-0000-000000000004",
+        );
+        let now = 200 * day;
+        let records = [
+            stored(&paths, old_run, "collected", true, now - 20 * day),
+            stored(&paths, new_run, "collected", true, now - 2 * day),
+            stored(&paths, old_patch, "kept-as-patch", true, now - 100 * day),
+            stored(&paths, new_patch, "kept-as-patch", true, now - 30 * day),
+        ];
+        let orphan = paths
+            .results
+            .join("0000bbbb-0000-0000-0000-000000000009.diff");
+        let fresh_orphan = paths
+            .results
+            .join("0000bbbb-0000-0000-0000-00000000000a.diff");
+        let stale_part = paths.results.join(format!("{new_run}.delta.part"));
+        for path in [&orphan, &fresh_orphan, &stale_part] {
+            fs::write(path, b"x").unwrap();
+        }
+        let ago = |days: u64| std::time::SystemTime::now() - Duration::from_secs(days * 24 * 3600);
+        for (path, age) in [(&orphan, 20), (&stale_part, 2)] {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(ago(age))
+                .unwrap();
+        }
+        sweep(
+            &paths,
+            &records,
+            now,
+            Duration::from_hours(14 * 24),
+            Some(Duration::from_hours(90 * 24)),
+        );
+        let gone = |path: PathBuf| !path.exists();
+        assert!(gone(paths.record(old_run)) && gone(paths.output(old_run, 1)));
+        assert!(paths.record(new_run).exists() && paths.output(new_run, 2).exists());
+        assert!(gone(paths.record(old_patch)) && gone(paths.payload(old_patch)));
+        assert!(paths.payload(new_patch).exists());
+        assert!(gone(orphan) && fresh_orphan.exists() && gone(stale_part));
+    }
+
+    /// The cap at its call sites: a full local file stops further fetching
+    /// (the offset jumps to the end, truncated), and a chunk that crosses the
+    /// cap is cut and reported.
+    #[test]
+    fn a_full_output_file_stops_fetching_and_a_chunk_across_the_cap_is_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        fs::create_dir_all(&paths.detached).unwrap();
+        fs::create_dir_all(&paths.results).unwrap();
+        let job = "0000aaaa-0000-0000-0000-000000000001";
+        let mut record = stored(&paths, job, "running", false, 0);
+        let file = paths.output(job, 1);
+        // Not full: nothing changes.
+        assert!(!record.drop_if_full(&paths, 1, 500));
+        assert!(!record.truncated);
+        // A chunk that crosses the cap is cut, and the offset moves past all of it.
+        let almost = OUTPUT_CAP - 2;
+        fs::File::create(&file).unwrap().set_len(almost).unwrap();
+        record
+            .store_chunk(&paths, 1, almost, almost, b"abcd")
+            .unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().len(), OUTPUT_CAP);
+        assert!(record.truncated);
+        assert_eq!(record.stdout, almost + 4);
+        // Full: the next fetch is skipped and the offset jumps to the end.
+        record.truncated = false;
+        assert!(record.drop_if_full(&paths, 1, 123_456_789));
+        assert!(record.truncated);
+        assert_eq!(record.stdout, 123_456_789);
+        // The other stream is its own file.
+        assert!(!record.drop_if_full(&paths, 2, 5));
+        assert_eq!(record.stderr, 0);
+    }
+
+    /// A kept patch is the only copy of a run's result: it is never swept by
+    /// default, never because its record cannot be read, and never as an
+    /// "orphan" while any record file names it.
+    #[test]
+    fn a_kept_patch_is_never_swept_by_age_or_because_its_record_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        fs::create_dir_all(&paths.detached).unwrap();
+        fs::create_dir_all(&paths.results).unwrap();
+        let day = 24 * 3600 * 1000_u64;
+        let now = 400 * day;
+        let (old, unreadable, bare) = (
+            "0000aaaa-0000-0000-0000-000000000001",
+            "0000aaaa-0000-0000-0000-000000000002",
+            "0000aaaa-0000-0000-0000-000000000003",
+        );
+        let kept = [stored(&paths, old, "kept-as-patch", true, now - 300 * day)];
+        // A record another build wrote (not loadable here), and its patch.
+        fs::write(paths.record(unreadable), b"{\"version\": 99}").unwrap();
+        fs::write(paths.payload(unreadable), b"patch").unwrap();
+        // A patch no record file names (an attached return's kept changes).
+        fs::write(paths.payload(bare), b"patch").unwrap();
+        let ancient = std::time::SystemTime::now() - Duration::from_hours(300 * 24);
+        for path in [
+            paths.payload(old),
+            paths.payload(unreadable),
+            paths.payload(bare),
+            paths.diff(unreadable),
+        ] {
+            fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap()
+                .set_modified(ancient)
+                .unwrap();
+        }
+        let two_weeks = Duration::from_hours(14 * 24);
+        // Unlimited by default.
+        sweep(&paths, &kept, now, two_weeks, None);
+        for path in [
+            paths.payload(old),
+            paths.payload(unreadable),
+            paths.payload(bare),
+        ] {
+            assert!(path.exists(), "{}", path.display());
+        }
+        // The diff of a patch whose record cannot be read stays too.
+        assert!(paths.diff(unreadable).exists());
+        // A configured limit applies to a readable record only.
+        sweep(
+            &paths,
+            &kept,
+            now,
+            two_weeks,
+            Some(Duration::from_hours(90 * 24)),
+        );
+        assert!(!paths.payload(old).exists());
+        assert!(paths.payload(unreadable).exists() && paths.payload(bare).exists());
     }
 
     #[test]

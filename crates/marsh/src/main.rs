@@ -1834,6 +1834,12 @@ fn attach_detached(
             && !pending
         {
             eprintln!("{}", settled_line(&view));
+            if view.output_truncated {
+                eprintln!(
+                    "marsh: cloud job {}: some output is missing (the sandbox keeps the newest 256 MiB of a stream and this Mac the first 256 MiB)",
+                    view.cursor
+                );
+            }
             if view.state == "kept-as-patch" {
                 eprintln!("marsh: review it with: marsh cloud diff {}", view.cursor);
             }

@@ -59,7 +59,8 @@ pub struct DetachedView {
     /// The job is settled: nothing more will arrive.
     #[serde(default)]
     pub settled: bool,
-    /// The run's oldest output was dropped in the sandbox (its spool cap).
+    /// Some output is missing here: the oldest was dropped in the sandbox (its
+    /// spool cap), or the newest after this Mac's per-stream cap was reached.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub output_truncated: bool,
 }

@@ -1570,6 +1570,56 @@ fn record_gives_back_a_refused_create_and_claims_a_nameless_one() {
     assert!(h.svc.ledger.has_volume("lane-a", "anon-1"), "{body}");
 }
 
+/// A reconcile (a prune, or the periodic pass) that runs while a volume create
+/// of unknown outcome is still pending must not drop the sender's record of
+/// the volume (older than the 30 s grace, absent from the engine's list): when
+/// the create lands inside the fence it has its owner. After the fence expired
+/// the normal rule applies again.
+#[test]
+fn reconcile_keeps_the_owner_of_a_create_that_may_still_land() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("reconcilecreatew4", true, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(250);
+        cfg.delete_fence = SHORT_FENCE;
+        // An established record (outside reconcile's 30 s grace) for a volume
+        // the engine does not have.
+        std::fs::write(
+            &cfg.paths.ledger,
+            r#"{"containers":{},"networks":{},"volumes":{"data":{"scope":"lane-a","attempt":"att1","created":1}},"execs":{},"pins":{},"scope_networks":{}}"#,
+        )
+        .unwrap();
+    });
+    assert!(
+        !h.svc.ledger.quarantined(),
+        "the seeded ledger did not parse"
+    );
+    assert!(h.svc.ledger.has_volume("lane-a", "data"));
+    let sock_a = h.serve(&h.auth);
+    let create = r#"{"Image":"busybox","HostConfig":{"Binds":["data:/x"]}}"#;
+    engine.hold_next_create.store(true, Ordering::SeqCst);
+    let (status, _) = call(&sock_a, "POST", "/containers/create", Some(create));
+    assert!(status >= 500, "{status}");
+    assert!(h.svc.volume_fenced("data"));
+    h.svc.reconcile();
+    assert!(
+        h.svc.ledger.has_volume("lane-a", "data"),
+        "reconcile dropped the owner"
+    );
+    engine.create_release.store(true, Ordering::SeqCst);
+    assert!(wait_for(Duration::from_secs(5), || engine
+        .held_create_done
+        .load(Ordering::SeqCst)));
+    assert!(engine.store.lock().unwrap().contains_key("data"));
+    h.svc.reconcile();
+    assert!(h.svc.ledger.has_volume("lane-a", "data"));
+    // Once the fence has expired, an absent volume's record goes as usual.
+    engine.store.lock().unwrap().remove("data");
+    std::thread::sleep(SHORT_FENCE + Duration::from_millis(300));
+    h.svc.reconcile();
+    assert!(!h.svc.ledger.has_volume("lane-a", "data"));
+}
+
 fn raw_exchange(sock: &Path, request: &str, keep_reading_for: Duration) -> String {
     let mut c = UnixStream::connect(sock).unwrap();
     c.set_read_timeout(Some(keep_reading_for)).unwrap();

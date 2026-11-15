@@ -804,11 +804,14 @@ impl Ledger {
 
     /// Drop records of objects the engine no longer has (auto-removed
     /// containers, prunes, a wiped pool) and return pins nothing references.
+    /// `pending_volumes` are names the engine may still create (a create of
+    /// unknown outcome): their records are kept.
     pub fn reconcile(
         &self,
         containers: &[String],
         networks: &[String],
         volumes: &[String],
+        pending_volumes: &[String],
         now_secs: u64,
     ) -> LedgerResult<Vec<(String, PinRec)>> {
         self.mutate(|s| {
@@ -845,8 +848,12 @@ impl Ledger {
             let (n0, v0) = (s.networks.len(), s.volumes.len());
             s.networks
                 .retain(|id, n| networks.contains(id) || now_secs.saturating_sub(n.created) < 30);
+            // A volume the engine does not list yet may be one whose create is
+            // still pending: its record stays (`pending_volumes`) whatever its age.
             s.volumes.retain(|name, v| {
-                volumes.contains(name) || now_secs.saturating_sub(v.created) < 30
+                volumes.contains(name)
+                    || pending_volumes.contains(name)
+                    || now_secs.saturating_sub(v.created) < 30
             });
             changed |= n0 != s.networks.len() || v0 != s.volumes.len();
             let live: Vec<String> = s.containers.values().flat_map(|c| c.pins.clone()).collect();

@@ -201,7 +201,10 @@ never sent (the engine could not be dialed) fences nothing
 (`a_delete_that_was_never_sent_fences_nothing`). The fence is in memory only: an
 agent restart forgets it. It is time-based, so a delete that lands after the fence
 expired is not stopped; the engine gives no way to cancel or confirm a request it
-has accepted. An engine error on a delete (409, 5xx) is an answer: the owner keeps
+has accepted. A reconcile (a prune or the periodic pass) keeps the ledger record of a volume
+whose create is of unknown outcome while the fence time has not passed, whatever
+its age (`reconcile_keeps_the_owner_of_a_create_that_may_still_land`); after that
+the usual rule drops a record the engine does not list. An engine error on a delete (409, 5xx) is an answer: the owner keeps
 the volume and the reply is passed on. The reply to a delete is the engine's
 (status line, headers, body; keep-alive when the client asked for it). Every
 engine call the agent makes itself ends at one absolute deadline, `up_progress` (30 s)

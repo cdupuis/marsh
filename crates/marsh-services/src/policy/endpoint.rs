@@ -153,6 +153,9 @@ pub struct Services {
     tag_res: Mutex<TagRes>,
     /// Volume names with a delete of unknown outcome, and when it was sent.
     fenced: Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// Volume names with a CREATE of unknown outcome, and when it was sent: a
+    /// reconcile keeps their ledger records until the same time has passed.
+    pending_creates: Mutex<HashMap<String, std::time::Instant>>,
     /// A pin is mounted and then recorded; both happen under the read side, and
     /// the sweep of unrecorded pins runs under the write side, so it can never
     /// see the first without the second.
@@ -280,6 +283,7 @@ impl Services {
             vol_lock: Mutex::new(()),
             tag_res: Mutex::new(HashMap::new()),
             fenced: Mutex::default(),
+            pending_creates: Mutex::default(),
             pin_gate: RwLock::new(()),
         }))
     }
@@ -552,6 +556,17 @@ impl Services {
         fenced.get(name).map(|(workspace, _)| workspace.clone())
     }
 
+    /// Names of volumes whose create may still land (within the fence time).
+    fn pending_create_names(&self) -> Vec<String> {
+        let mut pending = self
+            .pending_creates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wait = self.cfg.delete_fence;
+        pending.retain(|_, sent| sent.elapsed() < wait);
+        pending.keys().cloned().collect()
+    }
+
     fn fence_volume(&self, name: &str, workspace: &str) {
         self.fenced
             .lock()
@@ -584,6 +599,10 @@ impl Services {
             Err(e) => {
                 if let Some(name) = name {
                     self.fence_volume(name, workspace);
+                    self.pending_creates
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(name.to_owned(), std::time::Instant::now());
                 }
                 self.log(&format!("create of volume {name:?} did not complete: {e}"));
                 CreateOutcome::Unknown(e)
@@ -791,7 +810,10 @@ impl Services {
         ) else {
             return;
         };
-        match self.ledger.reconcile(&cs, &ns, &vs, now()) {
+        match self
+            .ledger
+            .reconcile(&cs, &ns, &vs, &self.pending_create_names(), now())
+        {
             Ok(freed) => self.unpin_freed(freed),
             Err(e) => self.log(&format!("reconcile: {e}")),
         }

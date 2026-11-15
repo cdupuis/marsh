@@ -99,7 +99,7 @@ operating system's "permission denied" and a gap that names the stack.
 | `restore-ignore-blockers` | stacks with fork-unsafe features are attempted | RST-10 c2 (the gaps no longer name them) |
 | `slow-restore` | prepare waits 1.5 s | PERF-03 measurement control |
 | `restore-unfiltered` (alias `restore-raw-engine`) | the compose client runs as root on the raw production socket | SEC-13 c1 (a privileged container exists) |
-| `restore-client-unconfined` | the client is unprivileged but not confined | SEC-13 c2 (the file outside the lane is read) |
+| `restore-client-unconfined` | the client is unprivileged but not confined | SEC-13 c2 (the file outside the lane is read); VM-free in CI: the unit test `sec13_a_confined_client_reaches_only_its_lane_and_scratch` |
 | `hold-restore-before-install`, `hold-restore-volumes-created`, `hold-restore-before-up`, `hold-restore-client-running` | harness barriers (the last waits in the helper, after it has dropped privileges) | SEC-13 c4 |
 
 ## Dropping a workspace (C3)

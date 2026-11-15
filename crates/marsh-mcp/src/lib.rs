@@ -582,6 +582,15 @@ impl HostConfig {
     }
 }
 
+/// Where a test can change the world while an identity is captured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureStage {
+    /// The executable is open and checked; hashing has not started.
+    Opened,
+    /// Hashed and re-`fstat`ed; the path has not been looked at again.
+    Hashed,
+}
+
 impl ExecutableIdentity {
     fn capture(path: &Path) -> Result<Self, String> {
         Self::capture_with_parent_policy(path, true)
@@ -595,20 +604,51 @@ impl ExecutableIdentity {
         path: &Path,
         require_trusted_parents: bool,
     ) -> Result<Self, String> {
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|error| format!("cannot inspect executable identity: {error}"))?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            return Err(format!(
+        Self::capture_observed(path, require_trusted_parents, &mut |_| {})
+    }
+
+    /// Opens the executable once, without following a symlink, and takes the
+    /// metadata, the checks and the hash from that descriptor, so they describe
+    /// one file. `hook` runs at each point a swap of the path could land (see [`CaptureStage`]).
+    fn capture_observed(
+        path: &Path,
+        require_trusted_parents: bool,
+        hook: &mut dyn FnMut(CaptureStage),
+    ) -> Result<Self, String> {
+        let not_regular = || {
+            format!(
                 "configured executable is no longer a regular file: {}",
                 path.display()
-            ));
+            )
+        };
+        // NONBLOCK: opening a FIFO for reading must not wait for a writer; the
+        // descriptor is checked to be a regular file before anything is read.
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK)
+                    .bits()
+                    .cast_signed(),
+            )
+            .open(path)
+            .map_err(|error| {
+                if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+                    not_regular()
+                } else {
+                    format!("cannot open executable for verification: {error}")
+                }
+            })?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot inspect executable identity: {error}"))?;
+        if !metadata.file_type().is_file() {
+            return Err(not_regular());
         }
         validate_executable_metadata(path, &metadata, "configured executable")?;
         if require_trusted_parents {
             validate_trusted_parent_chain(path)?;
         }
-        let mut file = fs::File::open(path)
-            .map_err(|error| format!("cannot open executable for verification: {error}"))?;
+        hook(CaptureStage::Opened);
         let mut digest = Sha256::new();
         let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
         loop {
@@ -619,6 +659,36 @@ impl ExecutableIdentity {
                 break;
             }
             digest.update(&buffer[..count]);
+        }
+        let after = file
+            .metadata()
+            .map_err(|error| format!("cannot recheck executable identity: {error}"))?;
+        hook(CaptureStage::Hashed);
+        let named = fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot recheck executable path: {error}"))?;
+        let same = |left: &fs::Metadata, right: &fs::Metadata| {
+            (left.dev(), left.ino()) == (right.dev(), right.ino())
+        };
+        if !same(&metadata, &named)
+            || !same(&metadata, &after)
+            || (
+                metadata.size(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            ) != (
+                after.size(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+            )
+        {
+            return Err(format!(
+                "executable was replaced or modified while it was verified: {}",
+                path.display()
+            ));
         }
         Ok(Self {
             device: metadata.dev(),
@@ -4633,6 +4703,131 @@ mod tests {
         for pinned in ["MARSH_HOME", "MARSH_SBX", "USER", "LOGNAME", "PATH"] {
             assert!(names.iter().any(|name| name == pinned), "{pinned} missing");
         }
+    }
+
+    /// The identity pins one file: the bytes hashed and the inode, mode and
+    /// times recorded come from the same object, whatever replaces the path
+    /// while it is being verified.
+    #[test]
+    fn an_executable_identity_never_mixes_two_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tool");
+        let other = root.path().join("other");
+        executable(&path, "#!/bin/sh\necho original\n");
+        executable(&other, "#!/bin/sh\necho replacement, longer\n");
+        let digest = |file: &Path| -> [u8; 32] { Sha256::digest(fs::read(file).unwrap()).into() };
+        let (original_hash, replacement_hash) = (digest(&path), digest(&other));
+        let original_inode = fs::metadata(&path).unwrap().ino();
+        let replacement_inode = fs::metadata(&other).unwrap().ino();
+
+        let result = ExecutableIdentity::capture_observed(&path, false, &mut |stage| {
+            if stage == CaptureStage::Opened {
+                fs::rename(&other, &path).unwrap();
+            }
+        });
+
+        // The path no longer names the file that was hashed: fail closed, never
+        // a half-and-half identity.
+        let error = result.expect_err("a replaced path must fail the check");
+        assert!(error.contains("replaced or modified"), "{error}");
+        assert_ne!(original_inode, replacement_inode);
+        assert_ne!(original_hash, replacement_hash);
+    }
+
+    /// A swap after the post-hash `fstat`: the opened file is untouched (same
+    /// inode, same ctime), so only the path-versus-descriptor comparison can
+    /// see that the path now names something else.
+    #[test]
+    fn a_path_swapped_after_the_last_descriptor_check_fails_the_check() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tool");
+        let other = root.path().join("other");
+        executable(&path, "#!/bin/sh\necho original\n");
+        executable(&other, "#!/bin/sh\necho replacement\n");
+        let error = ExecutableIdentity::capture_observed(&path, false, &mut |stage| {
+            if stage == CaptureStage::Hashed {
+                fs::rename(&other, &path).unwrap();
+            }
+        })
+        .expect_err("the path no longer names the hashed file");
+        assert!(error.contains("replaced or modified"), "{error}");
+    }
+
+    /// Renaming an ancestor directory and moving another in its place changes
+    /// what the path names without touching the opened file's metadata.
+    #[test]
+    fn an_ancestor_directory_swapped_while_verified_fails_the_check() {
+        for swap_at in [CaptureStage::Opened, CaptureStage::Hashed] {
+            let root = tempfile::tempdir().unwrap();
+            let (live, spare) = (root.path().join("live"), root.path().join("spare"));
+            fs::create_dir(&live).unwrap();
+            fs::create_dir(&spare).unwrap();
+            executable(&live.join("tool"), "#!/bin/sh\necho original\n");
+            executable(&spare.join("tool"), "#!/bin/sh\necho replacement\n");
+            let path = live.join("tool");
+            let error = ExecutableIdentity::capture_observed(&path, false, &mut |stage| {
+                if stage == swap_at {
+                    fs::rename(&live, root.path().join("moved")).unwrap();
+                    fs::rename(&spare, &live).unwrap();
+                }
+            })
+            .expect_err("the path now names another file");
+            assert!(
+                error.contains("replaced or modified"),
+                "{swap_at:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_executable_changed_in_place_while_verified_fails_the_check() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tool");
+        executable(&path, "#!/bin/sh\necho original\n");
+        let error = ExecutableIdentity::capture_observed(&path, false, &mut |stage| {
+            if stage == CaptureStage::Opened {
+                let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+                file.write_all(b"# appended\n").unwrap();
+            }
+        })
+        .expect_err("a file that changes while hashed must fail the check");
+        assert!(error.contains("replaced or modified"), "{error}");
+
+        // Untouched, the identity is the file's own.
+        let identity = ExecutableIdentity::capture_observed(&path, false, &mut |_| {}).unwrap();
+        assert_eq!(identity.inode, fs::metadata(&path).unwrap().ino());
+        assert_eq!(
+            identity.sha256,
+            <[u8; 32]>::from(Sha256::digest(fs::read(&path).unwrap()))
+        );
+    }
+
+    /// A pinned executable replaced by a FIFO is refused at once; opening it
+    /// for reading must not wait for a writer.
+    #[test]
+    fn a_fifo_in_place_of_a_pinned_executable_is_refused_not_waited_on() {
+        let (_root, config) = fixture();
+        fs::remove_file(&config.marsh).unwrap();
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&config.marsh)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (done, finished) = std::sync::mpsc::channel();
+        let checking = config.clone();
+        let worker = std::thread::spawn(move || {
+            let _ = done.send(checking.validate_host_executables());
+        });
+        let result = finished.recv_timeout(Duration::from_secs(10));
+        if result.is_err() {
+            // Release a blocked open so the thread ends, then fail.
+            let _ = fs::OpenOptions::new().write(true).open(&config.marsh);
+        }
+        worker.join().unwrap();
+        let error = result
+            .expect("validation waited for a writer on a FIFO")
+            .expect_err("a FIFO is not the pinned executable");
+        assert!(error.contains("regular file"), "{error}");
     }
 
     #[tokio::test]

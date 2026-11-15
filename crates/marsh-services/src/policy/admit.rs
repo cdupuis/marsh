@@ -123,6 +123,8 @@ pub struct Admitted {
     /// The client's JSON bytes, set by the endpoint (the `filter-forward-original-bytes`
     /// defect forwards them).
     pub client_body: Option<Vec<u8>>,
+    /// Image tags this request holds; recorded on success, released on drop.
+    pub tags: Option<super::TagHold>,
 }
 
 struct Q<'a>(&'a [(String, String)]);
@@ -638,6 +640,7 @@ pub fn admit(
         post: Post::None,
         raw_body: None,
         client_body: None,
+        tags: None,
     };
     let p = |i: usize| m.params.get(i).map_or("", String::as_str);
     let scope_filters =
@@ -984,6 +987,31 @@ pub fn admit(
             }
             q.token("tag", 128)?;
             q.token("platform", 64)?;
+            // The engine drops one trailing colon, then pulls every tag when no tag
+            // is named, and takes a digest from `fromImage` or from `tag` (the Go
+            // SDK sends `busybox@sha256:..` as `fromImage=busybox&tag=sha256:..`).
+            let repo = img.strip_suffix(':').unwrap_or(img);
+            let tag = q.get("tag").filter(|t| !t.is_empty());
+            let digest_in_tag = tag.is_some_and(|t| {
+                t.split_once(':').is_some_and(|(algo, hex)| {
+                    !algo.is_empty()
+                        && algo
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                        && hex.len() >= 32
+                        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            });
+            if !repo.contains('@') && !digest_in_tag {
+                let named =
+                    tag.is_some() || repo.rfind(':').is_some_and(|i| !repo[i..].contains('/'));
+                if !named {
+                    return Err(Refusal::forbid(
+                        "pulling every tag of a repository is not available; name a tag",
+                    ));
+                }
+                a.tags = env.reserve_pull(&[canonical_tag(repo, tag)?])?;
+            }
             a.path = mk_path(m, &["images", "create"]);
             a.query = q.pass(&["fromImage", "tag", "platform"]);
         }
@@ -1025,6 +1053,7 @@ pub fn admit(
             reserved_repo(repo)?;
             q.token("repo", 255)?;
             q.token("tag", 128)?;
+            a.tags = env.reserve_tags(&[canonical_tag(repo, q.get("tag"))?], Some(p(0)))?;
             a.path = format!(
                 "{}/images/{}/tag",
                 m.version
@@ -1038,6 +1067,8 @@ pub fn admit(
             q.only(&["force", "noprune"])?;
             q.bools(&["force", "noprune"])?;
             image_name_ok(p(0))?;
+            let grant = env.reserve_delete(p(0))?;
+            a.tags = grant.hold;
             a.path = format!(
                 "{}/images/{}",
                 m.version
@@ -1046,6 +1077,13 @@ pub fn admit(
                 p(0)
             );
             a.query = q.pass(&["force", "noprune"]);
+            if !grant.by_name {
+                // Never forced: the engine then refuses to remove an image that
+                // has several tags, however they got there, and only removes one
+                // whose last (or only) tag was checked. `docker rmi -f <id>`
+                // becomes `docker rmi <id>`; remove an image's tags by name.
+                a.query.retain(|(k, _)| k != "force");
+            }
         }
         Kind::Commit => {
             q.only(&["container", "repo", "tag", "comment", "author", "pause"])?;
@@ -1080,6 +1118,11 @@ pub fn admit(
             a.query.push(("container".into(), id));
             a.body = ReqBody::Json(cfg.to_bytes());
             a.content_type = Some("application/json".into());
+            if let Some(repo) = q.get("repo") {
+                // Under the workspace's own namespace, and recorded as its own
+                // so that no other workspace can move the tag by `tag` or `build`.
+                a.tags = env.reserve_tags(&[canonical_tag(repo, q.get("tag"))?], None)?;
+            }
         }
         Kind::Build => build(&q, m, head, env, &mut a)?,
         Kind::Session => {
@@ -1315,7 +1358,10 @@ const MOBY_ATTRS: [&str; 9] = [
 /// `outputs` is a closed schema: a list of `{"Type":"moby","Attrs":{..}}`, every
 /// key spelled exactly, every attribute listed. The text that goes upstream is
 /// rebuilt from what was validated.
-fn canonical_outputs(raw: &str) -> Result<String, Refusal> {
+///
+/// Also returns the image names the output would create (the `name` attribute is
+/// a comma-separated list), for the caller to check like any other tag.
+fn canonical_outputs(raw: &str) -> Result<(String, Vec<String>), Refusal> {
     let bad = |m: &str| Refusal::forbid(format!("outputs: {m}"));
     let j = parse(raw.as_bytes()).map_err(|e| Refusal::forbid(format!("outputs: {e}")))?;
     let list = match &j {
@@ -1334,9 +1380,10 @@ fn canonical_outputs(raw: &str) -> Result<String, Refusal> {
                 return Err(bad("only the moby exporter is allowed"));
             }
         }
-        return Ok(raw.to_string());
+        return Ok((raw.to_string(), Vec::new()));
     }
     let mut out = Vec::new();
+    let mut names = Vec::new();
     for item in &list {
         let Json::Obj(fields) = item else {
             return Err(bad("each output must be an object"));
@@ -1358,6 +1405,9 @@ fn canonical_outputs(raw: &str) -> Result<String, Refusal> {
                     let Some(v) = v.as_str() else {
                         return Err(bad("exporter attributes are strings"));
                     };
+                    if k == "name" {
+                        names.extend(v.split(',').filter(|n| !n.is_empty()).map(str::to_owned));
+                    }
                     attrs.push((k.clone(), string(v)));
                 }
             }
@@ -1368,7 +1418,53 @@ fn canonical_outputs(raw: &str) -> Result<String, Refusal> {
             ("Attrs".into(), Json::Obj(attrs)),
         ]));
     }
-    Ok(String::from_utf8_lossy(&Json::Arr(out).to_bytes()).into_owned())
+    let text = String::from_utf8_lossy(&Json::Arr(out).to_bytes()).into_owned();
+    Ok((text, names))
+}
+
+/// The one spelling an image tag is owned under: `repo:tag` with the default
+/// registry and `library/` prefixes dropped, so `postgres`, `postgres:latest`
+/// and `docker.io/library/postgres:latest` are the same tag. It is also put
+/// into a request path of the agent's own, so only plain name characters pass.
+pub(super) fn canonical_tag(repo: &str, tag: Option<&str>) -> Result<String, Refusal> {
+    let bad = || Refusal::forbid("invalid image tag");
+    let plain = |s: &str, extra: &[u8]| {
+        s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b) || extra.contains(&b))
+    };
+    if repo.is_empty() || repo.len() > 255 || !plain(repo, b"/:") {
+        return Err(bad());
+    }
+    let (name, in_repo) = match repo.rfind(':') {
+        Some(i) if !repo[i..].contains('/') => (&repo[..i], Some(&repo[i + 1..])),
+        _ => (repo, None),
+    };
+    let tag = tag
+        .filter(|t| !t.is_empty())
+        .or(in_repo)
+        .unwrap_or("latest");
+    if tag.is_empty() || tag.len() > 128 || tag.starts_with(['.', '-']) || !plain(tag, b"") {
+        return Err(bad());
+    }
+    let mut name = name.to_ascii_lowercase();
+    for host in ["docker.io/", "index.docker.io/", "registry-1.docker.io/"] {
+        if let Some(rest) = name.strip_prefix(host) {
+            name = rest.to_owned();
+            break;
+        }
+    }
+    if let Some(rest) = name.strip_prefix("library/")
+        && !rest.contains('/')
+    {
+        name = rest.to_owned();
+    }
+    if name
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(bad());
+    }
+    Ok(format!("{name}:{tag}"))
 }
 
 fn reserved_repo(n: &str) -> Result<(), Refusal> {
@@ -1564,11 +1660,13 @@ fn build(
             }
         }
     }
+    let mut tags = Vec::new();
     for t in m.query.iter().filter(|(k, _)| k == "t") {
         if t.1.len() > 255 {
             return Err(Refusal::forbid("invalid tag"));
         }
         reserved_repo(&t.1)?;
+        tags.push(canonical_tag(&t.1, None)?);
     }
     if let Some(l) = q.get("labels") {
         let j = parse(l.as_bytes()).map_err(|e| Refusal::forbid(format!("labels: {e}")))?;
@@ -1591,7 +1689,14 @@ fn build(
         check(&Ty::Arr(&Ty::Str), &j, "cachefrom").map_err(schema_err)?;
     }
     let outputs = match q.get("outputs") {
-        Some(o) => Some(canonical_outputs(o)?),
+        Some(o) => {
+            let (text, names) = canonical_outputs(o)?;
+            for name in names {
+                reserved_repo(&name)?;
+                tags.push(canonical_tag(&name, None)?);
+            }
+            Some(text)
+        }
         None => None,
     };
     if let Some(x) = q.get("extrahosts")
@@ -1611,5 +1716,9 @@ fn build(
     }
     a.body = ReqBody::Stream(head.framing);
     a.content_type = Some(stream_content_type(head)?);
+    // Last, so that a request refused above leaves no claim behind.
+    tags.sort();
+    tags.dedup();
+    a.tags = env.reserve_tags(&tags, None)?;
     Ok(())
 }

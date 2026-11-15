@@ -159,6 +159,106 @@ Network create takes no options. `docker commit` may only name a repository unde
 schema (the `moby` exporter; local attributes only; no `push`), rebuilt before
 it is forwarded.
 
+**Image tags have an owner, for the REST routes only (DA1-02 is partly fixed).**
+Every name a REST request would give an image is reserved first, in one spelling
+(`repo:tag`, the default registry and `library/` dropped; a `tag` parameter replaces
+a `:tag` in `repo`): `POST /images/<id>/tag`, each build `t`, each name of a
+build's `outputs` (a comma-separated list, also checked for the reserved
+`marsh`/`nf-` names), and a commit's repository. A pull is refused over a tag
+another scope owns and held for its duration (a pull with no tag, which would pull
+every tag of the repository, is refused, with or without a trailing colon; a digest
+pull, whether `fromImage=name@sha256:..` or the Go SDK's `fromImage=name&tag=sha256:..`,
+moves no tag and is not held). A delete is refused when it would remove a tag another
+scope owns or is making, or a pulled image's tag, and the names it removes are held
+(recording nothing) until the engine has finished, an absent requested name included.
+A pull of a name another scope's delete holds is refused, and so is a claim; pulls share
+a name with other pulls, and deletes with other deletes. A delete that is not of one of
+the image's own tags (an ID, short or full, or a digest) also holds the image by its ID,
+and `docker tag` holds its source image the same way (traced from the engine's source, not run against Docker), so a tag put on an image
+while an ID delete of it runs, and an ID delete while such a tag is made, refuse each
+other; the ID is the one the engine's inspect reports, taken under the lock.
+**An ID, short ID or digest delete is never forced** (`DeleteGrant::by_name`; the `force`
+parameter is dropped before the request goes upstream). "By name" is decided the way the
+engine decides: the engine first checks whether the reference is a prefix of the image's
+ID, and then it is an ID delete even if it is also a tag name (a tag named like an ID
+prefix, which any workspace can make with `docker tag`), so such a reference is treated as
+an ID delete here too, as is a name absent at the inspect (the engine may have an image
+under it by the time it runs). A tag can reach the image during the engine call by paths
+that name no source image (a cached build, a commit, a pull), which the hold cannot see.
+Because the delete is not forced, the engine's own check refuses (409, "referenced in
+multiple repositories") to remove an image that has gained a second tag, and removes one
+only when its single tag, or none, is what was checked, so no alias is taken away from
+its owner and no name freed for takeover. This is the engine's check, not an atomic
+step of marsh's: on the classic image store a few microseconds remain between the
+engine's conflict check and its removal of the references; the containerd store, which a
+fresh Docker 29 data root uses and so the one this engine runs, deletes only the
+references it saw in a snapshot and has no such window. (Traced from Docker's source, not
+run.) A delete by one of the image's own tag names keeps `force`: it untags only that name
+(on both stores), and the engine removes the image only when that was its last reference.
+Behaviour change: `docker rmi -f <id>` acts as `docker rmi <id>`, which includes the
+common cleanup `docker rmi -f $(docker images -q)` (it prints IDs): every image with several
+tags, or used by a stopped container, now fails with the engine's 409; remove such images by
+tag name (`docker rmi name1 name2`). An untagged image is deleted by ID as before, unforced.
+Compose is not affected: it never sends `force`, removes tagged images by name and dangling
+ones by ID (from Compose's source).
+A reference that is one of the image's tags untags only that name (so a scope may remove
+its own alias of a pulled image); any other reference removes the image, so every tag it
+has is checked.
+
+- **Rule** (`Env::reserve_tags`, `ledger::tag_claim`). A scope may create a tag no
+  image has, or move its own. It is refused a tag another scope created whose
+  image is there, a pulled image's tag (the image has registry digests), and a
+  name another scope's request is making or pulling right now (pulls do not block
+  other pulls). A record whose image is
+  gone holds nothing, so `docker rmi` frees the name at once. A locally built image
+  no record covers (its scope was dropped, or it predates the ledger) is adopted.
+- **Lifecycle.** The reservation lives in memory while the request runs (all names
+  or none; dropping the request's hold releases it, however it ended, and a name is
+  held until every request of the workspace for it has ended). The creator is
+  recorded as soon as the engine answers 2xx, whether or not the client is still
+  there to read the answer, so a refused or failed request leaves no record and a
+  successful tag keeps its owner when the client leaves. Caveats: a build whose
+  error is inside a 200 stream, or whose client left, records a name whose image
+  never appears (the next claimant takes the name, as the image is gone); and if the
+  ledger cannot be written at that moment (a failing disk) the tag stays unrecorded
+  and a later claimant adopts the local image. Capacity is decided with the
+  reservation, under one lock: records plus the new names in flight (this request's
+  included) never exceed `MAX_TAGS` (8192). Records go when their scope is dropped
+  (`forget_scope`), and when the engine no longer has the image, at the reconcile
+  pass and when the table is full; a record of an image that is there, or of a name
+  in flight, is never dropped, and a request that still would not fit is refused.
+  The lock covers one engine inspect per name (a multi-name build inspects each),
+  at most `up_request`'s 30 s progress timeout per call when the engine hangs; every
+  tag claim, pull, delete and request end waits on it meanwhile.
+- **Not covered.** The default `docker build -t` and `docker buildx build -t` send no
+  `POST /build`: they use `/grpc` and `/session` only (recorded e3 traffic,
+  `e3/corpus/cli.jsonl`), and the tag names are inside the opaque BuildKit solve.
+  Until `/grpc` is gated (DA1-04), a lane can still build over another workspace's
+  tag that way. A REST `/build` (the legacy builder, `DOCKER_BUILDKIT=0`, or a
+  hand-made call) is covered. A scope can also create a name nobody has yet and
+  build it first (the rule above).
+- Names are not forced under `<workspace>/` (that would refuse `docker build -t app`
+  and Compose's default names); the cost is that two workspaces cannot both build the
+  same tag over REST, such as an `image:` plus `build:` stack.
+
+Unit and endpoint tests: `every_path_that_names_an_image_*`,
+`one_workspace_cannot_move_a_tag_*`, `a_foreign_pull_is_refused`,
+`a_pull_of_every_tag_is_refused`, `an_active_pull_keeps_its_name_but_not_against_pulls`,
+`a_foreign_delete_is_refused`, `deleting_your_own_alias_of_a_pulled_image_is_allowed`,
+`a_client_that_disconnects_keeps_the_ownership_of_its_tag`,
+`requests_in_flight_reserve_capacity_in_the_tag_table`,
+`a_digest_pull_in_either_encoding_is_allowed`, `a_short_image_id_cannot_delete_a_foreign_tag`,
+`a_delete_holds_its_name_until_the_engine_finishes`, `a_pull_waits_for_another_workspaces_delete_of_its_name`,
+`a_delete_of_an_absent_name_waits_for_a_build_of_it`, `a_tag_cannot_be_put_on_an_image_while_it_is_being_deleted_by_id`,
+`an_id_delete_waits_for_a_tag_being_put_on_the_image`,
+`an_id_delete_is_never_forced_and_a_named_one_keeps_force`,
+`a_cached_build_alias_survives_a_forced_id_delete_and_cannot_be_taken`,
+`an_untagged_image_is_deleted_by_id_under_its_image_hold`,
+`a_tag_named_like_the_id_prefix_cannot_force_delete_the_image`, `an_absent_id_looking_name_is_not_forced`,
+`reconcile_sheds_stale_tag_records_but_not_held_or_live_ones`, `a_tag_is_free_again_after_its_image_is_deleted`,
+`a_failed_or_refused_request_leaves_no_claim`, `an_active_build_keeps_its_tag`,
+`racing_workspaces_get_a_new_tag_once`, `a_full_tag_table_drops_records_of_missing_images_only`.
+
 ## Compatibility notes
 
 - Docker (API 1.44+) ignores a body on `start`, `stop`, `kill` and the other
@@ -261,6 +361,9 @@ witness and nothing else; `e3/witness.sh` runs the in-process rows
   h2c/gRPC `Control.Solve` request, which D21 moves out of E3; the egress is
   limited to what the engine's network policy lets the project's VM reach.
 - The agent's argv carries break modes only in `test-breaks` builds (DECISIONS 22).
-- Images are shared by every scope of a project.
+- Images are shared by every scope of a project: any scope may run an image
+  another created. Only the tag names are owned, and only on the REST routes
+  (above); a BuildKit build over `/grpc`, which is what `docker build` and `docker
+  buildx build` use, can still name any tag.
 - Network and volume names are global in the engine; a name used by another
   scope is refused.

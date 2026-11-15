@@ -170,6 +170,24 @@ pub struct PinnedBind {
     pub pin_id: Option<String>,
 }
 
+/// What a request that reserved image tags holds: dropping it releases the
+/// reservation, whatever way the request ended.
+pub trait TagCommit: Send + Sync + std::fmt::Debug {
+    /// The engine accepted the request: record the caller as the tags' creator.
+    fn commit(&self);
+}
+
+pub type TagHold = std::sync::Arc<dyn TagCommit>;
+
+/// What a delete may do: the hold on what it removes, and whether the reference
+/// is one of the image's own tags. A delete that is not (an ID, a short ID, a
+/// digest) is sent to the engine without `force`, so that the engine itself
+/// refuses it when the image has gained another tag since it was checked.
+pub struct DeleteGrant {
+    pub hold: Option<TagHold>,
+    pub by_name: bool,
+}
+
 /// Everything the policy needs from the agent. Production: the ledger, the pin
 /// manager and the per-scope socket server. Tests: a fake.
 pub trait Env {
@@ -202,6 +220,30 @@ pub trait Env {
     /// this call made the reservation (and must give it back on failure).
     fn reserve_volume(&self, name: &str) -> Result<bool, Refusal>;
     fn release_volume(&self, name: &str);
+    /// Reserve image tags (canonical `repo:tag`, see `admit`) for the caller
+    /// before a request moves them, all or none. The reservation holds the
+    /// names against every other workspace while the request runs and ends when
+    /// the returned hold is dropped; the creator is recorded only when the
+    /// request succeeds ([`TagHold::commit`]). Refused when another workspace
+    /// created a tag whose image is there, or is making it now, or when the tag
+    /// is a pulled image. `None`: nothing to hold.
+    /// `source` is the existing image a tag is put on (`docker tag`), held against
+    /// an ID delete of it for the request.
+    fn reserve_tags(
+        &self,
+        tags: &[String],
+        source: Option<&str>,
+    ) -> Result<Option<TagHold>, Refusal>;
+    /// A pull replaces a tag with the registry's image: refused for a tag
+    /// another workspace owns or is making, and held (but never recorded) for the
+    /// pull's duration so that no one can take the name meanwhile.
+    fn reserve_pull(&self, tags: &[String]) -> Result<Option<TagHold>, Refusal>;
+    /// `reference` is an image name, ID or digest: refused when deleting it
+    /// would remove a tag another workspace owns or is making, or a pulled
+    /// image's tag. A name untags only itself; anything else removes the image
+    /// and so every tag it has. The names are held (recording nothing) while the
+    /// engine deletes.
+    fn reserve_delete(&self, reference: &str) -> Result<DeleteGrant, Refusal>;
     fn registry_allowed(&self, image: &str) -> bool;
     /// Extra bind-source paths that are the caller's own endpoint (for example
     /// `/run/marsh/docker.sock`, which Testcontainers mounts into Ryuk). Each is

@@ -47,6 +47,13 @@ fn invalid_declarations_cannot_be_hidden_by_overlay_or_update() {
     assert_eq!(base.iter().count(), 2);
 
     for name in rules().reserved_names.iter().cloned().chain([
+        // The shell VM puts registered names first on `PATH`; these are the
+        // shell's own, or marsh's alias.
+        "sh".into(),
+        "bash".into(),
+        "msh".into(),
+        "zsh".into(),
+        "brush".into(),
         "-option".into(),
         "with space".into(),
         "path/like".into(),

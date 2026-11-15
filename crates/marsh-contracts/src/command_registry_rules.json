@@ -4,5 +4,5 @@
   "max_document_bytes": 1048576,
   "allowed_name_characters": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-",
   "forbidden_name_prefixes": ["-"],
-  "reserved_names": [".", "..", "marsh", "fanout", "collect", "acp", "mcp", "ps", "top"]
+  "reserved_names": [".", "..", "marsh", "msh", "brush", "sh", "bash", "zsh", "fanout", "collect", "acp", "mcp", "ps", "top"]
 }

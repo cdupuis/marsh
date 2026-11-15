@@ -1413,38 +1413,57 @@ pub fn serve_retained(
                     }
                 }
                 tasks.handles.push(thread::spawn(move || {
-                    let mut source = MailboxControlSource::new(Arc::clone(&mailbox));
-                    let mut events = MultiplexedEventSink {
-                        attempt: attempt.clone(),
-                        output: task_output.clone(),
-                        container: container_slot,
-                    };
-                    let report = task_worker.run_with_events(
-                        &spec,
-                        &mut source,
-                        JobStreams {
-                            stdout: InterruptibleWriter::new(
-                                Box::new(MultiplexedStream {
-                                    attempt: attempt.clone(),
-                                    stderr: false,
-                                    output: task_output.clone(),
-                                    cancel: attempt_cancel.clone(),
-                                }),
-                                attempt_cancel.clone(),
-                            ),
-                            stderr: InterruptibleWriter::new(
-                                Box::new(MultiplexedStream {
-                                    attempt: attempt.clone(),
-                                    stderr: true,
-                                    output: task_output.clone(),
-                                    cancel: attempt_cancel.clone(),
-                                }),
-                                attempt_cancel.clone(),
-                            ),
-                        },
-                        &mut events,
-                    );
-                    drop(source);
+                    let slot = Arc::clone(&container_slot);
+                    // A panic must neither keep the attempt's slot nor end the
+                    // worker. What the attempt left behind is unknown, so the
+                    // terminal says cleanup is uncertain and quarantines.
+                    let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut source = MailboxControlSource::new(Arc::clone(&mailbox));
+                        let mut events = MultiplexedEventSink {
+                            attempt: attempt.clone(),
+                            output: task_output.clone(),
+                            container: container_slot,
+                        };
+                        let report = task_worker.run_with_events(
+                            &spec,
+                            &mut source,
+                            JobStreams {
+                                stdout: InterruptibleWriter::new(
+                                    Box::new(MultiplexedStream {
+                                        attempt: attempt.clone(),
+                                        stderr: false,
+                                        output: task_output.clone(),
+                                        cancel: attempt_cancel.clone(),
+                                    }),
+                                    attempt_cancel.clone(),
+                                ),
+                                stderr: InterruptibleWriter::new(
+                                    Box::new(MultiplexedStream {
+                                        attempt: attempt.clone(),
+                                        stderr: true,
+                                        output: task_output.clone(),
+                                        cancel: attempt_cancel.clone(),
+                                    }),
+                                    attempt_cancel.clone(),
+                                ),
+                            },
+                            &mut events,
+                        );
+                        drop(source);
+                        report
+                    }))
+                    .unwrap_or_else(|_| WorkerReport {
+                        container_id: slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone(),
+                        execution: ExecutionOutcome::SupervisionFailed,
+                        delivery: DeliveryOutcome::Failed,
+                        cleanup: CleanupOutcome::Uncertain,
+                        quarantine: true,
+                        control_errors: 0,
+                        retained_processes: Vec::new(),
+                    });
                     drop(capability);
                     // Do not cancel the transport on healthy completion. All
                     // per-job pumps are joined before terminal publication.

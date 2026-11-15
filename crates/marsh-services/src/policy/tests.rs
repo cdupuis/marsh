@@ -1497,3 +1497,20 @@ fn the_registry_allowlist_reaches_a_builds_frontend_argument_and_nothing_else() 
     let cache = enc(r#"["evil.example/cache:1","type=registry,ref=evil.example/c"]"#);
     assert!(build(&format!("cachefrom={cache}")).is_ok());
 }
+
+/// `/grpc` is the whole `BuildKit` control API and is relayed after the upgrade
+/// without being read, so the refusal of `POST /build/prune` is not a refusal of
+/// pruning, and history is not scoped. This pins that known limit
+/// (`docs/docker.md`, "Builds and the cache"); a change to it is a change to
+/// those docs.
+#[test]
+fn grpc_is_relayed_unread_so_the_build_prune_refusal_does_not_cover_it() {
+    let r = eval("POST", "/build/prune", &[], None);
+    assert!(matches!(&r, Err(e) if e.status == 403), "{r:?}");
+    let upgrade = [("Connection", "Upgrade"), ("Upgrade", "h2c")];
+    let a = eval("POST", "/grpc", &upgrade, None).unwrap();
+    assert_eq!(a.path, "/grpc");
+    assert!(a.query.is_empty() && a.hijack.is_some());
+    let r = eval("POST", "/grpc?scope=other", &upgrade, None);
+    assert!(matches!(&r, Err(e) if e.status == 403), "{r:?}");
+}

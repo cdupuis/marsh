@@ -355,6 +355,20 @@ witness and nothing else; `e3/witness.sh` runs the in-process rows
   accepted), and a remote context or frontend requested over gRPC is not seen
   here; the VM's policy and firewall govern it. Entitlements are denied by the
   engine's `daemon.json`.
+- **`/grpc` is the whole BuildKit `Control` service** (RR3 DA1-04): Solve, but also
+  `Prune`, `DiskUsage` and the build-history calls (`ListenBuildHistory`,
+  `UpdateBuildHistory`), none of them scoped. So the REST refusal of
+  `POST /build/prune` is not a refusal of pruning, and one scope can read or delete
+  another's build records (build arguments, logs). Unit
+  `grpc_is_relayed_unread_so_the_build_prune_refusal_does_not_cover_it`. Narrowing
+  it needs an HTTP/2 proxy with an HPACK decoder in front of the stream, to allow
+  `Control/Solve` and `Control/Status` of the scope's own build only; refusing
+  `/grpc` outright would break plain `docker build` too, not only `buildx`: the
+  recorded e3 traffic (`e3/corpus/cli.jsonl`) shows both use `/grpc` and `/session`
+  and send no REST `/build`. Neither is done. This is also the piece DA1-02 (image
+  tag ownership) needs: the tag names of a normal build are inside the same stream,
+  so gating `/grpc` is one piece of follow-up work for both. The behaviors above
+  are BuildKit's and were traced from its API, not run through the filter.
 - **A `/grpc` push is a residual** (DECISIONS 21): a BuildKit solve may export to
   a registry (`type=image,push=true`) inside the opaque gRPC stream, where the
   `outputs` query check does not see it. Refusing it would need parsing the

@@ -131,6 +131,9 @@ const MAX_LOST_GRANT_MOUNTS: usize = 64;
 const PREPARATION_BUILD_TIMEOUT: Duration = Duration::from_mins(20);
 const PREPARATION_LOAD_TIMEOUT: Duration = Duration::from_mins(10);
 const PREPARATION_DOCKER_TIMEOUT: Duration = Duration::from_mins(2);
+/// A stock call under a VM's fence is bounded by [`PREPARATION_SBX_TIMEOUT`]:
+/// twice that covers one such call and the one queued behind it.
+const LIFECYCLE_FENCE_WAIT: Duration = Duration::from_mins(10);
 const SUPERVISOR_PING_TIMEOUT: Duration = Duration::from_secs(5);
 // A supervisor frame this recent proves the transport live without a ping.
 const SUPERVISOR_RECENT: Duration = Duration::from_secs(2);
@@ -196,6 +199,9 @@ struct PreparationTimeouts {
     docker: Duration,
     /// A retained worker's Start frame must be written within this.
     start_write: Duration,
+    /// Longest a recovery operation waits for a VM's lifecycle fence, however
+    /// distant its own deadline.
+    fence: Duration,
 }
 
 impl Default for PreparationTimeouts {
@@ -207,6 +213,7 @@ impl Default for PreparationTimeouts {
             load: PREPARATION_LOAD_TIMEOUT,
             docker: PREPARATION_DOCKER_TIMEOUT,
             start_write: KEEPALIVE_READY_TIMEOUT,
+            fence: LIFECYCLE_FENCE_WAIT,
         }
     }
 }
@@ -1650,12 +1657,28 @@ impl StockSbx {
         if !refresh && let Some(view) = self.ownership.cached_view() {
             return Ok(view);
         }
+        self.observe_view(SBX_COMPATIBILITY_TIMEOUT)
+    }
+
+    /// [`Self::stock_view`] for a caller with a deadline: the listing gets no
+    /// longer than what remains of it.
+    fn stock_view_before(
+        &self,
+        refresh: bool,
+        deadline: Instant,
+    ) -> Result<Arc<StockInventory>, SbxError> {
+        if !refresh && let Some(view) = self.ownership.cached_view() {
+            return Ok(view);
+        }
+        let timeout = self
+            .lifecycle_timeout(deadline, "list stock VMs")?
+            .min(SBX_COMPATIBILITY_TIMEOUT);
+        self.observe_view(timeout)
+    }
+
+    fn observe_view(&self, timeout: Duration) -> Result<Arc<StockInventory>, SbxError> {
         let observed = self
-            .run_bounded_os(
-                "list stock VMs",
-                SBX_COMPATIBILITY_TIMEOUT,
-                ["ls", "--json"],
-            )
+            .run_bounded_os("list stock VMs", timeout, ["ls", "--json"])
             .and_then(|output| {
                 Self::require_success("list stock VMs", output.clone())?;
                 StockInventory::decode(&output.stdout)
@@ -1671,6 +1694,16 @@ impl StockSbx {
 
     fn classify_vm(&self, name: &str, refresh: bool) -> Result<VmClass, SbxError> {
         let view = self.stock_view(refresh)?;
+        Ok(self.ownership.classify(&view, name))
+    }
+
+    fn classify_vm_before(
+        &self,
+        name: &str,
+        refresh: bool,
+        deadline: Instant,
+    ) -> Result<VmClass, SbxError> {
+        let view = self.stock_view_before(refresh, deadline)?;
         Ok(self.ownership.classify(&view, name))
     }
 
@@ -1693,7 +1726,7 @@ impl StockSbx {
     /// Remove one VM only by its recorded, currently present UUID. Absent is a
     /// successful no-op; a foreign or unrecorded VM is never touched.
     fn remove_owned_vm(&self, name: &str, deadline: Instant) -> Result<bool, SbxError> {
-        let uuid = match self.classify_vm(name, true)? {
+        let uuid = match self.classify_vm_before(name, true, deadline)? {
             VmClass::Absent => {
                 self.ownership.forget(name)?;
                 return Ok(false);
@@ -1712,7 +1745,7 @@ impl StockSbx {
                 ["rm", "--force", name],
             )?,
         )?;
-        if self.stock_view(true)?.contains_uuid(&uuid) {
+        if self.stock_view_before(true, deadline)?.contains_uuid(&uuid) {
             return Err(SbxError::HostGrantFence(
                 "VM removal returned before its exact UUID disappeared".into(),
             ));
@@ -2177,12 +2210,18 @@ impl StockSbx {
         validate_name(vm)?;
         let (vm_transition, _vm_cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, vm.to_owned());
-        let _vm_transition =
-            fence_write_before(&vm_transition, deadline, "reset a stale scope Kit VM")?;
+        let _vm_transition = fence_write_before(
+            &vm_transition,
+            self.admission_deadline(deadline),
+            "reset a stale scope Kit VM",
+        )?;
         let (stock_operation, _stock_cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, vm.to_owned());
-        let _stock_operation =
-            stock_operation_before(&stock_operation, deadline, "reset a stale scope Kit VM")?;
+        let _stock_operation = stock_operation_before(
+            &stock_operation,
+            self.admission_deadline(deadline),
+            "reset a stale scope Kit VM",
+        )?;
         {
             let mut references = self
                 .grant_mount_references
@@ -2302,14 +2341,20 @@ impl StockSbx {
         validate_name(name)?;
         let (vm_transition, _vm_cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, name.to_owned());
-        let _vm_transition =
-            fence_write_before(&vm_transition, deadline, "remove an unused Kit VM")?;
+        let _vm_transition = fence_write_before(
+            &vm_transition,
+            self.admission_deadline(deadline),
+            "remove an unused Kit VM",
+        )?;
         let (stock_operation, _stock_cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, name.to_owned());
-        let _stock_operation =
-            stock_operation_before(&stock_operation, deadline, "remove an unused Kit VM")?;
+        let _stock_operation = stock_operation_before(
+            &stock_operation,
+            self.admission_deadline(deadline),
+            "remove an unused Kit VM",
+        )?;
         self.reject_quarantined(name)?;
-        match self.classify_vm(name, true)? {
+        match self.classify_vm_before(name, true, deadline)? {
             VmClass::Absent => return Ok(false),
             VmClass::Foreign => return Err(SbxError::ForeignVm(name.to_owned())),
             VmClass::Owned { running: true, .. } => {
@@ -2360,13 +2405,20 @@ impl StockSbx {
         validate_name(name)?;
         let (vm_transition, _vm_cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, name.to_owned());
-        let _vm_transition = fence_write_before(&vm_transition, deadline, "stop an idle Kit VM")?;
+        let _vm_transition = fence_write_before(
+            &vm_transition,
+            self.admission_deadline(deadline),
+            "stop an idle Kit VM",
+        )?;
         let (stock_operation, _stock_cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, name.to_owned());
-        let _stock_operation =
-            stock_operation_before(&stock_operation, deadline, "stop an idle Kit VM")?;
+        let _stock_operation = stock_operation_before(
+            &stock_operation,
+            self.admission_deadline(deadline),
+            "stop an idle Kit VM",
+        )?;
         self.reject_quarantined(name)?;
-        let running = match self.classify_vm(name, true)? {
+        let running = match self.classify_vm_before(name, true, deadline)? {
             VmClass::Absent => return Ok(KitVmStop::Absent),
             VmClass::Foreign => return Err(SbxError::ForeignVm(name.to_owned())),
             VmClass::Owned { running, .. } => running,
@@ -2404,7 +2456,7 @@ impl StockSbx {
         let settled = not_started
             || (outcome.is_ok()
                 && matches!(
-                    self.classify_vm(name, true),
+                    self.classify_vm_before(name, true, deadline),
                     Ok(VmClass::Owned { running: false, .. })
                 ));
         if settled && self.ownership.unmark_retired(name, prior).is_ok() {
@@ -2482,15 +2534,19 @@ impl StockSbx {
                 weak_rw_transition_lock(&self.grant_vm_transition_locks, name.clone());
             let (stock_operation, _stock_cleanup) =
                 weak_mutex_transition_lock(&self.grant_stock_operation_locks, name.clone());
-            let result = fence_write_before(&vm_transition, deadline, "remove retired Kit VMs")
-                .and_then(|_vm_transition| {
-                    let _stock_operation = stock_operation_before(
-                        &stock_operation,
-                        deadline,
-                        "remove retired Kit VMs",
-                    )?;
-                    self.remove_retired_locked(&name, deadline)
-                });
+            let result = fence_write_before(
+                &vm_transition,
+                self.admission_deadline(deadline),
+                "remove retired Kit VMs",
+            )
+            .and_then(|_vm_transition| {
+                let _stock_operation = stock_operation_before(
+                    &stock_operation,
+                    self.admission_deadline(deadline),
+                    "remove retired Kit VMs",
+                )?;
+                self.remove_retired_locked(&name, deadline)
+            });
             match result {
                 Ok(()) => removed.push(name),
                 Err(error) => failed.push((name, error)),
@@ -2517,14 +2573,20 @@ impl StockSbx {
         validate_name(&spec.name)?;
         let (vm_transition, _vm_cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, spec.name.clone());
-        let _vm_transition =
-            fence_write_before(&vm_transition, deadline, "replace an unhealthy Kit VM")?;
+        let _vm_transition = fence_write_before(
+            &vm_transition,
+            self.admission_deadline(deadline),
+            "replace an unhealthy Kit VM",
+        )?;
         let (stock_operation, _stock_cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, spec.name.clone());
-        let _stock_operation =
-            stock_operation_before(&stock_operation, deadline, "replace an unhealthy Kit VM")?;
+        let _stock_operation = stock_operation_before(
+            &stock_operation,
+            self.admission_deadline(deadline),
+            "replace an unhealthy Kit VM",
+        )?;
         self.reject_quarantined(&spec.name)?;
-        if let VmClass::Foreign = self.classify_vm(&spec.name, true)? {
+        if let VmClass::Foreign = self.classify_vm_before(&spec.name, true, deadline)? {
             return Err(SbxError::ForeignVm(spec.name.clone()));
         }
         {
@@ -2629,13 +2691,20 @@ impl StockSbx {
         validate_name(&spec.name)?;
         let (vm_transition, _vm_cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, spec.name.clone());
-        let _vm_transition = fence_write_before(&vm_transition, deadline, "retire a Kit VM")?;
+        let _vm_transition = fence_write_before(
+            &vm_transition,
+            self.admission_deadline(deadline),
+            "retire a Kit VM",
+        )?;
         let (stock_operation, _stock_cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, spec.name.clone());
-        let _stock_operation =
-            stock_operation_before(&stock_operation, deadline, "retire a Kit VM")?;
+        let _stock_operation = stock_operation_before(
+            &stock_operation,
+            self.admission_deadline(deadline),
+            "retire a Kit VM",
+        )?;
         let quarantined = self.reject_quarantined(&spec.name).is_err();
-        match self.classify_vm(&spec.name, true)? {
+        match self.classify_vm_before(&spec.name, true, deadline)? {
             VmClass::Absent => {
                 self.drop_worker_lease(&spec.name)?;
                 self.clear_worker_generation(spec);
@@ -3059,9 +3128,10 @@ impl StockSbx {
         // exact host spec before any deadline/stock failure, not just on ensure.
         self.remember_shell_recovery_spec(spec);
         self.lifecycle_timeout(deadline, "shell reset admission")?;
+        let admission = self.admission_deadline(deadline);
         let (transition, _cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, spec.name.clone());
-        let _guard = shell_admission_before(|| transition.try_write(), deadline)?;
+        let _guard = shell_admission_before(|| transition.try_write(), admission)?;
         let quarantined = self.check_shell_reset_admission(&spec.name)?;
         if quarantined && self.ownership.uuid(&spec.name).is_none() {
             return Err(SbxError::ShellMountCleanupUncertain(
@@ -3075,20 +3145,23 @@ impl StockSbx {
             .entry(spec.name.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-        let _initializing = shell_admission_before(|| init_lock.try_lock(), deadline)?;
+        let _initializing = shell_admission_before(|| init_lock.try_lock(), admission)?;
         let (operation, _cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, spec.name.clone());
-        let _operation = shell_admission_before(|| operation.try_lock(), deadline)?;
+        let _operation = shell_admission_before(|| operation.try_lock(), admission)?;
         if stopped_only
             && (quarantined
                 || matches!(
-                    self.classify_vm(&spec.name, true)?,
+                    self.classify_vm_before(&spec.name, true, deadline)?,
                     VmClass::Owned { running: true, .. } | VmClass::Foreign
                 ))
         {
             return Err(SbxError::ActiveWorkerState(spec.name.clone()));
         }
-        if matches!(self.classify_vm(&spec.name, true)?, VmClass::Owned { .. }) {
+        if matches!(
+            self.classify_vm_before(&spec.name, true, deadline)?,
+            VmClass::Owned { .. }
+        ) {
             self.uncertain_shell_grants
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5395,16 +5468,22 @@ impl StockSbx {
         let deadline = Instant::now() + self.preparation_timeouts.sbx;
         let (vm_transition, _vm_cleanup) =
             weak_rw_transition_lock(&self.grant_vm_transition_locks, vm.to_owned());
-        let _vm_transition =
-            fence_write_before(&vm_transition, deadline, "stop a quarantined worker")?;
+        let _vm_transition = fence_write_before(
+            &vm_transition,
+            self.admission_deadline(deadline),
+            "stop a quarantined worker",
+        )?;
         // A transition that began before the first publication can finish
         // before this write fence is acquired. Reassert quarantine while the
         // fence excludes every later transition and retained Start.
         self.quarantine_vm(vm, reason);
         let (stock_operation, _stock_cleanup) =
             weak_mutex_transition_lock(&self.grant_stock_operation_locks, vm.to_owned());
-        let _stock_operation =
-            stock_operation_before(&stock_operation, deadline, "stop a quarantined worker")?;
+        let _stock_operation = stock_operation_before(
+            &stock_operation,
+            self.admission_deadline(deadline),
+            "stop a quarantined worker",
+        )?;
         if let Some(lease) = self
             .worker_leases
             .lock()
@@ -7515,6 +7594,12 @@ impl StockSbx {
                     SbxError::Io(error)
                 }
             })
+    }
+
+    /// When a recovery operation gives up waiting for a VM's fence: its own
+    /// deadline, or the fence bound if sooner (several callers pass a day).
+    fn admission_deadline(&self, deadline: Instant) -> Instant {
+        deadline.min(Instant::now() + self.preparation_timeouts.fence)
     }
 
     fn lifecycle_timeout(

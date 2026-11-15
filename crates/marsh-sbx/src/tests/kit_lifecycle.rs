@@ -660,6 +660,206 @@ fn recovery_times_out_on_a_held_stock_operation_lock() {
     );
 }
 
+/// `marsh workers reset` and `marsh reset` pass a deadline a day away: the
+/// wait for a wedged VM's fence must end far sooner than that.
+#[test]
+fn a_recovery_with_a_distant_deadline_still_stops_waiting_for_the_fence() {
+    let model = StockModel::new();
+    let adapter = Arc::new(
+        model
+            .adapter()
+            .with_preparation_timeouts(PreparationTimeouts {
+                fence: Duration::from_millis(200),
+                ..PreparationTimeouts::default()
+            }),
+    );
+    let kit = KitFixture::published(KIT);
+    let ready = adapter.ensure_kit_vm(&kit.spec).unwrap();
+    let stop = model.gate(verb("stop"));
+    let wedged = {
+        let adapter = Arc::clone(&adapter);
+        thread::spawn(move || adapter.stop_quarantined(&ready))
+    };
+    stop.wait_entered(1);
+
+    let (send, receive) = mpsc::channel();
+    {
+        let adapter = Arc::clone(&adapter);
+        let spec = kit.spec.clone();
+        thread::spawn(move || {
+            let day = Instant::now() + Duration::from_hours(24);
+            let _ = send.send(adapter.retire_kit_vm_before(&spec, day, None));
+        });
+    }
+    let result = receive.recv_timeout(Duration::from_secs(10));
+    stop.release();
+    assert!(
+        matches!(result, Ok(Err(SbxError::LifecycleDeadline { .. }))),
+        "{result:?}"
+    );
+    wedged.join().unwrap().unwrap();
+}
+
+/// Review of B-03: the inventory listings inside stop, reset and gc used to
+/// get their own ten seconds whatever time the caller had left.
+#[test]
+fn lifecycle_inventories_never_outlast_the_callers_deadline() {
+    type Operation<'a> = Box<dyn Fn(Instant) + 'a>;
+    let model = StockModel::new();
+    let (adapter, kit, _ready) = warm_kit(&model, KIT);
+    let live = BTreeSet::new();
+    let limit = Duration::from_millis(400);
+    let operations: [(&str, Operation<'_>); 4] = [
+        (
+            "workers stop",
+            Box::new(|deadline| drop(adapter.stop_idle_kit_vm(KIT, &live, deadline))),
+        ),
+        (
+            "gc",
+            Box::new(|deadline| {
+                drop(adapter.remove_unused_kit_vm(KIT, "fixture", &live, deadline));
+            }),
+        ),
+        (
+            "workers reset",
+            Box::new(|deadline| drop(adapter.retire_kit_vm_before(&kit.spec, deadline, None))),
+        ),
+        (
+            "replace",
+            Box::new(|deadline| {
+                drop(adapter.replace_unhealthy_kit_vm(&kit.spec, &live, deadline));
+            }),
+        ),
+    ];
+    for (name, operation) in operations {
+        let seen = model.bounds_of("ls").len();
+        operation(Instant::now() + limit);
+        let bounds = model.bounds_of("ls");
+        assert!(bounds.len() > seen, "{name} listed nothing");
+        assert!(
+            bounds[seen..].iter().all(|bound| *bound <= limit),
+            "{name}: {bounds:?}"
+        );
+        // Put the VM back for the next one.
+        adapter.ensure_kit_vm(&kit.spec).ok();
+    }
+}
+
+/// The admission helpers give up at their deadline for a held lock; the
+/// stock-operation mutex and the fence each have their own mutation test.
+#[test]
+fn the_admission_helpers_give_up_at_their_deadline() {
+    let fence = RwLock::new(());
+    let _reader = fence.read().unwrap();
+    let operation = Mutex::new(());
+    let _held = operation.lock().unwrap();
+    let deadline = || Instant::now() + Duration::from_millis(50);
+    assert!(matches!(
+        fence_write_before(&fence, deadline(), "test"),
+        Err(SbxError::LifecycleDeadline { .. })
+    ));
+    assert!(matches!(
+        stock_operation_before(&operation, deadline(), "test"),
+        Err(SbxError::LifecycleDeadline { .. })
+    ));
+}
+
+/// Every recovery operation caps its wait for a VM's fence and its
+/// stock-operation lock at the fence bound, whatever deadline the caller
+/// gave. One case per operation, each with the fence held (a reader) and with
+/// the stock-operation mutex held; every deadline here is a day away, and the
+/// cap is 100 ms, so an operation that waits for its own deadline fails.
+#[test]
+fn every_recovery_operation_caps_its_wait_for_the_fence_and_the_stock_lock() {
+    type Site = fn(&StockSbx, &KitFixture, &ReadyKitVm) -> Result<(), SbxError>;
+    let sites: [(&str, Site); 7] = [
+        ("reset a stale scope Kit VM", |adapter, _, _| {
+            adapter
+                .reset_stale_scope_kit_vm_candidate(KIT, Instant::now() + Duration::from_hours(24))
+        }),
+        ("remove an unused Kit VM", |adapter, _, _| {
+            adapter
+                .remove_unused_kit_vm(
+                    KIT,
+                    "fixture",
+                    &BTreeSet::new(),
+                    Instant::now() + Duration::from_hours(24),
+                )
+                .map(drop)
+        }),
+        ("stop an idle Kit VM", |adapter, _, _| {
+            adapter
+                .stop_idle_kit_vm(
+                    KIT,
+                    &BTreeSet::new(),
+                    Instant::now() + Duration::from_hours(24),
+                )
+                .map(drop)
+        }),
+        ("remove retired Kit VMs", |adapter, _, _| {
+            adapter.ownership.mark_retired(KIT).unwrap();
+            let (_, failed) = adapter.remove_retired_kit_vms();
+            failed
+                .into_iter()
+                .next()
+                .map_or(Ok(()), |(_, error)| Err(error))
+        }),
+        ("replace an unhealthy Kit VM", |adapter, kit, _| {
+            adapter.replace_unhealthy_kit_vm(
+                &kit.spec,
+                &BTreeSet::new(),
+                Instant::now() + Duration::from_hours(24),
+            )
+        }),
+        ("retire a Kit VM", |adapter, kit, _| {
+            adapter
+                .retire_kit_vm_before(&kit.spec, Instant::now() + Duration::from_hours(24), None)
+                .map(drop)
+        }),
+        ("stop a quarantined worker", |adapter, _, ready| {
+            adapter.stop_quarantined(ready)
+        }),
+    ];
+    for (name, site) in sites {
+        for hold_stock_lock in [false, true] {
+            let model = StockModel::new();
+            let adapter = Arc::new(model.adapter().with_preparation_timeouts(
+                PreparationTimeouts {
+                    fence: Duration::from_millis(100),
+                    ..PreparationTimeouts::default()
+                },
+            ));
+            let kit = KitFixture::published(KIT);
+            let ready = adapter.ensure_kit_vm(&kit.spec).unwrap();
+            let (fence, _fence_cleanup) =
+                weak_rw_transition_lock(&adapter.grant_vm_transition_locks, KIT.to_owned());
+            let (operation, _operation_cleanup) =
+                weak_mutex_transition_lock(&adapter.grant_stock_operation_locks, KIT.to_owned());
+            let _fence_reader;
+            let _operation_held;
+            if hold_stock_lock {
+                _operation_held = Some(operation.lock().unwrap());
+                _fence_reader = None;
+            } else {
+                _fence_reader = Some(fence.read().unwrap());
+                _operation_held = None;
+            }
+            let (send, receive) = mpsc::channel();
+            {
+                let adapter = Arc::clone(&adapter);
+                thread::spawn(move || {
+                    let _ = send.send(site(&adapter, &kit, &ready));
+                });
+            }
+            let result = receive.recv_timeout(Duration::from_secs(10));
+            assert!(
+                matches!(result, Ok(Err(SbxError::LifecycleDeadline { .. }))),
+                "{name} (stock lock held: {hold_stock_lock}): {result:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_first_create_is_not_bounded_like_other_stock_calls() {
     // `sbx create` downloads the Kit's image on a cold host: it gets its own

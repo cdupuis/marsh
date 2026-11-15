@@ -75,6 +75,7 @@ session ─ job ─ job ...            (registered name or marsh run: own contai
 | `ProcessShow`, `Jobs`, `ShowJob` | session-authorized job inspection | the job's own subtree |
 | `SplitShow` (`marsh splits`) | yes | no (a job sees its splits in `marsh jobs --tree`) |
 | `SplitCancel`, `jobs cancel`, `splits rm` | yes, within its tree | no (drop the stream instead) |
+| `OpenUrl` (`marsh open`, `xdg-open`, `open`; whether the Mac opens the link is the daemon's decision) | yes | yes |
 | everything else (MCP, ACP, lifecycle) | request-specific session grants | refused |
 
 **`ProcessRun`** is admission (section 6), then an internal `Execute`
@@ -82,8 +83,11 @@ through the daemon's own endpoint (as split argv branches do in `split.rs`),
 then frame relay.
 
 - **Ordering against cancel.** Under the process-table lock, the daemon
-  re-checks that the parent's capability is live and not cancelling,
-  inserts the child record, and only then submits. A cancel that takes the
+  re-checks that the parent job has not ended and is not cancelling
+  (`child_lineage`), inserts the child record, and only then submits. The
+  connection was authenticated earlier by the attempt's capability token, which
+  the host's bridge attaches and the job never sees; this admission step
+  re-reads the parent job's state, not the token. A cancel that takes the
   lock first sees no child. A cancel that takes it later finds the record
   and cancels the child (`Spawn` is atomic in the model).
 - **stdin.** The implementation uses a bounded per-connection queue. The
@@ -330,7 +334,7 @@ refused by the spawn set), and is counted in `marsh status`
   then sends INT, waits 10 s, and sends KILL to each descendant container,
   and verifies deletion in every VM (`LiveUnderLive`, `NoOrphanRunning`,
   `CancelPropagates`; controls `orphanChildren`, `revokeOnly`,
-  `noPropagate`). This generalizes `cancel_children_of` in `split.rs`.
+  `noPropagate`). This generalizes the cascade in `split.rs` `cancel`, which recurses over `children`.
 - **Lost parent.** It becomes `cleanup_uncertain`, and its children are
   cancelled.
 - **Ctrl-C.** Daemon-driven. In the root shell, the client's `INT` (or

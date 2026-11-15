@@ -204,8 +204,11 @@ expired is not stopped; the engine gives no way to cancel or confirm a request i
 has accepted. An in-flight registry holds the name of every volume create from before the
 first byte is sent until the engine answers it (removed then, or when the dial
 failed); a create that stays unknown stays registered for the fence time. While a
-name is registered: a reconcile (a prune or the periodic pass, which runs under
-the volume lock, so it cannot overtake a create) keeps the ledger record whatever
+name is registered: a reconcile (a prune or the periodic pass) takes the volume
+lock before it reads the engine's lists (so it cannot overtake a create, and its
+snapshot is never older than one it waited for; the three reads, each bounded by
+`up_progress`, run under the lock, so a hung engine delays volume requests by up
+to about three deadlines) and keeps the ledger record whatever
 its age (`reconcile_keeps_the_owner_of_a_create_that_may_still_land`,
 `a_reconcile_during_a_create_that_then_times_out_keeps_the_owner`), and a delete of
 the name, by any workspace and the sender too, is refused with a 503 instead of

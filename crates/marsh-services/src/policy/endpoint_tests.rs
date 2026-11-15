@@ -1726,6 +1726,47 @@ fn a_delete_of_a_name_with_a_create_of_unknown_outcome_is_refused() {
     }
 }
 
+/// A reconcile whose engine snapshot is taken while a create is in flight must
+/// not use that snapshot after the create was answered: the snapshot (the
+/// engine's lists) is taken under the volume lock, so a slow create that
+/// succeeds is either fully before or fully after it, and the owner of a record
+/// older than the grace survives.
+#[test]
+fn a_reconcile_cannot_use_a_snapshot_older_than_a_create_it_waited_for() {
+    for implicit in [false, true] {
+        let engine = VolumeEngine::new();
+        engine.gate.store(true, Ordering::SeqCst);
+        let h = H::new(
+            &format!("staleSnapshotw4{implicit}"),
+            true,
+            engine.handler(),
+            |cfg| {
+                cfg.up_progress = Duration::from_secs(5);
+                std::fs::write(&cfg.paths.ledger, SEEDED_OLD_A).unwrap();
+            },
+        );
+        let sock = h.serve(&h.auth);
+        engine.hold_next_create.store(true, Ordering::SeqCst);
+        let create = {
+            let sock = sock.clone();
+            std::thread::spawn(move || create_request(&sock, implicit))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        // The create is at the engine; a reconcile starts now.
+        let svc = h.svc.clone();
+        let reconcile = std::thread::spawn(move || svc.reconcile());
+        std::thread::sleep(Duration::from_millis(300));
+        engine.create_release.store(true, Ordering::SeqCst);
+        assert_eq!(create.join().unwrap(), 201, "implicit={implicit}");
+        reconcile.join().unwrap();
+        assert!(engine.store.lock().unwrap().contains_key("data"));
+        assert!(
+            h.svc.ledger.has_volume("lane-a", "data"),
+            "OWNER LOST (implicit={implicit}): the volume exists, the ledger forgot it"
+        );
+    }
+}
+
 fn raw_exchange(sock: &Path, request: &str, keep_reading_for: Duration) -> String {
     let mut c = UnixStream::connect(sock).unwrap();
     c.set_read_timeout(Some(keep_reading_for)).unwrap();

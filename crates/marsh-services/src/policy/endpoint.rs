@@ -828,6 +828,10 @@ impl Services {
                     .collect(),
             )
         };
+        // Not while a volume create or delete is in progress, and not with a
+        // snapshot older than one: the lock is taken before the engine's lists
+        // are read, and the registry is read and the records dropped under it.
+        let guard = self.vol_enter();
         let (Some(cs), Some(ns), Some(vs)) = (
             ids("/containers/json?all=1", None, "Id"),
             ids("/networks", None, "Id"),
@@ -835,9 +839,6 @@ impl Services {
         ) else {
             return;
         };
-        // Not while a volume create or delete is in progress: the registry is
-        // read and the records dropped as one step with respect to them.
-        let guard = self.vol_enter();
         let reconciled = self
             .ledger
             .reconcile(&cs, &ns, &vs, &self.pending_create_names(), now());

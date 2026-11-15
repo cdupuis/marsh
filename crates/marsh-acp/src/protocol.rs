@@ -60,25 +60,11 @@ impl JsonRpcError {
     }
 
     #[must_use]
-    pub fn with_data(code: i64, message: impl Into<String>, data: serde_json::Value) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            data: Some(data),
-        }
-    }
-
-    #[must_use]
     pub fn method_not_found(method: &str) -> Self {
         Self::new(
             JSONRPC_METHOD_NOT_FOUND,
             format!("method '{method}' not found or disabled"),
         )
-    }
-
-    #[must_use]
-    pub fn permission_denied(reason: &str) -> Self {
-        Self::new(JSONRPC_PERMISSION_DENIED, reason)
     }
 
     #[must_use]

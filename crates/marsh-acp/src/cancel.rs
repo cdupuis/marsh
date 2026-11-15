@@ -71,18 +71,6 @@ impl CancelTracker {
         self.phase.load(Ordering::Acquire) >= PHASE_REQUESTED
     }
 
-    /// Returns true if cancellation notification has been dispatched across stdio.
-    #[must_use]
-    pub fn is_dispatched(&self) -> bool {
-        self.phase.load(Ordering::Acquire) >= PHASE_DISPATCHED
-    }
-
-    /// Returns true if agent has confirmed cancellation.
-    #[must_use]
-    pub fn is_confirmed(&self) -> bool {
-        self.phase.load(Ordering::Acquire) == PHASE_CONFIRMED
-    }
-
     /// Transitions to `Requested` if currently `NotCancelled`.
     /// Returns true if transitioned.
     pub fn mark_requested(&self) -> bool {

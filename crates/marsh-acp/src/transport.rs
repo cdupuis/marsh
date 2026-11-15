@@ -308,20 +308,6 @@ impl SubprocessHandle {
             .map_or_else(|_| Vec::new(), |g| g.clone())
     }
 
-    /// Returns loss diagnostic if child has exited.
-    pub async fn check_exit(&self) -> Option<String> {
-        let mut guard = self.child.lock().await;
-        if let Some(child) = guard.as_mut()
-            && let Ok(Some(status)) = child.try_wait()
-        {
-            let stderr = String::from_utf8_lossy(&self.stderr_output()).to_string();
-            return Some(format!(
-                "subprocess exited with status {status}; captured stderr: {stderr}"
-            ));
-        }
-        None
-    }
-
     /// Terminate subprocess.
     ///
     /// # Errors

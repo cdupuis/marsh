@@ -46,13 +46,6 @@ impl WorkerTransport {
         let output = File::from(OwnedFd::from(socket.try_clone()?));
         Self::from_files(File::from(OwnedFd::from(socket)), output)
     }
-    /// An explicit connection-level no-progress bound, not an attempt deadline.
-    /// Each frame also has a finite four-times-stall total lifetime.
-    #[must_use]
-    pub fn with_stall_timeout(mut self, timeout: Duration) -> Self {
-        self.stall = timeout.max(POLL);
-        self
-    }
     #[must_use]
     pub fn cancellation(&self) -> Cancellation {
         self.cancel.clone()

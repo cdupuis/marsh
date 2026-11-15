@@ -17,9 +17,20 @@ reproduce the vendored tree. The marsh build compiles that tree directly.
 | `0006-interactive-input` | Input backends: idle `TERM`/`HUP` delivery, no-terminal prompts, terminal output flags |
 | `0007-shell-entry-and-workspace` | Entry point (`run`/`run_from`), startup options, process shims, workspace manifest |
 
+**Size.** This is not a small queue. Counted with `git apply --numstat`, the
+seven patches add 12,284 lines and remove 1,564 over 114 files (18,595 patch
+lines; `0003` alone is 5,576). They are cut by area, not by intent: `0003`
+carries the fork architecture (real-process subshells), Bash fixes and the
+`split`/`fanout`/`cloud` product code in the same hunks, and the embedding hooks
+(`PREEXECUTE_HOOK`, `SPLIT_WORKSPACE`, ...) are process-global `OnceLock` statics, set
+once per process. So no single Bash fix
+can be upstreamed or reverted, and no product feature dropped, without
+hand-splitting. The refresh to `cc73400c` was a manual re-port of all of it.
+
 Some of this is marsh product wiring and not a Bash fix: registered-command
 process shims, `split`/`join`, `fanout`/`collect`, and `cloud`. Everything else is
-a Bash-compatibility change that could go upstream separately.
+a Bash-compatibility change that could go upstream, but not separately as the
+patches stand.
 
 ## History of this queue
 

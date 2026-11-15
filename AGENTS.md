@@ -1,9 +1,10 @@
 # marsh development guide
 
 marsh is a Linux shell for Apple Silicon Macs. Shell behavior comes from
-upstream Brush, vendored under `vendor/brush/` with a small patch queue in
-`docs/upstream/brush/`. VMs come from the stock Docker Sandboxes CLI (`sbx`).
-marsh must never invoke Bash as its implementation.
+upstream Brush, vendored under `vendor/brush/` with seven area patches in
+`docs/upstream/brush/`: about 12,300 added and 1,600 removed lines over 114
+files, a fork in all but name, not a small queue. VMs come from the stock
+Docker Sandboxes CLI (`sbx`). marsh must never invoke Bash as its implementation.
 
 ## Scope
 
@@ -25,7 +26,8 @@ In scope:
   Kit), and the interactive cloud shell are part of that preview; cloud ->
   laptop crossings and `marsh run --place` are v2 work.
 
-Out of scope: a Brush fork, cross-daemon source ledgers,
+Out of scope: a general-purpose Brush fork for others to use (marsh carries the
+patches it needs, see above), cross-daemon source ledgers,
 build-receipt authority binding, general M:N scheduling, workload restart
 recovery, and multi-device history. Third-party
 agent Kits live outside this repository (`docs/plan/custom-agent-kit.md`). The
@@ -80,7 +82,11 @@ journey. Do not grow mock suites or a parallel test framework to claim progress.
   behavior from historical plans. Do not invent benchmarks or transcripts, or
   make broad rewrites without user approval.
 - Preserve ordinary Bash behavior through Brush. Classify and test every
-  divergence. Keep Brush changes as small patches in `docs/upstream/brush/`.
+  divergence. Fold each Brush change into the area patch it belongs to in
+  `docs/upstream/brush/`, and keep the change itself small and single-purpose:
+  the patches are cut by area, so one holds Bash fixes and marsh product code in
+  the same hunks, and no single fix can be upstreamed or reverted without
+  hand-splitting.
 - Host `sbx` is trusted. Use only its public CLI; never ship a patched SBX.
 - VM names are random (`marsh-k-xxxxxxxx`, `marsh-s-xxxxxxxx`) and recorded in
   the per-daemon ownership map before `sbx create`. Never stop, remove, mount,

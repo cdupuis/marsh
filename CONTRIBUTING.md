@@ -170,9 +170,10 @@ and runs the full acceptance gate, by hand.
 ### Shell behavior
 
 The shell is [Brush](https://github.com/reubeno/brush), vendored under
-`vendor/brush/` with our changes kept as a small patch queue in
-`docs/upstream/brush/`. marsh never runs Bash to implement the shell, and every
-divergence from Bash is classified and tested.
+`vendor/brush/` with our changes kept as seven area patches (about 12,300 added
+and 1,600 removed lines over 114 files) in `docs/upstream/brush/`. marsh never
+runs Bash to implement the shell, and every divergence from Bash is classified
+and tested.
 
 To fix a shell bug, reproduce it through the shipped `marsh-local` entrypoint
 and compare with Bash (see `crates/marsh/tests/bash_audit.rs`). Then fix it in

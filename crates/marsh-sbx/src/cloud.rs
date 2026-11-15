@@ -22,6 +22,7 @@ use std::{
 use thiserror::Error;
 
 const MAX_DOCUMENT: usize = 4 * 1024 * 1024;
+const MAX_ROWS: usize = 4096;
 /// Owned sandboxes of attached runs (and unresolved creates).
 const MAX_OWNED: usize = 8;
 /// Detached runs' sandboxes (`docs/design/cloud-detach.md` s5), apart.
@@ -294,32 +295,16 @@ impl CloudInventory {
         let rows = value
             .as_array()
             .ok_or(CloudError::Invalid("unknown cloud inventory envelope"))?;
-        if rows.len() > 256 {
+        if rows.len() > MAX_ROWS {
             return Err(CloudError::Invalid("cloud inventory exceeds row bound"));
         }
         let mut by_name = BTreeMap::new();
         let mut ids = BTreeSet::new();
         for row in rows {
-            let object = row
-                .as_object()
-                .ok_or(CloudError::Invalid("invalid cloud inventory row"))?;
-            if object.keys().any(|key| {
-                !matches!(
-                    key.as_str(),
-                    "name"
-                        | "id"
-                        | "status"
-                        | "image"
-                        | "agent"
-                        | "cpus"
-                        | "memory_mib"
-                        | "template"
-                        | "created_at"
-                        | "expires_at"
-                )
-            }) {
-                return Err(CloudError::Invalid("unknown cloud inventory row schema"));
+            if !row.is_object() {
+                return Err(CloudError::Invalid("invalid cloud inventory row"));
             }
+            // Keys stock adds later are ignored: marsh reads only its own.
             let vm: CloudInventoryVm = serde_json::from_value(row.clone())?;
             if !valid_name(&vm.name)
                 || vm.status.is_empty()
@@ -1409,6 +1394,27 @@ mod tests {
         fn spawn_attached(&self, _: &Invocation) -> std::io::Result<Attachment> {
             Err(std::io::Error::other("unexpected stock effect"))
         }
+    }
+
+    /// Audit B-05: a key stock adds, or a long listing, must not make every
+    /// cloud operation fail.
+    #[test]
+    fn a_cloud_listing_with_an_added_key_or_many_rows_still_decodes() {
+        let row = |index: usize, extra: &str| {
+            format!(r#"{{"name":"box-{index}","id":"sbx_a{index}","status":"running"{extra}}}"#)
+        };
+        let rows = (0..300)
+            .map(|index| row(index, r#","labels":{"a":"b"},"ports":[]"#))
+            .collect::<Vec<_>>();
+        let decoded = CloudInventory::decode(format!("[{}]", rows.join(",")).as_bytes()).unwrap();
+        assert!(decoded.get("box-299").is_some());
+        // Still strict about identity: a duplicate name is ambiguous.
+        let duplicate = format!(
+            "[{},{}]",
+            row(1, ""),
+            row(1, "").replace("sbx_a1", "sbx_b1")
+        );
+        assert!(CloudInventory::decode(duplicate.as_bytes()).is_err());
     }
 
     fn record(name: &str, id: &str, detached: bool) -> CloudRecord {

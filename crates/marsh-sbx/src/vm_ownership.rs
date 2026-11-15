@@ -737,7 +737,9 @@ impl VmOwnership {
             None => VmClass::Absent,
             Some(vm) if recorded.as_deref() == Some(vm.id.as_str()) => VmClass::Owned {
                 uuid: vm.id.clone(),
-                running: vm.status == "running",
+                // Any state but stopped may be running: a VM caught while it
+                // starts or stops is never taken for stopped.
+                running: vm.possibly_running(),
             },
             Some(_) => VmClass::Foreign,
         }

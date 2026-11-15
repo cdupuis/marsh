@@ -143,9 +143,20 @@ for its lifetime, so a replacement that starts early waits, then fails, rather
 than answering from a stale view. A volume delete is checked, sent and recorded
 under the lock every volume claim takes (`vol_lock`), so an old delete cannot land
 after the name was given to another workspace
-(`a_delayed_delete_cannot_remove_a_volume_another_workspace_now_owns`). Container and
-network deletes are not serialized this way (they address the engine by the ID
-the ledger resolved; not changed or tested here). A ledger that goes corrupt while the agent
+(`a_delayed_delete_cannot_remove_a_volume_another_workspace_now_owns`). The agent
+makes the engine call itself, so the client leaving does not end it early
+(`a_delete_whose_client_disconnected_still_holds_the_name_until_the_engine_finishes`).
+The ledger releases the name only when the engine answers 200, 204 or 404. If the
+engine does not answer, the owner keeps the name and every claim of it is refused
+for `delete_fence` (5 minutes): a request that is still at the engine may land
+later (`a_delete_the_engine_did_not_answer_fences_the_name_before_it_can_be_reassigned`).
+The fence is in memory only (an agent restart forgets it), and it is time-based:
+the engine gives no way to cancel or confirm a request it has accepted. This covers
+DELETE of a volume against volume claims. Container and network deletes (they
+address the engine by the ID the ledger resolved), volume prune and other
+label-filtered engine calls are not serialized this way and are not covered.
+Volume claims and deletes queue behind one lock for every workspace, so a hung
+engine call delays them all until its answer or the 30 s response deadline. A ledger that goes corrupt while the agent
 runs is not set aside: the ledger degrades and refuses writes until restart.
 Enforced by the ledger tests `a_change_is_published_in_the_durable_order`,
 `a_corrupt_ledger_quarantines_until_an_operator_clears_it`,

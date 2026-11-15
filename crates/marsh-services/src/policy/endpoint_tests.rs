@@ -580,6 +580,197 @@ fn a_corrupt_ledger_refuses_project_binds_but_not_other_creates() {
     assert_eq!(status, 201, "{reply}");
 }
 
+/// An engine whose volumes are a name -> body map; the first `DELETE` waits
+/// for `gate` before removing the name (a request that is already at the
+/// engine when its caller is gone, or has given up).
+struct VolumeEngine {
+    store: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    deletes: Arc<AtomicUsize>,
+    first_done: Arc<AtomicBool>,
+    gate: Arc<AtomicBool>,
+}
+
+impl VolumeEngine {
+    fn new() -> Self {
+        Self {
+            store: Arc::default(),
+            deletes: Arc::default(),
+            first_done: Arc::default(),
+            gate: Arc::default(),
+        }
+    }
+
+    fn handler(&self) -> Handler {
+        let (store, deletes, gate, first_done) = (
+            self.store.clone(),
+            self.deletes.clone(),
+            self.gate.clone(),
+            self.first_done.clone(),
+        );
+        Arc::new(move |req, s| {
+            let name = req.target.trim_start_matches("/volumes/").to_owned();
+            match (req.method.as_str(), req.target.as_str()) {
+                ("POST", "/volumes/create") => {
+                    let body = String::from_utf8_lossy(&req.body).into_owned();
+                    let named = body
+                        .split("\"Name\":\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or("")
+                        .to_owned();
+                    store.lock().unwrap().insert(named, body.clone());
+                    answer(s, 201, &body);
+                    true
+                }
+                ("GET", t) if t.starts_with("/volumes/") => {
+                    match store.lock().unwrap().get(&name).cloned() {
+                        Some(body) => answer(s, 200, &body),
+                        None => answer(s, 404, "{\"message\":\"no such volume\"}"),
+                    }
+                    true
+                }
+                ("DELETE", t) if t.starts_with("/volumes/") => {
+                    let first = deletes.fetch_add(1, Ordering::SeqCst) == 0;
+                    if first {
+                        while !gate.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    let found = store.lock().unwrap().remove(&name).is_some();
+                    if found {
+                        let _ =
+                            s.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+                    } else {
+                        answer(s, 404, "{\"message\":\"no such volume\"}");
+                    }
+                    if first {
+                        first_done.store(true, Ordering::SeqCst);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        })
+    }
+}
+
+fn lane_b(h: &H) -> Authority {
+    Authority {
+        project_root: h.dir.clone(),
+        workspace: "lane-b".into(),
+        attempt: "att2".into(),
+    }
+}
+
+/// The caller of a DELETE that is already at the engine goes away. The name
+/// stays reserved until the engine has finished: a second delete and lane B's
+/// create wait, so the pending one cannot remove lane B's replacement.
+#[test]
+fn a_delete_whose_client_disconnected_still_holds_the_name_until_the_engine_finishes() {
+    let engine = VolumeEngine::new();
+    let h = H::new("deletegone", false, engine.handler(), |_| {});
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    let (status, body) = call(
+        &sock_a,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"data"}"#),
+    );
+    assert_eq!(status, 201, "{body}");
+
+    {
+        let mut c = UnixStream::connect(&sock_a).unwrap();
+        c.write_all(b"DELETE /volumes/data HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        assert!(wait_for(Duration::from_secs(5), || engine
+            .deletes
+            .load(Ordering::SeqCst)
+            == 1));
+    } // the client is gone
+    let second = {
+        let sock = sock_a.clone();
+        std::thread::spawn(move || call(&sock, "DELETE", "/volumes/data", None).0)
+    };
+    let create_b = {
+        let sock = sock_b.clone();
+        std::thread::spawn(move || {
+            call(&sock, "POST", "/volumes/create", Some(r#"{"Name":"data"}"#)).0
+        })
+    };
+    // Long enough for the endpoint to notice the vanished client.
+    std::thread::sleep(Duration::from_millis(3500));
+    assert!(
+        !second.is_finished(),
+        "the name was released with the client"
+    );
+    assert!(
+        !create_b.is_finished(),
+        "another workspace claimed the name"
+    );
+    engine.gate.store(true, Ordering::SeqCst);
+    second.join().unwrap();
+    assert_eq!(create_b.join().unwrap(), 201);
+    assert!(engine.first_done.load(Ordering::SeqCst));
+    assert!(
+        engine.store.lock().unwrap().contains_key("data"),
+        "lane B's volume was deleted"
+    );
+    assert!(h.svc.ledger.has_volume("lane-b", "data"));
+}
+
+/// The engine does not answer a DELETE in time: the outcome is unknown, so
+/// lane A keeps the name, and nobody else can claim it until the fence has
+/// passed, even after a second delete released lane A's ownership. The late
+/// first delete then finds nothing, and lane B's replacement survives.
+#[test]
+fn a_delete_the_engine_did_not_answer_fences_the_name_before_it_can_be_reassigned() {
+    let engine = VolumeEngine::new();
+    let h = H::new("deletetimeout", false, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(250);
+        cfg.delete_fence = Duration::from_millis(1500);
+    });
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    let (status, body) = call(
+        &sock_a,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"data"}"#),
+    );
+    assert_eq!(status, 201, "{body}");
+
+    let (status, _) = call(&sock_a, "DELETE", "/volumes/data", None);
+    assert_eq!(status, 502, "the first delete timed out");
+    // Lane A still owns the name; its second delete succeeds and releases it.
+    assert!(h.svc.ledger.has_volume("lane-a", "data"));
+    assert_eq!(call(&sock_a, "DELETE", "/volumes/data", None).0, 204);
+    assert!(!h.svc.ledger.has_volume("lane-a", "data"));
+    // Lane B cannot take the name while the first delete may still land.
+    let (status, body) = call(
+        &sock_b,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"data"}"#),
+    );
+    assert_eq!(status, 503, "{body}");
+    assert!(!engine.store.lock().unwrap().contains_key("data"));
+    // The first delete finally reaches the engine (and finds nothing) ...
+    engine.gate.store(true, Ordering::SeqCst);
+    assert!(wait_for(Duration::from_secs(5), || engine
+        .first_done
+        .load(Ordering::SeqCst)));
+    // ... and once the fence has passed lane B's volume is created and stays.
+    std::thread::sleep(Duration::from_millis(1700));
+    let (status, body) = call(
+        &sock_b,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"data"}"#),
+    );
+    assert_eq!(status, 201, "{body}");
+    assert!(engine.store.lock().unwrap().contains_key("data"));
+    assert!(h.svc.ledger.has_volume("lane-b", "data"));
+}
+
 /// A DELETE admitted while lane A owned `data` must not reach the engine after
 /// lane A's ownership ended and lane B created its own `data`: each volume
 /// operation is checked, sent and recorded under one lock, so the later

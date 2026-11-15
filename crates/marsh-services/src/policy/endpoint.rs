@@ -61,6 +61,13 @@ pub struct Config {
     /// How long a starting agent waits for the previous one to stop serving
     /// the ledger before it gives up.
     pub ledger_serve_wait: Duration,
+    /// How long the agent waits for the engine's answer to one of its own
+    /// calls (inspect, create, delete of a volume).
+    pub up_progress: Duration,
+    /// After a volume delete whose outcome at the engine is unknown, the name
+    /// cannot be claimed by anyone for this long: a request that is still at
+    /// the engine must not remove what a later claimant creates.
+    pub delete_fence: Duration,
     pub verbose: bool,
 }
 
@@ -82,6 +89,8 @@ impl Default for Config {
             hijack_idle: Duration::from_mins(30),
             hijack_poll: Duration::from_millis(500),
             ledger_serve_wait: Duration::from_secs(10),
+            up_progress: Duration::from_secs(30),
+            delete_fence: Duration::from_secs(300),
             verbose: false,
         }
     }
@@ -142,6 +151,8 @@ pub struct Services {
     /// held across one engine inspect (bounded by `up_request`'s 30 s progress
     /// timeout), which serializes tag claims while the engine hangs.
     tag_res: Mutex<TagRes>,
+    /// Volume names with a delete of unknown outcome, and when it was sent.
+    fenced: Mutex<HashMap<String, std::time::Instant>>,
     /// A pin is mounted and then recorded; both happen under the read side, and
     /// the sweep of unrecorded pins runs under the write side, so it can never
     /// see the first without the second.
@@ -268,6 +279,7 @@ impl Services {
             gate: Gate::default(),
             vol_lock: Mutex::new(()),
             tag_res: Mutex::new(HashMap::new()),
+            fenced: Mutex::default(),
             pin_gate: RwLock::new(()),
         }))
     }
@@ -509,6 +521,24 @@ impl Services {
         Ok(s)
     }
 
+    /// Whether a delete of this volume's name is still unconfirmed.
+    fn volume_fenced(&self, name: &str) -> bool {
+        let mut fenced = self
+            .fenced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wait = self.cfg.delete_fence;
+        fenced.retain(|_, sent| sent.elapsed() < wait);
+        fenced.contains_key(name)
+    }
+
+    fn fence_volume(&self, name: &str) {
+        self.fenced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_owned(), std::time::Instant::now());
+    }
+
     pub(crate) fn up_request(
         &self,
         method: &str,
@@ -533,7 +563,7 @@ impl Services {
         let mut conn = Conn::new(
             s,
             HttpLimits {
-                progress: Duration::from_secs(30),
+                progress: self.cfg.up_progress,
                 ..HttpLimits::default()
             },
         );
@@ -1402,6 +1432,15 @@ impl Env for Scope {
             .vol_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.svc.volume_fenced(name) {
+            return Err(Refusal {
+                status: 503,
+                msg: format!(
+                    "a delete of volume {name:?} has not been confirmed by the engine; try again later"
+                ),
+                close: false,
+            });
+        }
         let fail = |m: String| Refusal {
             status: 500,
             msg: m,
@@ -1461,6 +1500,15 @@ impl Env for Scope {
             .vol_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.svc.volume_fenced(name) {
+            return Err(Refusal {
+                status: 503,
+                msg: format!(
+                    "a delete of volume {name:?} has not been confirmed by the engine; try again later"
+                ),
+                close: false,
+            });
+        }
         let ws = &self.auth.workspace;
         let claim = self
             .svc
@@ -1918,6 +1966,9 @@ fn handle_request(scope: &Arc<Scope>, conn: &mut Conn, head: &Head) -> io::Resul
     if break_mode("filter-no-upgrade") {
         adm.hijack = None;
         adm.upgrade = None;
+    }
+    if let Post::VolumeDelete { name } = adm.post.clone() {
+        return Ok(delete_volume(scope, conn, &adm, &name));
     }
     let result = forward(scope, conn, head, &mut adm, m.kind);
     match result {
@@ -2676,6 +2727,47 @@ fn record_container(
         }
     }
     Ok(())
+}
+
+/// A volume delete, made by the agent itself rather than streamed through the
+/// client's connection, so that the client leaving cannot end it early: the
+/// caller (holding `vol_lock`) waits for the engine. The ledger releases the
+/// name only on an answer that says it is gone. If the engine does not answer,
+/// the delete may still land later, so the name stays with its owner and is
+/// fenced against every claim for `delete_fence`.
+fn delete_volume(scope: &Arc<Scope>, conn: &mut Conn, adm: &Admitted, name: &str) -> bool {
+    let svc = &scope.svc;
+    let mut path = adm.path.clone();
+    if !adm.query.is_empty() {
+        path.push('?');
+        path.push_str(&encode_query(&adm.query));
+    }
+    match svc.up_request("DELETE", &path, None) {
+        Ok((status, body)) => {
+            if matches!(status, 200 | 204 | 404) {
+                post_actions(scope, &adm.post);
+            }
+            let text = if status == 204 { Vec::new() } else { body };
+            let head = format!(
+                "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                super::http::status_text(status),
+                text.len()
+            );
+            let _ = conn.stream.write_all(head.as_bytes());
+            let _ = conn.stream.write_all(&text);
+        }
+        Err(e) => {
+            svc.fence_volume(name);
+            svc.log(&format!("delete of volume {name} did not complete: {e}"));
+            reply(
+                &mut conn.stream,
+                502,
+                "the engine did not answer the delete; the volume name stays reserved until it is known to be gone",
+                true,
+            );
+        }
+    }
+    false
 }
 
 fn post_actions(scope: &Arc<Scope>, post: &Post) {

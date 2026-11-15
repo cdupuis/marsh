@@ -1641,4 +1641,26 @@ mod tests {
         assert_eq!(l.exec_container("lane", "web-exec"), Lookup::Missing);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// Execs live only in memory, so a reload of what another process
+    /// published must keep this process's own.
+    #[test]
+    fn a_reload_keeps_this_agents_execs() {
+        let dir = scratch("exec-reload");
+        let path = dir.join("ledger.json");
+        let a = Ledger::open(&path).unwrap();
+        let b = Ledger::open(&path).unwrap();
+        a.add_container("db", rec("base", "db")).unwrap();
+        a.add_exec("exec-1", "db");
+        b.add_container("web", rec("base", "web")).unwrap();
+        // A's next change starts from B's file.
+        a.add_container("late", rec("base", "late")).unwrap();
+        assert!(a.container("web").is_some(), "the reload happened");
+        assert_eq!(
+            a.exec_container("base", "exec-1"),
+            Lookup::Own("db".into()),
+            "the reload dropped the exec"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

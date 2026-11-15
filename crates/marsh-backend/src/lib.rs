@@ -7710,7 +7710,7 @@ mod tests {
         StockSbx::new("sbx", runner).with_ephemeral_root_for_test(root.path().join("ephemeral"))
     }
 
-    pub(super) fn backend_for_kit_identity(
+    pub(crate) fn backend_for_kit_identity(
         daemon_home: &std::path::Path,
         commands: BTreeMap<String, RegisteredKit>,
     ) -> StockDaemonBackend {

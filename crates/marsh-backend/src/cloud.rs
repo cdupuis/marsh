@@ -108,6 +108,8 @@ struct Settlement<'a> {
     phase: Instant,
     /// All workload output reached the caller.
     output_complete: bool,
+    /// The receipt reached a terminal state through [`Self::finish_reporting`].
+    settled: bool,
 }
 
 impl Settlement<'_> {
@@ -157,6 +159,7 @@ impl Settlement<'_> {
             cleanup,
             std::mem::take(&mut self.timing),
         )?;
+        self.settled = true;
         let code = public.unwrap_or_else(|| {
             self.store
                 .job(&self.job_id)
@@ -165,6 +168,26 @@ impl Settlement<'_> {
                 .unwrap_or(code)
         });
         self.attachment.send(&AttachmentFrame::Exited { code })
+    }
+}
+
+impl Settlement<'_> {
+    /// The run left the local pool for collection (state `Detached`): the
+    /// receipt is now collection's to settle, so this guard must not fail it
+    /// when it drops. Left armed when the hand-off is refused.
+    fn hand_off(&mut self, job_id: &str, timing: TimingReport) -> Result<(), DaemonError> {
+        self.store.detach_cloud_job(job_id, timing)?;
+        self.settled = true;
+        Ok(())
+    }
+}
+
+impl Drop for Settlement<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.store.unregister_job_control(&self.job_id);
+            let _ = self.store.abort_job(&self.job_id, "backend_failed");
+        }
     }
 }
 
@@ -456,6 +479,192 @@ mod tests {
         assert!(!Arc::ptr_eq(&direct, &backend.cloud.import_lock(&other)));
     }
 
+    /// A project folder, its store, and a session attached to it.
+    fn session_in(root: &Path, terminal: bool) -> (DaemonStore, marsh_daemon::SessionSpec) {
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        let gid = rustix::process::getgid().as_raw();
+        let store = DaemonStore::new(root);
+        let session_id = store.attach_shell(
+            7,
+            marsh_daemon::SessionAuthority {
+                username: "fixture".into(),
+                uid,
+                gid,
+                launch_directory: project.clone(),
+                guest_home: project.clone(),
+                home_backing: project.clone(),
+                ephemeral_home: false,
+            },
+        );
+        let session = marsh_daemon::SessionSpec {
+            session_id,
+            username: "fixture".into(),
+            uid,
+            gid,
+            launch_directory: project.clone(),
+            guest_home: project.clone(),
+            home_backing: project,
+            ephemeral_home: false,
+            terminal,
+            terminal_size: None,
+        };
+        (store, session)
+    }
+
+    fn only_job_states(store: &DaemonStore) -> Vec<marsh_daemon::JobState> {
+        store.jobs().jobs.iter().map(|job| job.state).collect()
+    }
+
+    /// Audit C-01: the refusal came after admission and left a receipt
+    /// `Queued` forever, which a job could repeat with `-i`.
+    #[test]
+    fn an_interactive_cloud_shell_without_a_terminal_is_refused_before_any_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let (store, session) = session_in(&root, false);
+        let backend = crate::tests::backend_for_kit_identity(&root, BTreeMap::new());
+        let (attachment, _caller) = ServerAttachment::pair().unwrap();
+        let request = ExecuteSpec {
+            command: "cloud".into(),
+            arguments: vec![b"-i".to_vec()],
+            placement: marsh_daemon::Placement::Cloud,
+            environment: marsh_contracts::ExportedEnvironment::default(),
+            working_directory: None,
+            session,
+            process: None,
+            acp: false,
+            label: None,
+            model: None,
+            usage: None,
+            kit: None,
+        };
+
+        let error = backend
+            .execute_cloud(request, attachment, store.clone())
+            .unwrap_err();
+        assert!(error.to_string().contains("needs a terminal"), "{error}");
+        assert_eq!(only_job_states(&store), []);
+    }
+
+    /// A detached run that started is handed to collection: dropping its
+    /// settlement afterwards must leave it `Detached`, not failed; one that
+    /// was never handed off still fails.
+    #[test]
+    fn a_detached_run_that_started_is_not_failed_by_its_settlement_dropping() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let (store, session) = session_in(&root, false);
+        let begin = |store: &DaemonStore| {
+            store
+                .begin_cloud_job(
+                    NewJob {
+                        label: None,
+                        session_id: session.session_id.clone(),
+                        command: "cloud".into(),
+                        kit_ref: "cloud-shell".into(),
+                        workload_image: format!("registry.example/shell@sha256:{}", "a".repeat(64)),
+                        mounts: vec![PublicMount {
+                            target: session.launch_directory.clone(),
+                            access: "read_write".into(),
+                        }],
+                    },
+                    &marsh_daemon::process::ProcessLink::default(),
+                    &[],
+                )
+                .unwrap()
+                .0
+        };
+        let (attachment, _caller) = ServerAttachment::pair().unwrap();
+        let started = Instant::now();
+        let settlement = |job_id: String| Settlement {
+            store: &store,
+            attachment: &attachment,
+            job_id,
+            timing: TimingReport::default(),
+            started,
+            phase: started,
+            output_complete: true,
+            settled: false,
+        };
+        let (handed, unhanded) = (begin(&store), begin(&store));
+        for job in [&handed, &unhanded] {
+            store.mark_cloud_running(job, "sbx-cloud-id").unwrap();
+        }
+        let mut guard = settlement(handed.clone());
+        guard.hand_off(&handed, TimingReport::default()).unwrap();
+        drop(guard);
+        drop(settlement(unhanded.clone()));
+        assert_eq!(
+            store.job(&handed).unwrap().state,
+            marsh_daemon::JobState::Detached
+        );
+        assert_eq!(
+            store.job(&unhanded).unwrap().state,
+            marsh_daemon::JobState::Failed
+        );
+    }
+
+    /// The settlement's drop guard fails any receipt it still holds, so the
+    /// production detached start must go through [`Settlement::hand_off`]: a
+    /// direct `store.detach_cloud_job` there would fail every run that had
+    /// just started. Driving `start_detached` needs a fake Docker Cloud, which
+    /// does not exist; this guards the call site by its text instead.
+    #[test]
+    fn the_detached_start_hands_off_through_the_settlement() {
+        let source = include_str!("cloud/detach.rs");
+        let production = source.split("\nmod tests {").next().unwrap();
+        assert!(
+            production.contains("settle.hand_off("),
+            "start_detached must hand off through the settlement"
+        );
+        assert!(
+            !production.contains(".detach_cloud_job("),
+            "a direct detach_cloud_job leaves the drop guard armed"
+        );
+    }
+
+    /// Whatever early exit a later edit adds, an admitted cloud receipt that
+    /// was never settled ends failed instead of staying `Queued`.
+    #[test]
+    fn a_dropped_settlement_aborts_its_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let (store, session) = session_in(&root, false);
+        let (job_id, _, _) = store
+            .begin_cloud_job(
+                NewJob {
+                    label: None,
+                    session_id: session.session_id.clone(),
+                    command: "cloud".into(),
+                    kit_ref: "cloud-shell".into(),
+                    workload_image: format!("registry.example/shell@sha256:{}", "a".repeat(64)),
+                    mounts: vec![PublicMount {
+                        target: session.launch_directory.clone(),
+                        access: "read_write".into(),
+                    }],
+                },
+                &marsh_daemon::process::ProcessLink::default(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(only_job_states(&store), [marsh_daemon::JobState::Queued]);
+        let (attachment, _caller) = ServerAttachment::pair().unwrap();
+        let started = Instant::now();
+        drop(Settlement {
+            store: &store,
+            attachment: &attachment,
+            job_id,
+            timing: TimingReport::default(),
+            started,
+            phase: started,
+            output_complete: true,
+            settled: false,
+        });
+        assert_eq!(only_job_states(&store), [marsh_daemon::JobState::Failed]);
+    }
+
     /// The token reaches the sandbox only on one step's stdin: no
     /// serialized form marsh writes (the request in the snapshot, the
     /// detached record, the receipt) or prints carries it.
@@ -595,6 +804,12 @@ impl StockDaemonBackend {
         store: DaemonStore,
     ) -> Result<(), DaemonError> {
         let (mut options, mode, argv) = parse(&request.arguments)?;
+        // Refused before admission: a receipt would otherwise be left behind.
+        if mode == CloudMode::Shell && argv.is_empty() && !request.session.terminal {
+            return Err(DaemonError::Refused(
+                "cloud: an interactive cloud shell needs a terminal".into(),
+            ));
+        }
         if options.detach {
             if mode == CloudMode::Shell && argv.is_empty() {
                 return Err(DaemonError::Refused(
@@ -827,6 +1042,7 @@ impl StockDaemonBackend {
             started,
             phase: started,
             output_complete: true,
+            settled: false,
         };
         let _ = attachment.send(&AttachmentFrame::JobStarted {
             job_id: job_id.clone(),
@@ -869,12 +1085,6 @@ impl StockDaemonBackend {
             Ok(stat) => stat.identity,
             Err(error) => return not_started(settle, error.to_string()),
         };
-        let interactive = mode == CloudMode::Shell && argv.is_empty();
-        if interactive && !request.session.terminal {
-            return Err(DaemonError::Refused(
-                "cloud: an interactive cloud shell needs a terminal".into(),
-            ));
-        }
         // Only bindings inside this node's spawn set (MARSH_SPAWN narrows it).
         // (A direct call is the Kit itself: it calls no further agents.)
         let bindings = self

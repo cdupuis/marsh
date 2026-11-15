@@ -234,6 +234,10 @@ pub struct Ledger {
     state: Mutex<State>,
     /// The last write failed: durable authority is not established.
     degraded: AtomicBool,
+    /// Held for this ledger's lifetime by an agent that serves requests from
+    /// it (`open_exclusive`): no other serving agent can hold stale authority.
+    #[allow(dead_code)] // held, never read: dropping it releases the lock
+    serve_lock: Option<std::fs::File>,
 }
 
 #[must_use]
@@ -250,6 +254,7 @@ impl Ledger {
             path: None,
             state: Mutex::new(State::default()),
             degraded: AtomicBool::new(false),
+            serve_lock: None,
         }
     }
 
@@ -267,10 +272,13 @@ impl Ledger {
                 Ok(state) => state,
                 Err(first) => {
                     let kept = set_aside(path, &b)?;
+                    write_quarantine(path, &kept)?;
                     eprintln!(
-                        "marsh-services: ledger {} did not parse ({first}); kept as {}",
+                        "marsh-services: ledger {} did not parse ({first}); kept as {}; \
+                         protected paths are unknown until {} is removed",
                         path.display(),
-                        kept.display()
+                        kept.display(),
+                        path.with_extension("quarantine").display()
                     );
                     parse_first_value(&b).unwrap_or_default()
                 }
@@ -283,7 +291,43 @@ impl Ledger {
             path: Some(path.to_path_buf()),
             state: Mutex::new(state),
             degraded: AtomicBool::new(false),
+            serve_lock: None,
         })
+    }
+
+    /// As [`Self::open`], for the agent that serves requests from the ledger:
+    /// it also holds an exclusive lock for its lifetime, so a second serving
+    /// agent (a replacement that started before the old one exited) waits up
+    /// to `wait` and then fails. Reads answer from memory, so two servers
+    /// could authorize an operation on an object the other has since given to
+    /// another workspace; one server at a time cannot.
+    pub fn open_exclusive(path: &Path, wait: std::time::Duration) -> std::io::Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let serving = lock_exclusive(&path.with_extension("serve"), wait).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "another agent is serving {} ({e}); it must exit first",
+                    path.display()
+                ),
+            )
+        })?;
+        let mut ledger = Self::open(path)?;
+        ledger.serve_lock = Some(serving);
+        Ok(ledger)
+    }
+
+    /// The ledger was found corrupt and set aside, so the recorded protected
+    /// identities (`.git`, `.marsh`) cannot be trusted. Until an operator
+    /// verifies them and removes `ledger.quarantine`, nothing that depends on
+    /// them (binding a project folder) is admitted.
+    #[must_use]
+    pub fn quarantined(&self) -> bool {
+        self.path
+            .as_ref()
+            .is_some_and(|path| path.with_extension("quarantine").exists())
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
@@ -844,13 +888,20 @@ fn release_unreferenced(s: &mut State, ids: &[String]) -> Vec<(String, PinRec)> 
 /// Take the exclusive lock that serializes every writer of the ledger at
 /// `path`, across processes. The kernel drops it when the holder dies.
 fn lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    lock_exclusive(
+        &path.with_extension("lock"),
+        std::time::Duration::from_secs(10),
+    )
+}
+
+fn lock_exclusive(lock: &Path, wait: std::time::Duration) -> std::io::Result<std::fs::File> {
     use rustix::fs::{FlockOperation, flock};
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(path.with_extension("lock"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        .open(lock)?;
+    let deadline = std::time::Instant::now() + wait;
     loop {
         match flock(&file, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => return Ok(file),
@@ -937,9 +988,45 @@ fn sweep_temp_files(path: &Path) {
     }
 }
 
+/// Record a step of `persist` (tests assert their order).
+#[cfg(test)]
+fn step(what: &'static str) {
+    STEPS.with(|steps| steps.borrow_mut().push(what));
+}
+
+#[cfg(not(test))]
+fn step(_what: &'static str) {}
+
+#[cfg(test)]
+thread_local! {
+    static STEPS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Keep a note of the corrupt copy and refuse protected-path work until an
+/// operator removes the note.
+fn write_quarantine(path: &Path, kept: &Path) -> std::io::Result<()> {
+    let note = path.with_extension("quarantine");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&note)?;
+    writeln!(file, "corrupt ledger kept as {}", kept.display())?;
+    file.sync_all()?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Write `bytes` to `file` and make them durable.
 fn write_durably(mut file: std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)?;
+    sync("sync-file", &file)
+}
+
+/// `fsync`, noted for the tests of the publishing order.
+fn sync(what: &'static str, file: &std::fs::File) -> std::io::Result<()> {
+    step(what);
     file.sync_all()
 }
 
@@ -959,14 +1046,16 @@ fn persist(path: &Path, state: &State) -> std::io::Result<()> {
         .write(true)
         .create_new(true)
         .open(&tmp)?;
-    let published =
-        write_durably(file, &serde_json::to_vec(state)?).and_then(|()| std::fs::rename(&tmp, path));
+    let published = write_durably(file, &serde_json::to_vec(state)?).and_then(|()| {
+        step("rename");
+        std::fs::rename(&tmp, path)
+    });
     if let Err(e) = published {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     if let Some(dir) = path.parent() {
-        std::fs::File::open(dir)?.sync_all()?;
+        sync("sync-dir", &std::fs::File::open(dir)?)?;
     }
     Ok(())
 }
@@ -1375,6 +1464,79 @@ mod tests {
         let l = Ledger::open(&path).unwrap();
         assert!(!dir.join("ledger.json.99999.0.tmp").exists());
         l.add_container("c1", rec("base", "one")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The order that makes a published ledger durable: the temporary file's
+    /// bytes, then the rename, then the directory entry. Dropping either sync,
+    /// or syncing after the rename, changes this list.
+    #[test]
+    fn a_change_is_published_in_the_durable_order() {
+        let dir = scratch("order");
+        let l = Ledger::open(&dir.join("ledger.json")).unwrap();
+        STEPS.with(|steps| steps.borrow_mut().clear());
+        l.add_container("c1", rec("base", "one")).unwrap();
+        let steps = STEPS.with(|steps| steps.borrow().clone());
+        assert_eq!(steps, ["sync-file", "rename", "sync-dir"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A ledger that did not parse loses the recorded protected identities, so
+    /// the agent notes that it must not trust them: `quarantined` stays true,
+    /// across restarts, until an operator removes the note.
+    #[test]
+    fn a_corrupt_ledger_quarantines_until_an_operator_clears_it() {
+        let dir = scratch("quarantine");
+        let path = dir.join("ledger.json");
+        {
+            let l = Ledger::open(&path).unwrap();
+            assert!(!l.quarantined());
+            l.note_protected(
+                "/p",
+                &[ProtectedId {
+                    name: ".git".into(),
+                    dev: 1,
+                    ino: 2,
+                }],
+            )
+            .unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        let l = Ledger::open(&path).unwrap();
+        assert!(l.quarantined());
+        assert_eq!(l.protected("/p").len(), 0, "the identities are gone");
+        l.add_container("c1", rec("base", "one")).unwrap();
+        drop(l);
+        // The next start reads a clean file, and is still quarantined.
+        assert!(Ledger::open(&path).unwrap().quarantined());
+        // A salvaged older value is no better: its later records are unknown.
+        let mut with_tail = std::fs::read(&path).unwrap();
+        with_tail.extend_from_slice(b"garbage");
+        std::fs::write(&path, with_tail).unwrap();
+        let salvaged = Ledger::open(&path).unwrap();
+        assert!(salvaged.quarantined());
+        salvaged.add_container("c2", rec("base", "two")).unwrap();
+        drop(salvaged);
+        std::fs::remove_file(path.with_extension("quarantine")).unwrap();
+        assert!(!Ledger::open(&path).unwrap().quarantined());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One serving agent at a time: a second waits, then fails; it opens once
+    /// the first is gone.
+    #[test]
+    fn only_one_agent_serves_a_ledger_at_a_time() {
+        let dir = scratch("exclusive");
+        let path = dir.join("ledger.json");
+        let wait = std::time::Duration::from_millis(100);
+        let first = Ledger::open_exclusive(&path, wait).unwrap();
+        let error = Ledger::open_exclusive(&path, wait).err().expect("refused");
+        assert!(error.to_string().contains("another agent"), "{error}");
+        // A short-lived opener (engine-up's restore) is not blocked.
+        assert!(Ledger::open(&path).is_ok());
+        drop(first);
+        assert!(Ledger::open_exclusive(&path, wait).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

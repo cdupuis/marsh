@@ -58,6 +58,9 @@ pub struct Config {
     pub hijack_idle: Duration,
     /// How often a raw stream looks for a vanished peer and for idleness.
     pub hijack_poll: Duration,
+    /// How long a starting agent waits for the previous one to stop serving
+    /// the ledger before it gives up.
+    pub ledger_serve_wait: Duration,
     pub verbose: bool,
 }
 
@@ -78,6 +81,7 @@ impl Default for Config {
             socket_aliases: vec!["/run/marsh/docker.sock".to_string()],
             hijack_idle: Duration::from_mins(30),
             hijack_poll: Duration::from_millis(500),
+            ledger_serve_wait: Duration::from_secs(10),
             verbose: false,
         }
     }
@@ -247,7 +251,7 @@ impl Services {
         let ledger = if cfg.paths.ledger.as_os_str().is_empty() {
             Ledger::in_memory()
         } else {
-            Ledger::open(&cfg.paths.ledger)?
+            Ledger::open_exclusive(&cfg.paths.ledger, cfg.ledger_serve_wait)?
         };
         let pins = PinManager::new(&cfg.paths.bind_root);
         Ok(Arc::new(Self {
@@ -1135,6 +1139,11 @@ impl Env for Scope {
                 msg: e.to_string(),
                 close: false,
             })?;
+        if self.svc.ledger.quarantined() {
+            return Err(Refusal::forbid(
+                "marsh: the ownership records were corrupt, so which paths are protected (.git, .marsh) is unknown: project folders cannot be bound until an operator checks them and removes ledger.quarantine",
+            ));
+        }
         self.svc.note_protected(&root);
         let known = self.svc.ledger.protected(&root.given.to_string_lossy());
         // Mounted, then recorded, with the sweep of unrecorded pins held off.

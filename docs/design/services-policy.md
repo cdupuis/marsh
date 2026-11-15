@@ -134,8 +134,19 @@ spellings.
 Every change takes an exclusive `flock` on `ledger.lock`, reloads the file if
 another agent process published since, writes a private temporary file, fsyncs
 it, renames it over `ledger.json` and fsyncs the directory. A file that does not
-parse is kept as `ledger.json.corrupt-*` (never deleted) and the agent boots on
-the first complete state in it, or an empty one. Enforced by the ledger tests
+parse is kept as `ledger.json.corrupt-*` (never deleted), the agent boots on the
+first complete state in it (or an empty one), and writes `ledger.quarantine`: the
+recorded protected identities (`.git`, `.marsh`) cannot be trusted, so binding a
+project folder is refused (and restore marks pins failed) until an operator
+checks them and removes that file. The serving agent also holds `ledger.serve`
+for its lifetime, so a replacement that starts early waits, then fails, rather
+than answering from a stale view. A ledger that goes corrupt while the agent
+runs is not set aside: the ledger degrades and refuses writes until restart.
+Enforced by the ledger tests `a_change_is_published_in_the_durable_order`,
+`a_corrupt_ledger_quarantines_until_an_operator_clears_it`,
+`only_one_agent_serves_a_ledger_at_a_time`, the endpoint tests
+`a_second_serving_agent_on_one_ledger_is_refused` and
+`a_corrupt_ledger_refuses_project_binds_but_not_other_creates`, and
 `two_ledgers_on_one_file_keep_each_others_records`,
 `racing_writers_never_tear_or_lose_the_ledger` and
 `an_unparseable_ledger_is_set_aside_not_deleted`.

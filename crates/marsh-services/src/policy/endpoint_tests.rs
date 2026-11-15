@@ -533,6 +533,50 @@ fn a_ledger_write_failure_refuses_and_leaves_no_engine_object() {
     assert_eq!(st, 201, "admission did not resume: {body}");
 }
 
+/// A second agent serving the same ledger (a replacement that started before
+/// the old relay exited) is refused, so it cannot answer from a stale view and
+/// let a request delete a volume the ledger has since given to another
+/// workspace.
+#[test]
+fn a_second_serving_agent_on_one_ledger_is_refused() {
+    let h = H::new("secondagent", true, no_custom(), |_| {});
+    let mut cfg = Config::default();
+    cfg.paths.ledger = h.dir.join("ledger.json");
+    cfg.ledger_serve_wait = Duration::from_millis(100);
+    let error = Services::new(cfg.clone(), &h.dir.join("engine.sock"))
+        .err()
+        .expect("a second server must be refused");
+    assert!(error.to_string().contains("another agent"), "{error}");
+    drop(h);
+    assert!(Services::new(cfg, &scratch("secondagent-engine").join("e.sock")).is_ok());
+}
+
+/// A corrupt ledger forgets which paths are protected: binds of a project
+/// folder are refused (nothing reaches the engine) until an operator clears
+/// the note; other requests still work.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_corrupt_ledger_refuses_project_binds_but_not_other_creates() {
+    let h = H::new("quarantine", true, no_custom(), |_| {});
+    std::fs::create_dir_all(h.dir.join("data")).unwrap();
+    std::fs::write(
+        h.dir.join("ledger.quarantine"),
+        "corrupt ledger kept as x\n",
+    )
+    .unwrap();
+    let sock = h.serve(&h.auth);
+    let body = format!(
+        r#"{{"Image":"busybox","HostConfig":{{"Binds":["{}:/data"]}}}}"#,
+        h.dir.join("data").display()
+    );
+    let (status, reply) = call(&sock, "POST", "/containers/create", Some(&body));
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("ledger.quarantine"), "{reply}");
+    assert_eq!(h.engine.created.load(Ordering::SeqCst), 0);
+    let (status, reply) = call(&sock, "POST", "/containers/create", Some(CREATE));
+    assert_eq!(status, 201, "{reply}");
+}
+
 // --- freeze ordering ------------------------------------------------------------
 
 fn inflight(svc: &Services, ws: &str) -> usize {

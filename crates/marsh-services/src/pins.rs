@@ -870,7 +870,14 @@ mod imp {
         let mut rep = RestoreReport::default();
         let ledger_err = |e: crate::ledger::LedgerError| std::io::Error::other(e.to_string());
         for (id, rec) in ledger.pins() {
-            match mgr.restore(&id, &rec, &ledger.protected(&rec.project_root)) {
+            let restored = if ledger.quarantined() {
+                Err(PinError::Refused(
+                    "the ledger was corrupt: protected paths are unknown".into(),
+                ))
+            } else {
+                mgr.restore(&id, &rec, &ledger.protected(&rec.project_root))
+            };
+            match restored {
                 Ok(()) => {
                     ledger.set_pin_failed(&id, false).map_err(ledger_err)?;
                     rep.restored.push(id);

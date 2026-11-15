@@ -486,6 +486,20 @@ impl StockDaemonBackend {
         Ok(canonical)
     }
 
+    /// The project `rm` acts on: the exact folder of an owned VM whose folder
+    /// is gone, else the usual canonical existing directory (so any existing
+    /// folder is accepted as it is for every other request).
+    fn remove_target(
+        &self,
+        root: &Path,
+        owned: &[(String, String)],
+    ) -> Result<PathBuf, DaemonError> {
+        match missing_project_root(root, owned) {
+            Some(gone) => Ok(gone),
+            None => self.services_root(root),
+        }
+    }
+
     fn services_spec(&self, root: &Path, settings: &Settings) -> ServicesVmSpec {
         ServicesVmSpec {
             project: root.to_owned(),
@@ -534,10 +548,7 @@ impl StockDaemonBackend {
                 self.services_stop(&root)
             }
             ServicesRequest::Remove { root } => {
-                let root = match missing_project_root(&root, &self.sbx.owned_services_vms()) {
-                    Some(gone) => gone,
-                    None => self.services_root(&root)?,
-                };
+                let root = self.remove_target(&root, &self.sbx.owned_services_vms())?;
                 self.services_remove(&root)
             }
         }
@@ -1949,6 +1960,33 @@ mod tests {
         let below = file.join("project");
         let owned = vec![("marsh-svc-c".to_owned(), key(&below))];
         assert_eq!(missing_project_root(&below, &owned), None);
+    }
+
+    /// What `rm` acts on: a recorded project whose folder is gone, or else the
+    /// usual rule; an unrecorded missing folder, and a recorded key spelled
+    /// differently, are refused.
+    #[test]
+    fn rm_acts_on_a_gone_recorded_folder_or_the_usual_rule() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let base = fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let (gone, present, stranger) = (
+            base.join("moved"),
+            base.join("present"),
+            base.join("never-owned"),
+        );
+        fs::create_dir(&present).unwrap();
+        let owned = vec![("marsh-svc-a".to_owned(), gone.to_str().unwrap().to_owned())];
+        assert_eq!(backend.remove_target(&gone, &owned).unwrap(), gone);
+        assert_eq!(backend.remove_target(&present, &owned).unwrap(), present);
+        assert!(backend.remove_target(&stranger, &owned).is_err());
+        assert!(backend.remove_target(&gone, &[]).is_err());
+        assert!(
+            backend
+                .remove_target(&present.join("..").join("moved"), &owned)
+                .is_err()
+        );
+        fs::remove_dir_all(&base).unwrap();
     }
 
     fn scope(config: Option<&str>) -> tempfile::TempDir {

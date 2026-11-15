@@ -898,8 +898,8 @@ fn services_command(
         Command::Hold { seconds, json } => (Request::Hold { root, seconds }, json),
         Command::Release { holder, json } => (Request::Release { root, holder }, json),
         Command::Internet { on, json } => (Request::Internet { root, on }, json),
-        Command::Remove { yes, json, .. } => {
-            if !yes && !confirm_services_removal(&root)? {
+        Command::Remove { yes, json, project } => {
+            if !yes && !confirm_services_removal(&root, project.is_some())? {
                 writeln!(stdout, "not removed")?;
                 return Ok(ProductOutcome::Complete(1));
             }
@@ -926,16 +926,23 @@ fn write_project_list(stderr: &mut impl Write, projects: &[String]) -> std::io::
 }
 
 /// Ask on the terminal; with no terminal the caller must pass `--yes`.
-fn confirm_services_removal(root: &std::path::Path) -> Result<bool, ProductError> {
+fn confirm_services_removal(root: &std::path::Path, named: bool) -> Result<bool, ProductError> {
     use std::io::{BufRead as _, IsTerminal as _};
     if !std::io::stdin().is_terminal() {
         return Err(ProductError::Operation(
             "marsh docker rm removes the VM and its disk: pass --yes to confirm".into(),
         ));
     }
+    // A folder named with --project may be gone for good, or only on a drive
+    // that is not mounted right now: both look the same.
     eprint!(
-        "Remove the Docker VM of {} and its Docker disk? [y/N] ",
-        display_safe(&root.display().to_string())
+        "Remove the Docker VM of {}{} and its Docker disk? [y/N] ",
+        display_safe(&root.display().to_string()),
+        if named {
+            " (named with --project; if its folder is on a drive that is not mounted, mount it instead)"
+        } else {
+            ""
+        }
     );
     let mut answer = String::new();
     std::io::stdin().lock().read_line(&mut answer)?;

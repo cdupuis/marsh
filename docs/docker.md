@@ -371,8 +371,9 @@ marsh docker rm --yes
 the project, so turning Docker off never strands a VM. A project folder that was
 moved or deleted still has its Docker VM and disk: `marsh docker status` marks it
 as gone, and `marsh docker rm --project /old/path` (from any folder) removes
-it. It only accepts the exact folder of a Docker VM marsh made, and never one
-whose folder exists.
+it. For a folder that is gone it only accepts the exact folder of a Docker VM
+marsh made (a folder on a drive that is not mounted looks gone too, so mount
+it first); for a folder that exists it acts like `marsh docker rm` run there.
 
 ## Checkpoints and Branch from here
 

@@ -351,7 +351,7 @@ mod tests {
         stream: UnixStream,
         state: &Mutex<HashMap<String, Mode>>,
         log: &Mutex<Vec<String>>,
-        stage: (&Mutex<Option<bool>>, &Path),
+        probe: (&Mutex<Option<bool>>, &Path),
     ) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut first = String::new();
@@ -368,11 +368,11 @@ mod tests {
         let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
         log.lock().unwrap().push(format!("{method} {path}"));
         if method == "POST" && path.ends_with("/unpause") {
-            stage
+            probe
                 .0
                 .lock()
                 .unwrap()
-                .get_or_insert_with(|| stage.1.join(REVOKED).exists());
+                .get_or_insert_with(|| probe.1.join(REVOKED).exists());
         }
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let (code, body) = match (method, parts.as_slice()) {

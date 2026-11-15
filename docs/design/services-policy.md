@@ -146,12 +146,25 @@ after the name was given to another workspace
 (`a_delayed_delete_cannot_remove_a_volume_another_workspace_now_owns`). The agent
 makes the engine call itself, so the client leaving does not end it early
 (`a_delete_whose_client_disconnected_still_holds_the_name_until_the_engine_finishes`).
-The ledger releases the name only when the engine answers 200, 204 or 404. If the
-engine does not answer, the owner keeps the name and every claim of it is refused
-for `delete_fence` (5 minutes): a request that is still at the engine may land
-later (`a_delete_the_engine_did_not_answer_fences_the_name_before_it_can_be_reassigned`).
-The fence is in memory only (an agent restart forgets it), and it is time-based:
-the engine gives no way to cancel or confirm a request it has accepted. This covers
+The ledger releases the name only when the engine answers 200, 204 or 404. If a
+delete was sent and the engine does not answer (timeout, a reply that trickles
+past the whole-call deadline `up_progress`, an error after the send), the owner
+keeps the name and every claim of it is refused for `delete_fence` (5 minutes),
+because the request may land later
+(`a_delete_the_engine_did_not_answer_fences_the_name_before_it_can_be_reassigned`).
+A delete that was never sent (the engine could not be dialed) fences nothing
+(`a_delete_that_was_never_sent_fences_nothing`). The fence ends early when a later
+delete of the name gets 200, 204 or 404, or when an inspect (on the next claim)
+finds the volume absent (`a_confirmed_retry_clears_the_fence_for_the_owners_own_recreate`,
+`an_inspect_that_finds_the_volume_absent_clears_the_fence`); both rest on dockerd
+doing one removal of a name at a time and on its requests running promptly, which
+the endpoint cannot verify. Volume creates and container creates with a named
+volume (`ensure_volume`) both honor the fence. An engine error on a delete (409,
+5xx) is an answer: the owner keeps the volume and the reply is passed on. The
+reply to a delete is the engine's (status line, headers, body; keep-alive when
+the client asked for it). The fence is in memory only (an agent restart forgets
+it), and it is time-based: the engine gives no way to cancel or confirm a request
+it has accepted. This covers
 DELETE of a volume against volume claims. Container and network deletes (they
 address the engine by the ID the ledger resolved), volume prune and other
 label-filtered engine calls are not serialized this way and are not covered.

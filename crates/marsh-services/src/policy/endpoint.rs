@@ -545,7 +545,20 @@ impl Services {
         path: &str,
         body: Option<&[u8]>,
     ) -> io::Result<(u16, Vec<u8>)> {
-        let mut s = self.dial()?;
+        let (resp, body) = self.exchange(self.dial()?, method, path, body)?;
+        Ok((resp.status, body))
+    }
+
+    /// One request on an already dialed engine connection: the whole answer
+    /// must arrive within `up_progress` (a reply that trickles in is cut off).
+    fn exchange(
+        &self,
+        mut s: UnixStream,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> io::Result<(RespHead, Vec<u8>)> {
+        let deadline = std::time::Instant::now() + self.cfg.up_progress;
         let mut head = format!("{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n");
         if let Some(b) = body {
             head.push_str(&format!(
@@ -568,8 +581,35 @@ impl Services {
             },
         );
         let resp = conn.read_response_head(method == "HEAD").map_err(http_io)?;
-        let body = read_resp_body(&mut conn, &resp, 32 << 20).map_err(http_io)?;
-        Ok((resp.status, body))
+        let body = read_resp_body(&mut conn, &resp, 32 << 20, Some(deadline)).map_err(http_io)?;
+        Ok((resp, body))
+    }
+
+    /// Refuse a claim of a name whose delete may still be pending at the
+    /// engine, unless the engine now shows the volume absent (the delete has
+    /// finished). Called with `vol_lock` held.
+    fn check_fence(&self, name: &str) -> Result<(), Refusal> {
+        if !self.volume_fenced(name) {
+            return Ok(());
+        }
+        if let Ok((404, _)) = self.up_request("GET", &format!("/volumes/{name}"), None) {
+            self.unfence_volume(name);
+            return Ok(());
+        }
+        Err(Refusal {
+            status: 503,
+            msg: format!(
+                "a delete of volume {name:?} has not been confirmed by the engine; try again later"
+            ),
+            close: false,
+        })
+    }
+
+    fn unfence_volume(&self, name: &str) {
+        self.fenced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
     }
 
     fn lock_tags(&self) -> std::sync::MutexGuard<'_, TagRes> {
@@ -1432,15 +1472,7 @@ impl Env for Scope {
             .vol_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.svc.volume_fenced(name) {
-            return Err(Refusal {
-                status: 503,
-                msg: format!(
-                    "a delete of volume {name:?} has not been confirmed by the engine; try again later"
-                ),
-                close: false,
-            });
-        }
+        self.svc.check_fence(name)?;
         let fail = |m: String| Refusal {
             status: 500,
             msg: m,
@@ -1500,15 +1532,7 @@ impl Env for Scope {
             .vol_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.svc.volume_fenced(name) {
-            return Err(Refusal {
-                status: 503,
-                msg: format!(
-                    "a delete of volume {name:?} has not been confirmed by the engine; try again later"
-                ),
-                close: false,
-            });
-        }
+        self.svc.check_fence(name)?;
         let ws = &self.auth.workspace;
         let claim = self
             .svc
@@ -1968,7 +1992,7 @@ fn handle_request(scope: &Arc<Scope>, conn: &mut Conn, head: &Head) -> io::Resul
         adm.upgrade = None;
     }
     if let Post::VolumeDelete { name } = adm.post.clone() {
-        return Ok(delete_volume(scope, conn, &adm, &name));
+        return Ok(delete_volume(scope, conn, head, &adm, &name));
     }
     let result = forward(scope, conn, head, &mut adm, m.kind);
     match result {
@@ -2258,7 +2282,13 @@ fn canonical_header(k: &str) -> String {
         .join("-")
 }
 
-fn read_resp_body(c: &mut Conn, resp: &RespHead, cap: usize) -> Result<Vec<u8>, HttpError> {
+fn read_resp_body(
+    c: &mut Conn,
+    resp: &RespHead,
+    cap: usize,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<u8>, HttpError> {
+    let late = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
     let mut out = Vec::new();
     let mut buf = vec![0u8; 16 * 1024];
     let mut st = match resp.framing {
@@ -2269,6 +2299,9 @@ fn read_resp_body(c: &mut Conn, resp: &RespHead, cap: usize) -> Result<Vec<u8>, 
             let n = c.read_until_close(&mut buf)?;
             if n == 0 {
                 return Ok(out);
+            }
+            if late() {
+                return Err(HttpError::Timeout);
             }
             if out.len() + n > cap {
                 return Err(HttpError::BodyTooLarge);
@@ -2285,6 +2318,9 @@ fn read_resp_body(c: &mut Conn, resp: &RespHead, cap: usize) -> Result<Vec<u8>, 
             return Err(HttpError::BodyTooLarge);
         }
         out.extend_from_slice(&buf[..n]);
+        if late() {
+            return Err(HttpError::Timeout);
+        }
     }
 }
 
@@ -2466,7 +2502,7 @@ fn respond(
             | Post::ListVolumes
     );
     if buffered && resp.framing != RespFraming::NoBody {
-        let body = match read_resp_body(upc, resp, 32 << 20) {
+        let body = match read_resp_body(upc, resp, 32 << 20, None) {
             Ok(b) => b,
             Err(e) => {
                 undo_post(scope, &adm.post);
@@ -2735,26 +2771,50 @@ fn record_container(
 /// name only on an answer that says it is gone. If the engine does not answer,
 /// the delete may still land later, so the name stays with its owner and is
 /// fenced against every claim for `delete_fence`.
-fn delete_volume(scope: &Arc<Scope>, conn: &mut Conn, adm: &Admitted, name: &str) -> bool {
+fn delete_volume(
+    scope: &Arc<Scope>,
+    conn: &mut Conn,
+    head: &Head,
+    adm: &Admitted,
+    name: &str,
+) -> bool {
     let svc = &scope.svc;
     let mut path = adm.path.clone();
     if !adm.query.is_empty() {
         path.push('?');
         path.push_str(&encode_query(&adm.query));
     }
-    match svc.up_request("DELETE", &path, None) {
-        Ok((status, body)) => {
-            if matches!(status, 200 | 204 | 404) {
-                post_actions(scope, &adm.post);
-            }
-            let text = if status == 204 { Vec::new() } else { body };
-            let head = format!(
-                "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                super::http::status_text(status),
-                text.len()
+    // Nothing was sent if the engine cannot be dialed: no fence.
+    let up = match svc.dial() {
+        Ok(up) => up,
+        Err(e) => {
+            reply(
+                &mut conn.stream,
+                502,
+                &format!("the engine is not available: {e}"),
+                true,
             );
-            let _ = conn.stream.write_all(head.as_bytes());
-            let _ = conn.stream.write_all(&text);
+            return false;
+        }
+    };
+    match svc.exchange(up, "DELETE", &path, None) {
+        Ok((resp, body)) => {
+            // The engine answered, so the delete is over. Dockerd removes one
+            // name at a time, so this answer also means any earlier unanswered
+            // delete of the name has finished: the fence ends.
+            if matches!(resp.status, 200 | 204 | 404) {
+                post_actions(scope, &adm.post);
+                svc.unfence_volume(name);
+            }
+            let out = if resp.framing == RespFraming::NoBody {
+                Out::Bodiless
+            } else {
+                Out::Length(body.len() as u64)
+            };
+            let keep = !head.close;
+            let sent = write_resp_head(&mut conn.stream, &resp, out, keep, None)
+                .and_then(|()| conn.stream.write_all(&body));
+            keep && sent.is_ok()
         }
         Err(e) => {
             svc.fence_volume(name);
@@ -2765,9 +2825,9 @@ fn delete_volume(scope: &Arc<Scope>, conn: &mut Conn, adm: &Admitted, name: &str
                 "the engine did not answer the delete; the volume name stays reserved until it is known to be gone",
                 true,
             );
+            false
         }
     }
-    false
 }
 
 fn post_actions(scope: &Arc<Scope>, post: &Post) {

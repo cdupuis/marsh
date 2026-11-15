@@ -224,6 +224,15 @@ fn parse(body: &[u8]) -> Result<(Vec<Value>, Vec<Value>), String> {
             .into_iter()
             .flatten()
         {
+            // Only 127.0.0.1 is forwarded into jobs; a binding on another loopback
+            // address (127.0.0.2, ::1) is not published to them.
+            if port
+                .get("IP")
+                .and_then(Value::as_str)
+                .is_some_and(|ip| ip != "127.0.0.1")
+            {
+                continue;
+            }
             let (Some(container), Some(host)) = (
                 port.get("PrivatePort").and_then(Value::as_u64),
                 port.get("PublicPort").and_then(Value::as_u64),
@@ -269,6 +278,8 @@ mod tests {
            "Labels":{"com.docker.compose.service":"db"},
            "Ports":[{"IP":"127.0.0.1","PrivatePort":5432,"PublicPort":5432,"Type":"tcp"},
                     {"IP":"::1","PrivatePort":5432,"PublicPort":5432,"Type":"tcp"},
+                    {"IP":"127.0.0.2","PrivatePort":80,"PublicPort":8080,"Type":"tcp"},
+                    {"IP":"::1","PrivatePort":81,"PublicPort":8081,"Type":"tcp"},
                     {"PrivatePort":9999,"Type":"tcp"}]},
           {"Names":["/\u001b[31mevil\n"],"State":"Run\nning","Status":"Up","Labels":{},"Ports":[]}]"#;
         let (containers, ports) = parse(body).unwrap();

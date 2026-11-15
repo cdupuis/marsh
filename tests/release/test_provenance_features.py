@@ -197,9 +197,23 @@ def pinned_toolchain_installed():
 REQUIRED = os.environ.get("MARSH_REQUIRE_RUST_PROBES") == "1"
 
 
+def dependencies_resolve_offline():
+    """The probes build marsh-sbx offline: skip where the registry was never fetched
+    (the tooling job has a cargo but no `cargo fetch`)."""
+    environment = dict(os.environ, RUSTUP_AUTO_INSTALL="0")
+    try:
+        done = subprocess.run(
+            ["cargo", "metadata", "--offline", "--locked", "--format-version", "1"],
+            cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0
+
+
 @unittest.skipUnless(
-    REQUIRED or pinned_toolchain_installed(),
-    "the pinned Rust toolchain (rust-toolchain.toml) is not installed; these probes run in the Rust lanes",
+    REQUIRED or (pinned_toolchain_installed() and dependencies_resolve_offline()),
+    "the pinned Rust toolchain or the fetched crate registry is missing; these probes run in the Rust lanes",
 )
 class CompileTimeRefusal(unittest.TestCase):
     """marsh-sbx refuses the harness at compile time under MARSH_RELEASE_PACKAGING=1,

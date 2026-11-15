@@ -8,8 +8,8 @@
 
 use super::coordinator::{self, Coordinator};
 use super::{
-    CloudRequest, delta, helper_path, kill_workload, link_dir, prepare_links, privileged,
-    record_status, run_user, state_dir, state_path, workload_command,
+    CloudRequest, delta, helper_path, kill_workload, link_dir, lock_privileges, prepare_links,
+    privileged, record_status, run_user, state_dir, state_path, workload_command,
 };
 use marsh_contracts::cloud::CloudMode;
 use std::fs::{self, File, OpenOptions};
@@ -65,6 +65,10 @@ pub(super) fn run() -> i32 {
         Err(error) => {
             // Nothing runs: say so the same way a supervisor would.
             eprintln!("marsh cloud: cannot start the supervisor: {error}");
+            // No supervisor will ever read the uploaded token.
+            if let Ok(state) = state_dir() {
+                let _ = coordinator::discard_token_file(&state);
+            }
             let _ = finish_without_workload(&format!("cannot start the supervisor: {error}"));
             println!("failed");
             return 1;
@@ -177,6 +181,9 @@ pub(super) fn supervise() -> i32 {
     };
     let started = (|| -> io::Result<Supervised> {
         let state = state_dir()?;
+        // Whatever happens next (a failed start, or a run with no coordinator
+        // that never reads it), no uploaded token stays on the disk.
+        let _token = coordinator::token_guard(&state, privileged());
         let user = run_user()?;
         fs::write(state.join("supervisor"), std::process::id().to_string())?;
         if !privileged() {
@@ -218,6 +225,7 @@ pub(super) fn supervise() -> i32 {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
+        lock_privileges()?;
         let mut child = command
             .spawn()
             .map_err(|error| start_failure(&request, &error))?;
@@ -536,7 +544,7 @@ pub(super) fn state() {
         "delta": fs::metadata(state.join("result.delta")).ok().map(|metadata| metadata.len()),
         "stdout": streams[0],
         "stderr": streams[1],
-        "delegate": exists(coordinator::DELEGATE_FILE),
+        "delegate": exists(coordinator::DELEGATE_FILE) || exists(coordinator::DELEGATE_USED),
         "children": coordinator::call_records(&state),
         "sandboxes": coordinator::owned_sandboxes(&state),
     });

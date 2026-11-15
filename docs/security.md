@@ -530,11 +530,13 @@ Detached cloud runs with `cloud-delegate` on
   root-only file in its sandbox, so its supervisor can start agent sandboxes.
   That access is all or nothing: anyone holding the token can create, use,
   and delete every cloud sandbox on your account and spend its quota. The
-  run's commands run as an unprivileged user without `sudo` and cannot read
-  the file; they can only ask the supervisor to start one of the run's own
-  Kits, within a per-run cap and the run's time limit. What remains exposed
-  is the sandbox itself (its disk holds the file until the sandbox is
-  deleted) and the supervisor. marsh reads the token from your Keychain only
+  run's commands run as an unprivileged user, which the supervisor checks
+  (not root, no extra groups, no `sudo` rule, no Docker socket access; the run
+  is refused otherwise) before it reads the file, and the file is deleted once
+  the supervisor has signed in. They can only ask the supervisor to start one
+  of the run's own Kits, within a per-run cap and the run's time limit. What
+  remains exposed is the sandbox itself (the signed-in CLI's session stays in
+  a root-only directory until the sandbox is deleted) and the supervisor. marsh reads the token from your Keychain only
   at a run's start and passes it on one root-only step's stdin; it is not in
   requests, records, receipts, logs, or command lines. See
   [Docker Cloud](cloud.md#agents-calling-agents-with-the-lid-closed).

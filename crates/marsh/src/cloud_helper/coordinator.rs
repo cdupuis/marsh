@@ -36,6 +36,8 @@ const SBX_RELEASE: &str = "https://github.com/docker/sbx-releases/releases/downl
 const SBX_RELEASE_SHA256: &str = "53c5250c480b8ef671d89413d824af62e08575c3b0051570dc5efa9f48a94eb6";
 /// The uploaded Docker ID and access token (root, 0600).
 pub(super) const DELEGATE_FILE: &str = "delegate";
+/// Left in place of [`DELEGATE_FILE`] once the token has been used to sign in.
+pub(super) const DELEGATE_USED: &str = "delegate-used";
 /// One JSON line per finished agent call.
 pub(super) const CALLS_FILE: &str = "children.jsonl";
 /// The coordinator's sandbox ownership record (`cloud-ownership.json`).
@@ -75,6 +77,199 @@ pub(super) fn store_delegate() -> io::Result<()> {
     file.write_all(format!("{account}\n{token}\n").as_bytes())?;
     input.fill(0);
     file.sync_all()
+}
+
+/// The token's life in `start`, in one place: the workload user is looked at
+/// first (the image is the caller's, and the token's only guard is that the
+/// workload cannot become root), then the token is read and handed to
+/// `sign_in`; the file is deleted and the copies zeroed on every way out,
+/// success or not.
+fn use_token<T>(
+    state: &Path,
+    probe: impl FnOnce() -> io::Result<Isolation>,
+    sign_in: impl FnOnce(&str, &str) -> io::Result<T>,
+) -> io::Result<T> {
+    let result = (|| {
+        if let Some(problem) = isolation_problem(&probe()?) {
+            return Err(io::Error::other(format!(
+                "cloud-delegate: refused: {problem}; delegation needs an image where the workload user has no sudo, no extra groups and no Docker socket access (the default image does)"
+            )));
+        }
+        let mut delegate = fs::read(state.join(DELEGATE_FILE)).map_err(|_| {
+            io::Error::other("cloud-delegate: no access token was uploaded for this run")
+        })?;
+        let parsed = parse_delegate(&delegate);
+        delegate.fill(0);
+        let (account, token) = parsed
+            .ok_or_else(|| io::Error::other("cloud-delegate: the uploaded token is unreadable"))?;
+        let signed_in = sign_in(&account, &token);
+        token.into_bytes().fill(0);
+        signed_in
+    })();
+    // The PAT is not needed again, and a failed start needs it no more:
+    // do not leave it on the sandbox disk, which a stopped run keeps for days.
+    let forgotten = forget_delegate(state);
+    let value = result?;
+    forgotten?;
+    Ok(value)
+}
+
+/// Delete the uploaded token after sign-in, leaving a marker that one was used.
+fn forget_delegate(state: &Path) -> io::Result<()> {
+    // The token first: a marker that cannot be written must not leave it.
+    let removed = discard_token_file(state);
+    let marker = File::create(state.join(DELEGATE_USED)).and_then(|file| file.sync_all());
+    removed.and(marker)
+}
+
+/// Overwrite and unlink the uploaded token file (a plain unlink leaves the
+/// bytes on the disk). No marker; a missing file is fine.
+pub(super) fn discard_token_file(state: &Path) -> io::Result<()> {
+    let path = state.join(DELEGATE_FILE);
+    if let Ok(metadata) = fs::metadata(&path)
+        && let Ok(mut file) = OpenOptions::new().write(true).open(&path)
+    {
+        let _ = file.write_all(&vec![0; usize::try_from(metadata.len()).unwrap_or(0)]);
+        let _ = file.sync_all();
+    }
+    match fs::remove_file(&path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// The guard `supervise` holds (privileged helpers only: a Kit sandbox has no
+/// token file).
+pub(super) fn token_guard(state: &Path, privileged: bool) -> Option<TokenGuard> {
+    privileged.then(|| TokenGuard(state.to_owned()))
+}
+
+/// Removes the token file when it goes out of scope: a start that fails or
+/// never needs the token (no coordinator is started) must not leave it.
+pub(super) struct TokenGuard(pub(super) PathBuf);
+
+impl Drop for TokenGuard {
+    fn drop(&mut self) {
+        let _ = discard_token_file(&self.0);
+    }
+}
+
+/// What the workload user can do, as seen from root.
+struct Isolation {
+    user: String,
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+    /// What `sudo -n -l -U USER` printed.
+    sudo: String,
+    /// Owner, group and mode of `/var/run/docker.sock`, if it exists.
+    docker_socket: Option<(u32, u32, u32)>,
+    /// The workload user can open the socket (checked as that user, so ACLs
+    /// count; `false` when this helper is not root and cannot become it).
+    socket_access: bool,
+}
+
+/// Why the workload user could reach the token, if it could.
+fn isolation_problem(facts: &Isolation) -> Option<String> {
+    let user = &facts.user;
+    if facts.uid == 0 || facts.gid == 0 {
+        return Some(format!("{user} is root or in root's group"));
+    }
+    if facts.groups.iter().any(|group| *group != facts.gid) {
+        return Some(format!("{user} belongs to groups besides its own"));
+    }
+    if !facts.sudo.contains("is not allowed to run sudo") {
+        return Some(format!("{user} may run sudo"));
+    }
+    if facts.socket_access
+        || facts.docker_socket.is_some_and(|(owner, group, mode)| {
+            mode & 0o006 != 0 || owner == facts.uid || (mode & 0o060 != 0 && group == facts.gid)
+        })
+    {
+        return Some(format!("{user} can reach /var/run/docker.sock"));
+    }
+    None
+}
+
+/// Run a probe command with a clean environment; a missing program says so.
+fn probe_command(program: &str, args: &[&str]) -> io::Result<std::process::Output> {
+    Command::new(program)
+        .args(args)
+        .env_clear()
+        .env("PATH", PATH)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            io::Error::other(format!(
+                "cannot run `{program}` to check the workload user ({error}); delegation needs an image with `sudo` and `id`"
+            ))
+        })
+}
+
+/// Whether `uid`/`gid` (no other groups: the workload has none) can open
+/// `path` for reading or writing, asked of the kernel by a child that runs as
+/// that user, so ACLs and every other rule count. `Ok(false)` only when the
+/// check ran and said no (exit 1, the one answer `test` gives for that); any
+/// other end (exit 2, 127, a signal) is "cannot tell" and counts as reachable.
+/// Needs root, or the user's own ids. The check trusts the image's own `test`.
+fn reachable_as(path: &Path, uid: u32, gid: u32) -> io::Result<bool> {
+    reachable_with("test", path, uid, gid)
+}
+
+fn reachable_with(program: &str, path: &Path, uid: u32, gid: u32) -> io::Result<bool> {
+    let path = path.to_string_lossy().into_owned();
+    Command::new(program)
+        .args(["-r", &path, "-o", "-w", &path])
+        .env_clear()
+        .env("PATH", PATH)
+        .stdin(Stdio::null())
+        .uid(uid)
+        .gid(gid)
+        .status()
+        .map(|status| status.code() != Some(1))
+}
+
+/// Whether the workload user may reach the socket: it exists, and either the
+/// check says so or it cannot be made (fail closed). Not root: the check
+/// cannot run as the workload user, and the mode-bit rules stand alone.
+fn socket_access(exists: bool, root: bool, check: impl FnOnce() -> io::Result<bool>) -> bool {
+    exists && root && check().unwrap_or(true)
+}
+
+fn probe_isolation(user: &nix::unistd::User) -> io::Result<Isolation> {
+    use std::os::unix::fs::MetadataExt as _;
+    let listed = probe_command("id", &["-G", &user.name])?;
+    if !listed.status.success() {
+        return Err(io::Error::other("cannot list the workload user's groups"));
+    }
+    let groups = String::from_utf8_lossy(&listed.stdout)
+        .split_whitespace()
+        .map(|group| {
+            group
+                .parse::<u32>()
+                .map_err(|_| io::Error::other("cannot read the workload user's groups"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let listing = probe_command("sudo", &["-n", "-l", "-U", &user.name])?;
+    let mut sudo = String::from_utf8_lossy(&listing.stdout).into_owned();
+    sudo.push_str(&String::from_utf8_lossy(&listing.stderr));
+    let socket = Path::new("/var/run/docker.sock");
+    let docker_socket = fs::metadata(socket)
+        .ok()
+        .map(|metadata| (metadata.uid(), metadata.gid(), metadata.mode()));
+    // Fail closed: a socket that exists and cannot be asked about is reachable.
+    let socket_access = socket_access(docker_socket.is_some(), super::privileged(), || {
+        reachable_as(socket, user.uid.as_raw(), user.gid.as_raw())
+    });
+    Ok(Isolation {
+        user: user.name.clone(),
+        uid: user.uid.as_raw(),
+        gid: user.gid.as_raw(),
+        groups,
+        sudo,
+        docker_socket,
+        socket_access,
+    })
 }
 
 /// `ID\nTOKEN\n` with a plausible Docker ID and a token of printable,
@@ -439,16 +634,17 @@ impl Coordinator {
         user: nix::unistd::User,
     ) -> io::Result<Arc<Self>> {
         let state = state_path();
-        let delegate = fs::read_to_string(state.join(DELEGATE_FILE)).map_err(|_| {
-            io::Error::other("cloud-delegate: no access token was uploaded for this run")
-        })?;
-        let (account, token) = parse_delegate(delegate.as_bytes())
-            .ok_or_else(|| io::Error::other("cloud-delegate: the uploaded token is unreadable"))?;
-        check_hub_access(&plan, &account, &token)?;
-        let program = install_sbx(&state)?;
-        let home = private_directory(&state.join("sbx-home"))?;
-        sign_in(&program, &home, &account, &token)?;
-        drop(token);
+        let (program, home) = use_token(
+            &state,
+            || probe_isolation(&user),
+            |account, token| {
+                check_hub_access(&plan, account, token)?;
+                let program = install_sbx(&state)?;
+                let home = private_directory(&state.join("sbx-home"))?;
+                sign_in(&program, &home, account, token)?;
+                Ok((program, home))
+            },
+        )?;
         let children = private_directory(&state.join(CHILDREN_DIR))?;
         let runner = Arc::new(
             marsh_runtime::SystemCommandRunner::new(&home)
@@ -861,6 +1057,319 @@ fn refuse(stream: &UnixStream, code: i32, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real `id` and `sudo -l -U` output of an ordinary account passes the
+    /// check (and `agent`, which may run sudo, does not). Where sudo is not
+    /// usable without a password the check is skipped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_probe_reads_real_sudo_and_id_output() {
+        let usable = Command::new("sudo")
+            .args(["-n", "true"])
+            .stdin(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        let Ok(Some(nobody)) = nix::unistd::User::from_name("nobody") else {
+            return;
+        };
+        if !usable {
+            return;
+        }
+        let facts = probe_isolation(&nobody).unwrap();
+        assert!(
+            facts.sudo.contains("is not allowed to run sudo"),
+            "{}",
+            facts.sudo
+        );
+        assert_eq!(facts.groups, [nobody.gid.as_raw()]);
+        assert_eq!(
+            isolation_problem(&Isolation {
+                docker_socket: None,
+                ..facts
+            }),
+            None
+        );
+    }
+
+    /// The wiring of `Coordinator::start`'s token handling: the probe comes
+    /// first, the token is read only when it passes, and the file is gone on
+    /// every way out.
+    #[test]
+    fn the_token_is_probed_before_it_is_read_and_deleted_on_every_exit() {
+        let state = tempfile::tempdir().unwrap();
+        let file = state.path().join(DELEGATE_FILE);
+        let write = || fs::write(&file, b"someone\ndckr_pat_secret\n").unwrap();
+        let ok = || Ok(facts());
+        let unused = |_: &str, _: &str| -> io::Result<()> { panic!("the token was read") };
+
+        // A probe that fails, and one that finds a problem: the token is not
+        // read, and the file is deleted.
+        write();
+        assert!(use_token(state.path(), || Err(io::Error::other("no sudo")), unused).is_err());
+        assert!(!file.exists());
+        write();
+        let refused =
+            use_token(state.path(), || Ok(Isolation { uid: 0, ..facts() }), unused).unwrap_err();
+        assert!(refused.to_string().contains("refused"), "{refused}");
+        assert!(!file.exists());
+
+        // Sign-in fails: the file is deleted anyway.
+        write();
+        let failed = use_token(state.path(), ok, |_, _| {
+            Err::<(), _>(io::Error::other("sign-in failed"))
+        })
+        .unwrap_err();
+        assert!(failed.to_string().contains("sign-in failed"));
+        assert!(!file.exists());
+
+        // Success: sign-in saw the account and token, and the file is gone.
+        write();
+        let seen = use_token(state.path(), ok, |account, token| {
+            Ok((account.to_owned(), token.to_owned()))
+        })
+        .unwrap();
+        assert_eq!(seen, ("someone".to_owned(), "dckr_pat_secret".to_owned()));
+        assert!(!file.exists());
+        assert!(state.path().join(DELEGATE_USED).exists());
+    }
+
+    fn stub_test(dir: &Path, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Only exit 1 from `test` means "cannot open it"; 0 is reachable, and an
+    /// abnormal end (2, 127, a signal) is "cannot tell", which counts as reachable.
+    #[test]
+    fn only_an_exit_of_one_from_the_probe_means_the_socket_is_closed_to_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let (uid, gid) = (
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        );
+        let ask = |body: &str| {
+            let stub = stub_test(dir.path(), "stub", body);
+            reachable_with(&stub, Path::new("/x"), uid, gid)
+        };
+        assert!(ask("exit 0").unwrap());
+        assert!(!ask("exit 1").unwrap());
+        assert!(ask("exit 2").unwrap());
+        assert!(ask("exit 127").unwrap());
+        assert!(ask("kill -9 $$").unwrap());
+        // A probe that cannot be started at all is an error.
+        assert!(reachable_with("/no/such/test", Path::new("/x"), uid, gid).is_err());
+    }
+
+    /// The default when the probe cannot answer is "reachable", and it is not
+    /// asked at all unless the socket exists and the helper is root.
+    #[test]
+    fn the_socket_probe_fails_closed_and_only_runs_for_root_on_an_existing_socket() {
+        let cannot = || -> io::Result<bool> { Err(io::Error::other("no test")) };
+        assert!(socket_access(true, true, cannot));
+        assert!(!socket_access(true, true, || Ok(false)));
+        assert!(socket_access(true, true, || Ok(true)));
+        let never = || -> io::Result<bool> { panic!("asked") };
+        assert!(!socket_access(false, true, never));
+        assert!(!socket_access(true, false, never));
+    }
+
+    /// `supervise` holds the guard from before the coordinator reads the token
+    /// until its start-up closure ends, and the supervisor's spawn failure in
+    /// `run` deletes the token. (`supervise` needs a sandbox user to run, so
+    /// these read the source: dropping the guard early, `let _ =`, removing
+    /// it, or removing the deletion fails here.)
+    #[test]
+    fn the_token_guard_lives_through_the_coordinator_start_and_a_failed_spawn_deletes_the_token() {
+        let source = include_str!("detached.rs");
+        let guard = source
+            .find("let _token = coordinator::token_guard(")
+            .unwrap();
+        let start = source.find("Coordinator::start(").unwrap();
+        assert!(
+            guard < start,
+            "the guard must be bound before the coordinator starts"
+        );
+        let failed = source
+            .find("cannot start the supervisor: {error}\"")
+            .unwrap();
+        let cleanup = source[failed..]
+            .find("coordinator::discard_token_file(")
+            .unwrap();
+        let finish = source[failed..].find("finish_without_workload(").unwrap();
+        assert!(cleanup < finish);
+        // The guard function itself.
+        let state = tempfile::tempdir().unwrap();
+        fs::write(state.path().join(DELEGATE_FILE), b"x").unwrap();
+        assert!(token_guard(state.path(), false).is_none());
+        assert!(state.path().join(DELEGATE_FILE).exists());
+        drop(token_guard(state.path(), true));
+        assert!(!state.path().join(DELEGATE_FILE).exists());
+    }
+
+    /// A marker that cannot be written must not leave the token behind.
+    #[test]
+    fn a_marker_that_cannot_be_written_still_deletes_the_token() {
+        let state = tempfile::tempdir().unwrap();
+        fs::write(
+            state.path().join(DELEGATE_FILE),
+            b"someone\ndckr_pat_secret\n",
+        )
+        .unwrap();
+        // The marker's path is a directory: creating it fails.
+        fs::create_dir(state.path().join(DELEGATE_USED)).unwrap();
+        assert!(forget_delegate(state.path()).is_err());
+        assert!(!state.path().join(DELEGATE_FILE).exists());
+    }
+
+    /// The guard `supervise` holds deletes the token on any exit.
+    #[test]
+    fn the_supervisors_token_guard_deletes_the_file_when_it_drops() {
+        let state = tempfile::tempdir().unwrap();
+        let file = state.path().join(DELEGATE_FILE);
+        fs::write(&file, b"someone\ndckr_pat_secret\n").unwrap();
+        drop(TokenGuard(state.path().to_owned()));
+        assert!(!file.exists());
+        assert!(!state.path().join(DELEGATE_USED).exists());
+        // Nothing to delete is fine.
+        drop(TokenGuard(state.path().to_owned()));
+    }
+
+    /// The probe asks the kernel as the workload user (ACLs count): a file
+    /// the user's ids can open is reachable, one they cannot is not.
+    #[test]
+    fn the_socket_probe_asks_the_kernel_as_the_workload_user() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (uid, gid) = (
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        );
+        let open = dir.path().join("open");
+        let shut = dir.path().join("shut");
+        for (path, mode) in [(&open, 0o600), (&shut, 0o000)] {
+            fs::write(path, b"").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        assert!(reachable_as(&open, uid, gid).unwrap());
+        // Root can open anything; only a user's own ids are refused.
+        assert_eq!(reachable_as(&shut, uid, gid).unwrap(), uid == 0);
+    }
+
+    #[test]
+    fn a_missing_probe_program_is_named() {
+        let error = probe_command("marsh-no-such-program", &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("marsh-no-such-program"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("`sudo` and `id`"), "{error}");
+    }
+
+    /// Both places that start a privileged workload call `lock_privileges`
+    /// before they spawn it (a spawn seam would need a real sandbox user, so
+    /// this reads the source: removing either call fails here).
+    #[test]
+    fn both_workload_spawn_sites_lock_privileges_first() {
+        for (file, source, spawn) in [
+            (
+                "cloud_helper.rs",
+                include_str!("../cloud_helper.rs"),
+                "command.spawn()?",
+            ),
+            (
+                "detached.rs",
+                include_str!("detached.rs"),
+                ".spawn()
+",
+            ),
+        ] {
+            let lock = source.find("lock_privileges()?;");
+            let spawned = source.find(spawn);
+            assert!(
+                matches!((lock, spawned), (Some(lock), Some(spawned)) if lock < spawned),
+                "{file}: lock_privileges()? must come before the workload spawn"
+            );
+        }
+    }
+
+    fn facts() -> Isolation {
+        Isolation {
+            user: "marsh-run".into(),
+            uid: 1001,
+            gid: 1001,
+            groups: vec![1001],
+            sudo: "User marsh-run is not allowed to run sudo on box.\n".into(),
+            docker_socket: Some((0, 999, 0o660)),
+            socket_access: false,
+        }
+    }
+
+    #[test]
+    fn the_token_is_read_only_when_the_workload_user_is_cut_off_from_root() {
+        assert_eq!(isolation_problem(&facts()), None);
+        let broken = [
+            Isolation { uid: 0, ..facts() },
+            Isolation {
+                gid: 0,
+                groups: vec![0],
+                ..facts()
+            },
+            Isolation {
+                socket_access: true,
+                ..facts()
+            },
+            Isolation {
+                groups: vec![1001, 27],
+                ..facts()
+            },
+            Isolation {
+                sudo: "User marsh-run may run the following commands:\n    (ALL) NOPASSWD: ALL\n"
+                    .into(),
+                ..facts()
+            },
+            Isolation {
+                sudo: String::new(),
+                ..facts()
+            },
+            Isolation {
+                docker_socket: Some((0, 0, 0o666)),
+                ..facts()
+            },
+            Isolation {
+                docker_socket: Some((1001, 0, 0o600)),
+                ..facts()
+            },
+            Isolation {
+                docker_socket: Some((0, 1001, 0o660)),
+                ..facts()
+            },
+        ];
+        for facts in &broken {
+            assert!(isolation_problem(facts).is_some(), "{:?}", facts.sudo);
+        }
+        assert!(
+            isolation_problem(&Isolation {
+                docker_socket: None,
+                ..facts()
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn the_token_file_is_gone_after_sign_in_and_a_marker_says_it_was_used() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join(DELEGATE_FILE);
+        fs::write(&path, b"someone\ndckr_pat_secret\n").unwrap();
+        forget_delegate(state.path()).unwrap();
+        assert!(!path.exists());
+        assert!(state.path().join(DELEGATE_USED).exists());
+        // Twice is fine (a run that is retried before it starts).
+        forget_delegate(state.path()).unwrap();
+    }
 
     fn plan(max_children: u32) -> DelegatePlan {
         DelegatePlan {

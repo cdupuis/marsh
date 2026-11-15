@@ -186,13 +186,15 @@ and they say how many they kept.
     the sandbox.
 
   So marsh uploads the token at start into a root-only file in the remote state
-  directory. The supervisor, running as root, signs `sbx` in with it and serves
-  nested calls; the workload runs as `marsh-run` with no `sudo` and can't read
-  it. The supervisor enforces marsh's guardrails: only Kits the user allows, a
+  directory. The supervisor, running as root, first checks that `marsh-run` is
+  not root, has no extra groups, no `sudo` rule and no Docker socket access
+  (it refuses the run otherwise: the image is the caller's), signs `sbx` in
+  with the token, deletes the file, and serves nested calls; the workload runs
+  as `marsh-run`. The supervisor enforces marsh's guardrails: only Kits the user allows, a
   cap on child sandboxes per run, children inherit the parent's time limit,
   all children are deleted with the parent. The workload can make the
   supervisor start allowed Kits, not use the token directly. Remaining exposure:
-  the sandbox's disk (never saved as a template or moved) and the supervisor
+  the signed-in CLI's session on the sandbox's disk (never saved as a template or moved) and the supervisor
   itself.
 
   This is off unless the user turns it on (`marsh config cloud-delegate on`,

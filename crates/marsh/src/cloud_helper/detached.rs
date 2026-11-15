@@ -8,8 +8,8 @@
 
 use super::coordinator::{self, Coordinator};
 use super::{
-    CloudRequest, delta, helper_path, kill_workload, link_dir, lock_privileges, prepare_links,
-    privileged, record_status, run_user, state_dir, state_path, workload_command,
+    CloudRequest, claim_start, delta, helper_path, kill_workload, link_dir, lock_privileges,
+    prepare_links, privileged, record_status, run_user, state_dir, state_path, workload_command,
 };
 use marsh_contracts::cloud::CloudMode;
 use std::fs::{self, File, OpenOptions};
@@ -31,14 +31,7 @@ pub(super) const DETACHED_VARIABLE: &str = "MARSH_CLOUD_DETACHED";
 /// `run --detached`: claim the at-most-once start, start the supervisor in
 /// its own session, and report `started` once the workload runs.
 pub(super) fn run() -> i32 {
-    let claimed = state_dir().and_then(|state| {
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(state.join("started"))
-    });
-    if let Err(error) = claimed {
+    if let Err(error) = claim_start() {
         eprintln!("marsh cloud: the command was already started in this sandbox: {error}");
         return 125;
     }

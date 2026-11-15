@@ -46,24 +46,44 @@ const MAX_TOKEN: usize = 4096;
 const DISPLAY_ARGS: usize = 8;
 const DISPLAY_ARG_CHARS: usize = 64;
 
+/// The token is only taken before the workload exists.
+fn not_started(state: &Path) -> io::Result<()> {
+    if state.join("started").exists() {
+        return Err(io::Error::other("the run has already started"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn not_started_for_test(state: &Path) -> io::Result<()> {
+    not_started(state)
+}
+
 /// `--internal-cloud delegate`, as root before the run starts: keep the
 /// Docker ID and token from stdin (`ID\nTOKEN\n`) in a root-only file.
 /// Nothing is echoed.
 pub(super) fn store_delegate() -> io::Result<()> {
-    if !super::privileged() {
+    store_delegate_from(
+        super::privileged(),
+        super::state_dir,
+        &mut io::stdin().lock(),
+    )
+}
+
+fn store_delegate_from(
+    privileged: bool,
+    state_dir: impl FnOnce() -> io::Result<PathBuf>,
+    stdin: &mut dyn io::Read,
+) -> io::Result<()> {
+    if !privileged {
         return Err(io::Error::other(
             "agent calls from a detached run need the marsh cloud shell (a Kit sandbox has no root to keep the token from the workload)",
         ));
     }
-    let state = super::state_dir()?;
-    if state.join("started").exists() {
-        return Err(io::Error::other("the run has already started"));
-    }
+    let state = state_dir()?;
+    not_started(&state)?;
     let mut input = Vec::new();
-    io::stdin()
-        .lock()
-        .take(MAX_TOKEN as u64 + 256)
-        .read_to_end(&mut input)?;
+    stdin.take(MAX_TOKEN as u64 + 256).read_to_end(&mut input)?;
     let (account, token) = parse_delegate(&input)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid delegate input"))?;
     let mut file = OpenOptions::new()
@@ -514,6 +534,19 @@ pub(super) struct CallRecord {
     pub cause: String,
 }
 
+/// Write a finished call to `children.jsonl`, plain (the workload chose its
+/// arguments, and the laptop shows this record to its user).
+fn append_call_record(state: &Path, record: CallRecord) {
+    if let Ok(line) = serde_json::to_string(&record.plain()) {
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(state.join(CALLS_FILE))
+            .and_then(|mut file| writeln!(file, "{line}"));
+    }
+}
+
 impl CallRecord {
     /// Without control or escape characters: the workload chose the
     /// arguments, and the laptop shows this record to its user.
@@ -622,6 +655,28 @@ impl Guard {
     fn ttl(&self) -> Duration {
         self.ttl_after(self.started_at.elapsed())
     }
+}
+
+/// Taken before a call's changes are written back and held while they are:
+/// once the run's end is being recorded (`seal`) nothing more is written, and
+/// `seal` waits for a write in progress.
+fn write_back_gate(sealed: &Mutex<bool>) -> Result<std::sync::MutexGuard<'_, bool>, String> {
+    let sealed = sealed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *sealed {
+        return Err("the detached run ended before the call returned".into());
+    }
+    Ok(sealed)
+}
+
+/// The run's end is being recorded: no new calls, and no write-back after the
+/// one in progress (`write_back_gate` holds the lock, so this waits for it).
+fn seal_state(closing: &AtomicBool, sealed: &Mutex<bool>) {
+    closing.store(true, Ordering::Release);
+    *sealed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
 }
 
 pub(super) struct Coordinator {
@@ -737,11 +792,7 @@ impl Coordinator {
     /// The workload's leader ended: no write-back from here on (one in
     /// progress finishes first).
     pub(super) fn seal(&self) {
-        self.closing.store(true, Ordering::Release);
-        *self
-            .sealed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        seal_state(&self.closing, &self.sealed);
     }
 
     /// Stop calls still running, wait for them, then delete every agent
@@ -841,22 +892,16 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&id);
-        let record = CallRecord {
-            kit: name,
-            args,
-            exit: outcome.code,
-            summary: outcome.summary,
-            cause: outcome.cause,
-        }
-        .plain();
-        if let Ok(line) = serde_json::to_string(&record) {
-            let _ = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(self.state.join(CALLS_FILE))
-                .and_then(|mut file| writeln!(file, "{line}"));
-        }
+        append_call_record(
+            &self.state,
+            CallRecord {
+                kit: name,
+                args,
+                exit: outcome.code,
+                summary: outcome.summary,
+                cause: outcome.cause,
+            },
+        );
         let _ = run_frame::write(&mut &stream, run_frame::EXIT, &outcome.code.to_be_bytes());
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
@@ -971,14 +1016,7 @@ impl cloud_call::ChildParent for LocalParent<'_> {
     }
 
     fn apply(&self, payload: &Path) -> Result<String, String> {
-        let sealed = self
-            .coordinator
-            .sealed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *sealed {
-            return Err("the detached run ended before the call returned".into());
-        }
+        let sealed = write_back_gate(&self.coordinator.sealed)?;
         let file = File::open(payload).map_err(|e| e.to_string())?;
         let output = self
             .coordinator
@@ -1108,6 +1146,55 @@ mod tests {
                 ..facts
             }),
             None
+        );
+    }
+
+    /// What the coordinator writes for a call is already plain.
+    #[test]
+    fn the_written_call_record_is_plain() {
+        let state = tempfile::tempdir().unwrap();
+        append_call_record(
+            state.path(),
+            CallRecord {
+                kit: "codex".into(),
+                args: vec!["\u{1b}]52;c;AAAA\u{7}go".into()],
+                exit: 0,
+                summary: "wrote\u{1b}[2J".into(),
+                cause: String::new(),
+            },
+        );
+        let raw = fs::read_to_string(state.path().join(CALLS_FILE)).unwrap();
+        assert!(
+            !raw.contains("\\u001b") && !raw.contains("\\u0007"),
+            "{raw}"
+        );
+        let records = call_records(state.path());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].args, ["]52;c;AAAAgo"]);
+    }
+
+    /// `store_delegate`'s own refusals and its file: only privileged, only
+    /// before the start, one owner-only file.
+    #[test]
+    fn the_delegate_is_stored_only_privileged_and_before_the_start() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let state = tempfile::tempdir().unwrap();
+        let dir = || Ok(state.path().to_owned());
+        let input = || &b"someone\ndckr_pat_secret\n"[..];
+        let unprivileged = store_delegate_from(false, dir, &mut input()).unwrap_err();
+        assert!(unprivileged.to_string().contains("no root"));
+        assert!(!state.path().join(DELEGATE_FILE).exists());
+        fs::write(state.path().join("started"), b"").unwrap();
+        let late = store_delegate_from(true, dir, &mut input()).unwrap_err();
+        assert!(late.to_string().contains("already started"));
+        assert!(!state.path().join(DELEGATE_FILE).exists());
+        fs::remove_file(state.path().join("started")).unwrap();
+        store_delegate_from(true, dir, &mut input()).unwrap();
+        let file = state.path().join(DELEGATE_FILE);
+        assert_eq!(fs::read(&file).unwrap(), b"someone\ndckr_pat_secret\n");
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 
@@ -1331,6 +1418,82 @@ mod tests {
         assert_eq!(record.args[0], "a[2Jb");
         assert!(record.args[1].len() <= 4 * DISPLAY_ARG_CHARS);
         assert_eq!(record.summary, "ok31mfake line");
+    }
+
+    /// The lifecycle, not its parts: sealing stops new calls, waits for a
+    /// write-back in progress, and from then on every write-back is refused.
+    #[test]
+    fn sealing_waits_for_a_write_back_in_progress_and_then_refuses_every_later_one() {
+        let (closing, sealed) = (AtomicBool::new(false), Mutex::new(false));
+        let finished = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            // A write-back is in progress (the gate is held).
+            let writing = write_back_gate(&sealed).unwrap();
+            let seal = scope.spawn(|| {
+                seal_state(&closing, &sealed);
+                finished.store(true, Ordering::SeqCst);
+            });
+            // Wait (bounded) until the sealing thread has started: `closing` is
+            // set before it takes the gate, so a thread that never ran cannot
+            // make the "has not finished" check below pass.
+            let give_up = Instant::now() + Duration::from_secs(10);
+            while !closing.load(Ordering::Acquire) {
+                assert!(Instant::now() < give_up, "the sealing thread never ran");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(
+                !finished.load(Ordering::SeqCst),
+                "sealing did not wait for the write-back"
+            );
+            drop(writing);
+            seal.join().unwrap();
+        });
+        assert!(closing.load(Ordering::Acquire));
+        let refused = write_back_gate(&sealed).unwrap_err();
+        assert!(
+            refused.contains("ended before the call returned"),
+            "{refused}"
+        );
+        // The production `seal` is that transition (it needs a coordinator
+        // with a signed-in CLI to run, so this reads the source: a `seal` that
+        // no longer seals fails here).
+        let source = include_str!("coordinator.rs");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let seal = &production[production.find("pub(super) fn seal(&self)").unwrap()..];
+        let seal = &seal[..seal.find("\n    }").unwrap()];
+        assert!(
+            seal.contains("seal_state(&self.closing, &self.sealed)"),
+            "{seal}"
+        );
+    }
+
+    /// A sealed run takes no more write-backs (the gate refuses), an open one
+    /// does, and the gate is held across the write so `seal` waits for it.
+    #[test]
+    fn a_sealed_run_refuses_a_calls_write_back() {
+        let sealed = Mutex::new(false);
+        {
+            let held = write_back_gate(&sealed).unwrap();
+            assert!(!*held);
+        }
+        *sealed.lock().unwrap() = true;
+        let refused = write_back_gate(&sealed).unwrap_err();
+        assert!(
+            refused.contains("ended before the call returned"),
+            "{refused}"
+        );
+        // `apply` takes the gate before it reads the payload or runs anything
+        // (it needs a coordinator with a signed-in CLI to run, so this reads
+        // the source: removing the gate from `apply` fails here).
+        let source = include_str!("coordinator.rs");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let apply = &production[production.find("fn apply(&self, payload: &Path)").unwrap()..];
+        let gate = apply
+            .find("write_back_gate(&self.coordinator.sealed)?")
+            .unwrap();
+        assert!(gate < apply.find("File::open(payload)").unwrap());
+        assert!(gate < apply.find(".output()").unwrap());
     }
 
     fn facts() -> Isolation {

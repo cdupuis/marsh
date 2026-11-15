@@ -2132,24 +2132,6 @@ impl crate::Client {
         }
     }
 
-    /// Validate the exact authenticated control envelope without connecting or
-    /// dispatching, distinguishing deterministic size errors from lost replies.
-    pub fn acp_prompt_preflight(
-        &self,
-        agent_session_id: &str,
-        session: &SessionSpec,
-        operation_id: &str,
-        text: &str,
-    ) -> Result<(), DaemonError> {
-        self.encode_acp_prompt(
-            agent_session_id.into(),
-            session.clone(),
-            operation_id.into(),
-            text.into(),
-        )
-        .map(|_| ())
-    }
-
     fn encode_acp_prompt(
         &self,
         agent_session_id: String,

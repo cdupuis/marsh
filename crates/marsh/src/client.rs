@@ -282,14 +282,6 @@ impl CommandExecutor {
     pub fn new(client: Arc<dyn DaemonClient>, session: SessionConfig) -> Self {
         Self { client, session }
     }
-
-    /// Reserve a visible agent session before Brush starts a background job.
-    ///
-    /// # Errors
-    /// Returns a daemon or validation error when reservation cannot be made.
-    pub fn reserve_acp(&self, adapter: &str) -> Result<String, ClientError> {
-        self.client.acp_reserve(adapter, &self.session)
-    }
 }
 
 impl RegisteredCommandExecutor for CommandExecutor {

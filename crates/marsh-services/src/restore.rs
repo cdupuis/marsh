@@ -3044,7 +3044,7 @@ mod linux {
         }
 
         /// A volume directory that is a relative link to another volume stays
-        /// beneath the data root, which only NO_SYMLINKS refuses: the other
+        /// beneath the data root, which only `NO_SYMLINKS` refuses: the other
         /// volume is not written into.
         #[test]
         fn install_never_writes_through_a_relative_link_to_another_volume() {

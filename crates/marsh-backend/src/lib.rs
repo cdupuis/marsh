@@ -2683,8 +2683,25 @@ impl DaemonBackend for StockDaemonBackend {
                     Ok(WorkerResponse::Started { container_id, .. }) => {
                         let now = Instant::now();
                         worker_progress_at.get_or_insert(now);
-                        store.mark_running(&job_id, &vm.name, &vm.name, container_id.as_str())?;
-                        started_container = Some(container_id);
+                        started_container = Some(container_id.clone());
+                        // A start the store refuses ends the attempt as lost
+                        // (the container is cancelled; grants are revoked and
+                        // the container reconciled below like any loss).
+                        if let Err((detail, lost)) =
+                            record_start(&store, &job_id, &vm.name, container_id, || {
+                                let _ = control.send_bounded(
+                                    &WorkerRequest::Cancel {
+                                        attempt: attempt_id.clone(),
+                                    },
+                                    WORKER_CANCEL_WRITE_TIMEOUT,
+                                );
+                            })
+                        {
+                            transport_lost = true;
+                            output_complete = false;
+                            transport_detail = Some(detail);
+                            break lost;
+                        }
                     }
                     Ok(WorkerResponse::Stdout { bytes, .. }) => {
                         first_output_at.get_or_insert_with(Instant::now);
@@ -3908,6 +3925,46 @@ fn cleanup_diagnostic(message: &str, output_budget: u64, output_used: u64) -> Ve
         length -= 1;
     }
     diagnostic.as_bytes()[..length].to_vec()
+}
+
+/// Record the worker's `Started` on the receipt. When the store refuses it
+/// the container may be running: `cancel` is called, and the loss is returned
+/// for the response loop to break out with, never an early return.
+fn record_start(
+    store: &DaemonStore,
+    job_id: &str,
+    vm: &str,
+    container_id: marsh_contracts::ContainerId,
+    cancel: impl FnOnce(),
+) -> Result<(), (String, WorkerReport)> {
+    store
+        .mark_running(job_id, vm, vm, container_id.as_str())
+        .map_err(|error| {
+            cancel();
+            unrecorded_start(Some(container_id), &error)
+        })
+}
+
+/// The worker reported a started container that the store refused to record
+/// (a bad or reused id, a receipt no longer `Queued`, a journal write that
+/// failed): the attempt is lost and its cleanup uncertain, never an early
+/// return that leaves the container and its grants behind.
+fn unrecorded_start(
+    container_id: Option<marsh_contracts::ContainerId>,
+    error: &DaemonError,
+) -> (String, WorkerReport) {
+    (
+        format!("the start could not be recorded: {error}"),
+        WorkerReport {
+            container_id,
+            delivery: marsh_worker::DeliveryOutcome::Failed,
+            execution: ExecutionOutcome::Unknown,
+            cleanup: CleanupOutcome::Uncertain,
+            quarantine: true,
+            control_errors: 1,
+            retained_processes: Vec::new(), // No observed IDs, NOT proof of absence.
+        },
+    )
 }
 
 fn worker_public_exit(
@@ -7978,6 +8035,98 @@ mod tests {
             .mark_running(&job, &vm.name, &vm.name, container.as_str())
             .unwrap();
         (store, job)
+    }
+
+    /// C-02: a `Started` the store will not record (a second one) cancels
+    /// the container and ends the attempt as lost with it named and cleanup
+    /// uncertain, so the grants are revoked and the container reconciled; it
+    /// is not an early return. The response loop calls only `record_start`
+    /// for this, and breaks with what it returns.
+    #[test]
+    fn a_started_the_store_refuses_cancels_and_ends_the_attempt_as_lost() {
+        let home = tempfile::tempdir().unwrap();
+        let vm = cleanup_test_vm(home.path());
+        let container = marsh_contracts::ContainerId::parse("a".repeat(64)).unwrap();
+        let (store, job) = reserved_cleanup_job(home.path(), &vm, &container);
+        let cancelled = std::cell::Cell::new(false);
+        let (detail, report) = record_start(&store, &job, &vm.name, container.clone(), || {
+            cancelled.set(true);
+        })
+        .unwrap_err();
+        assert!(cancelled.get(), "the container was not cancelled");
+        assert!(detail.contains("could not be recorded"), "{detail}");
+        assert_eq!(report.container_id, Some(container));
+        assert_eq!(report.cleanup, CleanupOutcome::Uncertain);
+        assert!(report.quarantine);
+        assert_eq!(report.delivery, marsh_worker::DeliveryOutcome::Failed);
+        assert_eq!(report.execution, ExecutionOutcome::Unknown);
+    }
+
+    /// The response loop's `Started` arm is a closure over a dozen locals of
+    /// `execute` and needs a worker to run; a test cannot drive it without one.
+    /// What keeps the early-return form from coming back is this: production
+    /// code records a start in exactly one place (`record_start`, tested above
+    /// through the real store), and the arm calls it and breaks out with what it
+    /// returns. A second `mark_running` call, or an arm that stops calling
+    /// `record_start`, fails here. The real-stack scenario is a worker sending a
+    /// second `Started`.
+    #[test]
+    fn the_response_loops_started_arm_records_a_start_only_through_record_start() {
+        let source = include_str!("lib.rs");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        assert_eq!(
+            production.matches(".mark_running(").count(),
+            1,
+            "a start must be recorded only inside record_start"
+        );
+        let arm = &production[production.find("Ok(WorkerResponse::Started {").unwrap()..];
+        let arm = &arm[..arm.find("Ok(WorkerResponse::Stdout {").unwrap()];
+        assert!(arm.contains("record_start("), "{arm}");
+        assert!(arm.contains("break lost;"), "{arm}");
+        assert!(!arm.contains('?'), "the arm must not return early: {arm}");
+    }
+
+    /// The accepted case records the start and cancels nothing.
+    #[test]
+    fn a_started_the_store_accepts_is_recorded_and_not_cancelled() {
+        let home = tempfile::tempdir().unwrap();
+        let vm = cleanup_test_vm(home.path());
+        let container = marsh_contracts::ContainerId::parse("b".repeat(64)).unwrap();
+        let store = DaemonStore::new(home.path());
+        let session = store.attach_shell(
+            1,
+            SessionAuthority {
+                username: "alice".into(),
+                uid: 501,
+                gid: 20,
+                launch_directory: home.path().to_owned(),
+                guest_home: "/Users/alice".into(),
+                home_backing: home.path().to_owned(),
+                ephemeral_home: false,
+            },
+        );
+        store
+            .register_worker(public_worker_status(&store, &vm))
+            .unwrap();
+        let (job, _) = store
+            .begin_job(NewJob {
+                label: None,
+                session_id: session,
+                command: "fixture".into(),
+                kit_ref: vm.kit_ref.clone(),
+                workload_image: vm.job_image.as_str().into(),
+                mounts: Vec::new(),
+            })
+            .unwrap();
+        store.reserve_worker(&job, &vm.name, &vm.name).unwrap();
+        record_start(&store, &job, &vm.name, container, || {
+            panic!("a recorded start must not cancel")
+        })
+        .unwrap();
+        assert_eq!(
+            store.job(&job).unwrap().state,
+            marsh_daemon::JobState::Running
+        );
     }
 
     /// A lane job recorded before its split was closed is refused at

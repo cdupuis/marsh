@@ -1,5 +1,6 @@
 use super::*;
 use crate::exec_identity::CaptureStage;
+use crate::scope_registry::remove_exact_scope_home_with_limits;
 use std::io::Write;
 use std::os::fd::AsRawFd as _;
 use tempfile::TempDir;

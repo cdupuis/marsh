@@ -171,6 +171,17 @@ impl Settlement<'_> {
     }
 }
 
+impl Settlement<'_> {
+    /// The run left the local pool for collection (state `Detached`): the
+    /// receipt is now collection's to settle, so this guard must not fail it
+    /// when it drops. Left armed when the hand-off is refused.
+    fn hand_off(&mut self, job_id: &str, timing: TimingReport) -> Result<(), DaemonError> {
+        self.store.detach_cloud_job(job_id, timing)?;
+        self.settled = true;
+        Ok(())
+    }
+}
+
 impl Drop for Settlement<'_> {
     fn drop(&mut self) {
         if !self.settled {
@@ -535,6 +546,83 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("needs a terminal"), "{error}");
         assert_eq!(only_job_states(&store), []);
+    }
+
+    /// A detached run that started is handed to collection: dropping its
+    /// settlement afterwards must leave it `Detached`, not failed; one that
+    /// was never handed off still fails.
+    #[test]
+    fn a_detached_run_that_started_is_not_failed_by_its_settlement_dropping() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let (store, session) = session_in(&root, false);
+        let begin = |store: &DaemonStore| {
+            store
+                .begin_cloud_job(
+                    NewJob {
+                        label: None,
+                        session_id: session.session_id.clone(),
+                        command: "cloud".into(),
+                        kit_ref: "cloud-shell".into(),
+                        workload_image: format!("registry.example/shell@sha256:{}", "a".repeat(64)),
+                        mounts: vec![PublicMount {
+                            target: session.launch_directory.clone(),
+                            access: "read_write".into(),
+                        }],
+                    },
+                    &marsh_daemon::process::ProcessLink::default(),
+                    &[],
+                )
+                .unwrap()
+                .0
+        };
+        let (attachment, _caller) = ServerAttachment::pair().unwrap();
+        let started = Instant::now();
+        let settlement = |job_id: String| Settlement {
+            store: &store,
+            attachment: &attachment,
+            job_id,
+            timing: TimingReport::default(),
+            started,
+            phase: started,
+            output_complete: true,
+            settled: false,
+        };
+        let (handed, unhanded) = (begin(&store), begin(&store));
+        for job in [&handed, &unhanded] {
+            store.mark_cloud_running(job, "sbx-cloud-id").unwrap();
+        }
+        let mut guard = settlement(handed.clone());
+        guard.hand_off(&handed, TimingReport::default()).unwrap();
+        drop(guard);
+        drop(settlement(unhanded.clone()));
+        assert_eq!(
+            store.job(&handed).unwrap().state,
+            marsh_daemon::JobState::Detached
+        );
+        assert_eq!(
+            store.job(&unhanded).unwrap().state,
+            marsh_daemon::JobState::Failed
+        );
+    }
+
+    /// The settlement's drop guard fails any receipt it still holds, so the
+    /// production detached start must go through [`Settlement::hand_off`]: a
+    /// direct `store.detach_cloud_job` there would fail every run that had
+    /// just started. Driving `start_detached` needs a fake Docker Cloud, which
+    /// does not exist; this guards the call site by its text instead.
+    #[test]
+    fn the_detached_start_hands_off_through_the_settlement() {
+        let source = include_str!("cloud/detach.rs");
+        let production = source.split("\nmod tests {").next().unwrap();
+        assert!(
+            production.contains("settle.hand_off("),
+            "start_detached must hand off through the settlement"
+        );
+        assert!(
+            !production.contains(".detach_cloud_job("),
+            "a direct detach_cloud_job leaves the drop guard armed"
+        );
     }
 
     /// Whatever early exit a later edit adds, an admitted cloud receipt that

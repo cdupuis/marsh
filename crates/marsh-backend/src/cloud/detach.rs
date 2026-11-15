@@ -680,7 +680,7 @@ impl StockDaemonBackend {
     #[allow(clippy::too_many_lines)] // One ordered record, mark, start, detach sequence.
     pub(super) fn start_detached(
         &self,
-        settle: Settlement<'_>,
+        mut settle: Settlement<'_>,
         store: &DaemonStore,
         adapter: &Arc<CloudSbx>,
         id: &CloudSandboxId,
@@ -804,7 +804,7 @@ impl StockDaemonBackend {
         }
         let mut timing = settle.timing.clone();
         timing.wall_ms = u64::try_from(settle.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if let Err(error) = store.detach_cloud_job(&job_id, timing) {
+        if let Err(error) = settle.hand_off(&job_id, timing) {
             settle.note(&format!("leaving the local job pool: {error}"));
         }
         if confirmed {

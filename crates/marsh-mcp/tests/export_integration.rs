@@ -1022,6 +1022,26 @@ async fn a_kit_call_starts_the_daemon_without_the_gateways_environment() {
     }
 }
 
+/// D-06: a stdin limit above the 64 KiB argument cap takes effect end to end.
+#[tokio::test]
+async fn a_large_declared_stdin_reaches_the_daemon_whole() {
+    let backend = Arc::new(TestKitBackend::new(vec!["test-report".into()]));
+    let harness = TestHarness::new(backend.clone());
+    let mut declaration = make_declaration("test-report");
+    declaration.bindings.stdin = Some(StdinBinding {
+        field: "input_data".into(),
+        max_bytes: 1_048_576,
+    });
+    let connection = harness.connect(declaration).await;
+    let input = "y".repeat(200 * 1024);
+    let result = connection
+        .call(json!({"filter": "big", "input_data": input}))
+        .await;
+    assert_eq!(result.is_error, Some(false), "{result:?}");
+    let recorded = backend.last_execution.lock().unwrap().clone().unwrap();
+    assert_eq!(recorded.stdin.len(), 200 * 1024);
+}
+
 #[tokio::test]
 async fn typed_export_never_mounts_scope_control_files_or_a_symlinked_guest_home() {
     let backend = Arc::new(TestKitBackend::new(vec!["test-report".into()]));

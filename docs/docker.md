@@ -622,6 +622,18 @@ builds:
   does not read the context, and a build with the older builder
   (`DOCKER_BUILDKIT=0`) pulls `FROM` images itself. A build can pull from any
   registry the Docker VM can reach.
+- **BuildKit's whole control API is reachable, not only builds.** The stream
+  BuildKit uses (`/grpc`; plain `docker build` and `docker buildx build` both use
+  it) is relayed without being read, so the filter's refusal
+  of `POST /build/prune` does not stop `docker buildx prune` or `docker buildx
+  du`, which ask BuildKit directly and can empty or measure the cache shared by
+  the project's lanes. marsh does not scope build history either, so BuildKit's
+  history calls (`docker buildx history`) can see another lane's builds, with the
+  build arguments and logs they recorded, and delete them. (These behaviors are
+  BuildKit's own and have not been exercised end to end through marsh.) Keep secrets out of
+  build arguments (use `--secret`, which stays in your job), and treat the build
+  cache and history as shared by every lane of a project. This stays inside one
+  project.
 - **The build cache is shared across lanes of one project.** A cache written by
   one lane is readable by another lane of the same project. This is the same
   user and the same project, and lanes are copies of one tree, so marsh accepts

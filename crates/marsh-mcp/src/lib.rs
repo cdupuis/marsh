@@ -582,6 +582,15 @@ impl HostConfig {
     }
 }
 
+/// Where a test can change the world while an identity is captured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureStage {
+    /// The executable is open and checked; hashing has not started.
+    Opened,
+    /// Hashed and re-`fstat`ed; the path has not been looked at again.
+    Hashed,
+}
+
 impl ExecutableIdentity {
     fn capture(path: &Path) -> Result<Self, String> {
         Self::capture_with_parent_policy(path, true)
@@ -595,16 +604,16 @@ impl ExecutableIdentity {
         path: &Path,
         require_trusted_parents: bool,
     ) -> Result<Self, String> {
-        Self::capture_observed(path, require_trusted_parents, &mut || {})
+        Self::capture_observed(path, require_trusted_parents, &mut |_| {})
     }
 
     /// Opens the executable once, without following a symlink, and takes the
     /// metadata, the checks and the hash from that descriptor, so they describe
-    /// one file. `between_open_and_hash` runs where a swap of the path could land.
+    /// one file. `hook` runs at each point a swap of the path could land (see [`CaptureStage`]).
     fn capture_observed(
         path: &Path,
         require_trusted_parents: bool,
-        between_open_and_hash: &mut dyn FnMut(),
+        hook: &mut dyn FnMut(CaptureStage),
     ) -> Result<Self, String> {
         let not_regular = || {
             format!(
@@ -639,7 +648,7 @@ impl ExecutableIdentity {
         if require_trusted_parents {
             validate_trusted_parent_chain(path)?;
         }
-        between_open_and_hash();
+        hook(CaptureStage::Opened);
         let mut digest = Sha256::new();
         let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
         loop {
@@ -654,6 +663,7 @@ impl ExecutableIdentity {
         let after = file
             .metadata()
             .map_err(|error| format!("cannot recheck executable identity: {error}"))?;
+        hook(CaptureStage::Hashed);
         let named = fs::symlink_metadata(path)
             .map_err(|error| format!("cannot recheck executable path: {error}"))?;
         let same = |left: &fs::Metadata, right: &fs::Metadata| {
@@ -4710,8 +4720,10 @@ mod tests {
         let original_inode = fs::metadata(&path).unwrap().ino();
         let replacement_inode = fs::metadata(&other).unwrap().ino();
 
-        let result = ExecutableIdentity::capture_observed(&path, false, &mut || {
-            fs::rename(&other, &path).unwrap();
+        let result = ExecutableIdentity::capture_observed(&path, false, &mut |stage| {
+            if stage == CaptureStage::Opened {
+                fs::rename(&other, &path).unwrap();
+            }
         });
 
         // The path no longer names the file that was hashed: fail closed, never
@@ -4722,20 +4734,67 @@ mod tests {
         assert_ne!(original_hash, replacement_hash);
     }
 
+    /// A swap after the post-hash `fstat`: the opened file is untouched (same
+    /// inode, same ctime), so only the path-versus-descriptor comparison can
+    /// see that the path now names something else.
+    #[test]
+    fn a_path_swapped_after_the_last_descriptor_check_fails_the_check() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tool");
+        let other = root.path().join("other");
+        executable(&path, "#!/bin/sh\necho original\n");
+        executable(&other, "#!/bin/sh\necho replacement\n");
+        let error = ExecutableIdentity::capture_observed(&path, false, &mut |stage| {
+            if stage == CaptureStage::Hashed {
+                fs::rename(&other, &path).unwrap();
+            }
+        })
+        .expect_err("the path no longer names the hashed file");
+        assert!(error.contains("replaced or modified"), "{error}");
+    }
+
+    /// Renaming an ancestor directory and moving another in its place changes
+    /// what the path names without touching the opened file's metadata.
+    #[test]
+    fn an_ancestor_directory_swapped_while_verified_fails_the_check() {
+        for swap_at in [CaptureStage::Opened, CaptureStage::Hashed] {
+            let root = tempfile::tempdir().unwrap();
+            let (live, spare) = (root.path().join("live"), root.path().join("spare"));
+            fs::create_dir(&live).unwrap();
+            fs::create_dir(&spare).unwrap();
+            executable(&live.join("tool"), "#!/bin/sh\necho original\n");
+            executable(&spare.join("tool"), "#!/bin/sh\necho replacement\n");
+            let path = live.join("tool");
+            let error = ExecutableIdentity::capture_observed(&path, false, &mut |stage| {
+                if stage == swap_at {
+                    fs::rename(&live, root.path().join("moved")).unwrap();
+                    fs::rename(&spare, &live).unwrap();
+                }
+            })
+            .expect_err("the path now names another file");
+            assert!(
+                error.contains("replaced or modified"),
+                "{swap_at:?}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn an_executable_changed_in_place_while_verified_fails_the_check() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("tool");
         executable(&path, "#!/bin/sh\necho original\n");
-        let error = ExecutableIdentity::capture_observed(&path, false, &mut || {
-            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-            file.write_all(b"# appended\n").unwrap();
+        let error = ExecutableIdentity::capture_observed(&path, false, &mut |stage| {
+            if stage == CaptureStage::Opened {
+                let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+                file.write_all(b"# appended\n").unwrap();
+            }
         })
         .expect_err("a file that changes while hashed must fail the check");
         assert!(error.contains("replaced or modified"), "{error}");
 
         // Untouched, the identity is the file's own.
-        let identity = ExecutableIdentity::capture_observed(&path, false, &mut || {}).unwrap();
+        let identity = ExecutableIdentity::capture_observed(&path, false, &mut |_| {}).unwrap();
         assert_eq!(identity.inode, fs::metadata(&path).unwrap().ino());
         assert_eq!(
             identity.sha256,

@@ -18,7 +18,7 @@ images="^(kits/marsh-(claude|codex|pi|shell)/|packaging/(shell|shell-image|svc-e
 # derives that list from the sources). Image inputs select them too: a
 # per-commit run moves a Kit's stable tag only when its CI run passed the Rust
 # lanes on that commit.
-code="^(crates/|Cargo\\.(toml|lock)\$|rust-toolchain\\.toml\$|vendor/|docs/upstream/|Makefile\$|\\.config/nextest\\.toml\$|tests/mcp/|kits/|packaging/(commands|drive-commands)\\.json\$|tests/acceptance/(onboarding\\.py\$|acp-fixture/|fixture/commands\\.json\$|bash_suites\\.py\$|bash_divergences\\.json\$))|$images"
+code="^(crates/|Cargo\\.(toml|lock)\$|deny\\.toml\$|rust-toolchain\\.toml\$|vendor/|docs/upstream/|Makefile\$|\\.config/nextest\\.toml\$|tests/mcp/|kits/|packaging/(commands|drive-commands)\\.json\$|tests/acceptance/(onboarding\\.py\$|acp-fixture/|fixture/commands\\.json\$|bash_suites\\.py\$|bash_divergences\\.json\$))|$images"
 host=$code
 # Tooling tests exercise publisher, acceptance and release scripts without Rust.
 tools="^(scripts/|tests/|evals/|kits/|packaging/|Makefile\$|\\.github/)|$code"

@@ -115,7 +115,7 @@ class CiChanges(unittest.TestCase):
                          "(add them to code= in scripts/ci-changes.sh)")
 
     def test_rust_and_real_binary_callers_run_both_platforms(self):
-        for path in ("crates/marsh-sbx/src/lib.rs", "Cargo.lock", "Cargo.toml", "rust-toolchain.toml",
+        for path in ("crates/marsh-sbx/src/lib.rs", "Cargo.lock", "Cargo.toml", "deny.toml", "rust-toolchain.toml",
                      "vendor/brush/src/lib.rs", "docs/upstream/brush/0042-x.patch", ".config/nextest.toml", "tests/mcp/test_stdio.py",
                      "tests/acceptance/onboarding.py", "tests/acceptance/acp-fixture/typed_host_caller.py",
                      "tests/acceptance/bash_suites.py"):

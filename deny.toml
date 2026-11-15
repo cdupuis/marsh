@@ -1,0 +1,47 @@
+# cargo-deny policy, checked in CI by the `deny` job (.github/workflows/ci.yml).
+# Run it locally with `cargo deny --locked check`.
+
+[graph]
+# Check the default feature set; the vendored Brush crates are path
+# dependencies of the workspace and are covered through it.
+all-features = false
+
+[advisories]
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # serde_yaml is archived and depends on unsafe-libyaml. The forks that are
+    # drop-in (serde_norway, serde_yaml_ng) are also unmaintained and also wrap
+    # a C-to-Rust translation of libyaml, so a rename would move the finding,
+    # not fix it. Replacing it means moving to a safe-Rust parser (for example
+    # serde-saphyr) at the call sites in marsh-sbx, marsh-backend (sbxenv.rs)
+    # and marsh-daemon (peer_review.rs). Remove this ignore with that change.
+    { id = "RUSTSEC-2024-0449", reason = "serde_yaml 0.9 is deprecated; replace it with a safe-Rust YAML parser" },
+]
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "WTFPL", # terminfo
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# 13 crates appear in two versions (syn, rand, darling, signal-hook, ...).
+# That is reported, not failed: most are held back by dependencies we do not own.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

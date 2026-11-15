@@ -153,7 +153,7 @@ jobs:
           stages=all
           # The CI jobs that run the Rust tests, by name (ci.yml). A push run
           # selects lanes from its own diff, so it may have skipped them.
-          rust_lanes=$'Lint (fmt, clippy; Linux)\nLinux arm64 (workspace tests)\nLinux arm64 (binary callers, entrypoints)\nLinux arm64 (Bash differential suites)\nmacOS arm64 (clippy, host workspace tests)\nmacOS arm64 (MCP and ACP tests, binary callers, entrypoints)'
+          rust_lanes=$'Lint (fmt, clippy; Linux)\nLinux arm64 (workspace tests)\nLinux arm64 (binary callers, entrypoints)\nLinux arm64 (Bash differential suites)\nmacOS arm64 (clippy, host workspace tests)\nmacOS arm64 (MCP and ACP tests, binary callers, entrypoints)\nDependency policy (cargo-deny)'
           rust_lanes_passed=false
           if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
             # Follow CI's image selection, including its conservative fallback.

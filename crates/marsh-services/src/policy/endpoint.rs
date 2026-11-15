@@ -2060,6 +2060,10 @@ fn handle_request(scope: &Arc<Scope>, conn: &mut Conn, head: &Head) -> io::Resul
     let mut adm = match admit(&m, head, body, scope.as_ref()) {
         Ok(a) => a,
         Err(r) => {
+            // The refusal is written (and the rest of the request drained)
+            // without holding the volume lock: a client that never reads must
+            // not stall other workspaces.
+            drop(volume_op.take());
             return Ok(refuse(
                 conn,
                 head,
@@ -2093,6 +2097,8 @@ fn handle_request(scope: &Arc<Scope>, conn: &mut Conn, head: &Head) -> io::Resul
             &mut volume_op,
         ));
     }
+    // Not a volume create or delete after all: nothing here holds the lock.
+    drop(volume_op.take());
     let result = forward(scope, conn, head, &mut adm, m.kind);
     match result {
         Ok(keep) => Ok(keep),

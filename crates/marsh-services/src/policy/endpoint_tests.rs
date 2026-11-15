@@ -592,6 +592,8 @@ struct VolumeEngine {
     delete_status: Arc<std::sync::atomic::AtomicU16>,
     /// Hold every DELETE (not only the first) until `gate`.
     hold_all_deletes: Arc<AtomicBool>,
+    /// 0: create normally; otherwise answer every volume CREATE with this status.
+    create_status: Arc<std::sync::atomic::AtomicU16>,
     /// Hold the next volume CREATE until `create_release`; `held_create_done`
     /// is set when it has been answered.
     hold_next_create: Arc<AtomicBool>,
@@ -607,6 +609,7 @@ impl VolumeEngine {
             first_done: Arc::default(),
             gate: Arc::default(),
             delete_status: Arc::default(),
+            create_status: Arc::default(),
             hold_all_deletes: Arc::default(),
             hold_next_create: Arc::default(),
             create_release: Arc::default(),
@@ -622,6 +625,7 @@ impl VolumeEngine {
             self.first_done.clone(),
             self.delete_status.clone(),
         );
+        let create_status = self.create_status.clone();
         let (hold_all, hold_create, release, create_done) = (
             self.hold_all_deletes.clone(),
             self.hold_next_create.clone(),
@@ -657,6 +661,23 @@ impl VolumeEngine {
                     if String::from_utf8_lossy(&req.body).contains("\"bigreply\"") =>
                 {
                     answer(s, 201, &"x".repeat(4 << 20));
+                    true
+                }
+                ("POST", "/volumes/create") if create_status.load(Ordering::SeqCst) != 0 => {
+                    answer(
+                        s,
+                        create_status.load(Ordering::SeqCst),
+                        "{\"message\":\"refused\"}",
+                    );
+                    true
+                }
+                ("POST", "/volumes/create")
+                    if !String::from_utf8_lossy(&req.body).contains("\"Name\":\"") =>
+                {
+                    // A nameless create: the engine picks the name.
+                    let body = "{\"Name\":\"anon-1\",\"Labels\":{}}".to_owned();
+                    store.lock().unwrap().insert("anon-1".into(), body.clone());
+                    answer(s, 201, &body);
                     true
                 }
                 ("POST", "/volumes/create") => {
@@ -1482,6 +1503,71 @@ fn an_implicit_volume_create_that_could_not_be_dialed_gives_the_reservation_back
     assert!(status >= 500, "{status} {reply}");
     assert!(!h.svc.ledger.has_volume("lane-a", "other"));
     assert!(!h.svc.volume_fenced("other"));
+}
+
+/// A refused volume request is answered without holding the volume lock: a
+/// client that pipelines refused creates and never reads its replies (the
+/// server's refusal write blocks) cannot stall another workspace's create.
+#[test]
+fn a_client_that_never_reads_its_refusals_does_not_block_other_workspaces() {
+    // Refused creates (a name another workspace owns) and refused deletes (a
+    // name this workspace does not own), pipelined without reading.
+    for (round, request) in [
+        "POST /volumes/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: 16\r\n\r\n{\"Name\":\"owned\"}",
+        "DELETE /volumes/owned HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let engine = VolumeEngine::new();
+        engine.gate.store(true, Ordering::SeqCst);
+        let h = H::new(&format!("refusalsw4{round}"), false, engine.handler(), |_| {});
+        let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+        // Lane B owns `owned`: lane A's requests for it are refused.
+        assert_eq!(
+            call(&sock_b, "POST", "/volumes/create", Some(r#"{"Name":"owned"}"#)).0,
+            201
+        );
+        let stuck = UnixStream::connect(&sock_a).unwrap();
+        let mut writer = stuck.try_clone().unwrap();
+        let batch = request.repeat(4000);
+        let pipelined = std::thread::spawn(move || {
+            let _ = writer.write_all(batch.as_bytes());
+        });
+        std::thread::sleep(Duration::from_millis(1000));
+        let started = Instant::now();
+        let (status, _) = call(&sock_b, "POST", "/volumes/create", Some(r#"{"Name":"other"}"#));
+        assert_eq!(status, 201, "round {round}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "round {round}: {:?}",
+            started.elapsed()
+        );
+        let _ = stuck.shutdown(std::net::Shutdown::Both);
+        drop(stuck);
+        let _ = pipelined.join();
+    }
+}
+
+/// An engine error on a volume create leaves the name unowned (the reservation
+/// made at admission is given back), and a nameless create is owned by its
+/// sender under the name the engine chose.
+#[test]
+fn record_gives_back_a_refused_create_and_claims_a_nameless_one() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("recordw4", false, engine.handler(), |_| {});
+    let sock = h.serve(&h.auth);
+    engine.create_status.store(500, Ordering::SeqCst);
+    assert_eq!(call(&sock, "POST", "/volumes/create", DATA).0, 500);
+    assert!(
+        !h.svc.ledger.has_volume("lane-a", "data"),
+        "the reservation stayed"
+    );
+    engine.create_status.store(0, Ordering::SeqCst);
+    let (status, body) = call(&sock, "POST", "/volumes/create", Some("{}"));
+    assert_eq!(status, 201, "{body}");
+    assert!(h.svc.ledger.has_volume("lane-a", "anon-1"), "{body}");
 }
 
 fn raw_exchange(sock: &Path, request: &str, keep_reading_for: Duration) -> String {

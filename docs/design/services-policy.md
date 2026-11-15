@@ -148,11 +148,17 @@ and an old delete cannot land after the name was given to another workspace
 (`a_delayed_delete_cannot_remove_a_volume_another_workspace_now_owns`,
 `a_volume_create_holds_the_name_from_admission_to_the_end_of_its_engine_call`).
 The lock is released as soon as the engine's answer is in memory and recorded
-(or the call failed and the fence is set), before the reply is written to the
-client, so a client that reads slowly or not at all blocks nobody
+(or the call failed and the fence is set), and an admission refusal releases it
+before it is written; no reply to the client (an answer, a refusal or an error)
+is written, and no rest of a refused request is drained, while the lock is held,
+so a client that reads slowly or not at all does not hold up other workspaces'
+volume requests
 (`a_client_that_does_not_read_its_reply_does_not_block_other_workspaces`,
 `a_client_that_does_not_read_a_delete_reply_does_not_block_other_workspaces`,
-`a_slow_engine_body_does_not_block_other_workspaces_past_the_deadline`).
+`a_client_that_never_reads_its_refusals_does_not_block_other_workspaces`,
+`a_slow_engine_body_does_not_block_other_workspaces_past_the_deadline`). The
+engine calls made inside admission (an inspect, an implicit create) still hold
+the lock, bounded by `up_progress`.
 Both are made by the agent itself (`exchange`, one absolute `up_progress`
 deadline), not through the client's connection: a client that leaves does not
 cancel the engine call, ownership is recorded by its result, and a create the

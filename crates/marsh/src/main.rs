@@ -1122,7 +1122,7 @@ fn run_command(arguments: &[OsString]) -> i32 {
                 | marsh_daemon::DaemonError::Refused(message) => message,
                 other => other.to_string(),
             };
-            eprintln!("marsh: {message}");
+            eprintln!("marsh: {}", display_safe_text(&message));
             125
         }
     };

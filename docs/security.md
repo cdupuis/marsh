@@ -69,19 +69,38 @@ marsh refuses to start in a directory that contains them.
 Text a job, a Kit or a cloud run chose (command names and arguments, an agent
 call's summary, labels, a run's failure detail, file names in an error) is
 shown on your terminal through one filter,
-`marsh_contracts::terminal::display_safe`. It replaces with `?` the C0 and C1
-controls (so escape sequences), the line and paragraph separators, the
-bidirectional embedding, override and isolate controls, and invisible
-characters that hide text (zero-width space, BOM, word joiner, the tag block).
-Right-to-left marks, CJK, combining marks and joined emoji are kept; a
-zero-width joiner that joins nothing is replaced.
+`marsh_contracts::terminal::display_safe`. It replaces with `?`:
+- the C0 and C1 controls (so escape sequences), the line and paragraph
+  separators, and the bidirectional embedding, override and isolate controls;
+- characters that render as nothing, so text can hide in them: zero-width space,
+  BOM, word joiner and the invisible operators (U+2060 to U+206F), soft hyphen,
+  the combining grapheme joiner, the Hangul and Braille fillers, the Mongolian
+  separators, the object-replacement and annotation characters, all variation
+  selectors but the emoji pair, and the tag block (this also reduces the
+  subdivision flags, such as England's, to a plain flag, and shows a Japanese
+  ideographic variant as its base character).
 
-Where it applies on the Mac: `marsh results` and `results show`, `marsh status`,
-`gc`, `services` and `workers stop`, the `stop`/`reset` summary, cloud finish
-notices and `marsh cloud` messages and job lines, daemon errors (`DaemonError`
-text, and every `marsh: ...` error line), shell notices and control errors, and
-`mcp publish` and `acp` status text. The filter runs where the text is
-printed, and a test per path feeds it a controlled string.
+Kept: right-to-left marks, CJK, combining marks, emoji, emoji presentation
+selectors after an emoji, and a zero-width joiner inside an emoji sequence or
+between letters of a script that needs it (Arabic, Persian, the Indic scripts,
+Myanmar, Khmer). The list of hidden characters is a list, not a promise that no
+invisible character can pass.
+
+Where it applies on the Mac, each path filtered where it prints: `marsh results`
+and `results show`, `marsh status`, `gc`, `services` and `workers stop`, the
+`workers forget-cloud` and `kit uninstall` messages, `peer-review ls`, the
+`reset --include-services` and `docker rm` confirmations, the `stop`/`reset`
+summary, cloud finish notices and `marsh cloud` messages and job lines, daemon
+errors (`DaemonError` text, and every `marsh: ...` error line), shell notices and
+control errors, and `mcp publish` and `acp` status text. Tests feed a controlled
+string through: the receipt, results list, status, gc, services, notices, the
+lifecycle summary, the reset confirmation, `peer-review ls`, every `DaemonError`
+variant, the notice and control-error lines, the cloud job lines, `RunError`,
+and the refusal text of `marsh jobs`. The other filtered paths (the cloud
+discard line, `workers stop` entries, `forget-cloud` and `kit uninstall`
+messages, the `detached_json` notice, `acp` and `mcp publish` prints, and the
+calls that attach the notice helpers to the shell relay) are one-line calls to
+the same filter with no test of their own.
 
 Left as the workload wrote it:
 - the output stream of a job or a cloud run (`marsh cloud attach` replays its

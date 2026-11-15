@@ -235,7 +235,11 @@ pub fn prepare(
             return services_command(client.as_ref(), command, &session, &mut stdout);
         }
         ProductCommand::WorkersForgetCloud { name } => {
-            writeln!(stdout, "{}", client.forget_cloud_create(&name)?)?;
+            writeln!(
+                stdout,
+                "{}",
+                display_safe_text(&client.forget_cloud_create(&name)?)
+            )?;
             return Ok(ProductOutcome::Complete(0));
         }
         ProductCommand::WorkersReset { selection } => {
@@ -601,7 +605,9 @@ fn peer_review(
                     })?,
                 )?;
             } else {
-                crate::peer_review_cli::render(stdout, &status)?;
+                write_safe(stdout, |out| {
+                    Ok(crate::peer_review_cli::render(out, &status)?)
+                })?;
             }
             Ok(ProductOutcome::Complete(0))
         }
@@ -643,7 +649,9 @@ fn peer_review(
             )?;
             let status =
                 crate::peer_review_cli::status_of(&value).map_err(ProductError::Operation)?;
-            crate::peer_review_cli::render(stdout, &status)?;
+            write_safe(stdout, |out| {
+                Ok(crate::peer_review_cli::render(out, &status)?)
+            })?;
             Ok(ProductOutcome::Complete(0))
         }
         _ => Ok(ProductOutcome::Complete(2)),
@@ -700,9 +708,7 @@ fn confirm_services_in_reset(
         stderr,
         "marsh: --include-services deletes the Docker VM, Docker disk and data of:"
     )?;
-    for project in &projects {
-        writeln!(stderr, "  {project}")?;
-    }
+    write_project_list(stderr, &projects)?;
     if yes {
         return Ok(Some(projects));
     }
@@ -900,6 +906,15 @@ fn services_command(
 }
 
 /// Ask on the terminal; with no terminal the caller must pass `--yes`.
+/// The projects a reset would delete the services data of, one per line.
+/// Their paths come from the daemon, so they are filtered.
+fn write_project_list(stderr: &mut impl Write, projects: &[String]) -> std::io::Result<()> {
+    for project in projects {
+        writeln!(stderr, "  {}", display_safe(project))?;
+    }
+    Ok(())
+}
+
 fn confirm_services_removal(root: &std::path::Path) -> Result<bool, ProductError> {
     use std::io::{BufRead as _, IsTerminal as _};
     if !std::io::stdin().is_terminal() {
@@ -909,7 +924,7 @@ fn confirm_services_removal(root: &std::path::Path) -> Result<bool, ProductError
     }
     eprint!(
         "Remove the Docker VM of {} and its Docker disk? [y/N] ",
-        root.display()
+        display_safe(&root.display().to_string())
     );
     let mut answer = String::new();
     std::io::stdin().lock().read_line(&mut answer)?;
@@ -1775,7 +1790,7 @@ fn run_kit_command(
         }
         ProductCommand::KitUninstall { command } => {
             let detail = client.uninstall_kit(&command)?;
-            writeln!(&mut stdout, "{detail}")?;
+            writeln!(&mut stdout, "{}", display_safe_text(&detail))?;
             Ok(ProductOutcome::Complete(0))
         }
         _ => unreachable!("only Kit commands are dispatched here"),
@@ -1958,6 +1973,33 @@ mod tests {
         let report = marsh_daemon::VmGcReport::default();
         let mut out = Vec::new();
         write_gc_report(&mut out, &report).unwrap();
+    }
+
+    #[test]
+    fn reset_confirmation_prints_no_terminal_control_from_project_paths() {
+        let evil = "/p/project-\u{1b}]52;c;AAAA\u{7}";
+        let mut out = Vec::new();
+        write_project_list(&mut out, &[evil.to_owned()]).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out, "  /p/project-?]52;c;AAAA?\n");
+    }
+
+    #[test]
+    fn peer_review_listing_prints_no_terminal_control() {
+        let status: marsh_daemon::peer_review::PeerReviewStatus = serde_json::from_value(json!({
+            "enabled": true, "disabled_by": [], "reviewers": [], "skipped": [{
+                "agent": "a\u{1b}[2J", "model": "m", "source": "/s/x", "reason": "r\u{1b}]0;t\u{7}",
+                "class": "small", "vendor": "v", "classified": "c"
+            }],
+        }))
+        .unwrap();
+        let mut out = Vec::new();
+        write_safe(&mut out, |out| {
+            Ok(crate::peer_review_cli::render(out, &status)?)
+        })
+        .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("a?[2J") && out.contains("r?]0;t?"), "{out:?}");
     }
 
     #[test]

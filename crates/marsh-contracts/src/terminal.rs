@@ -73,22 +73,43 @@ fn plain_value(value: &str) -> bool {
 /// Whether `character` could act on a terminal or hide or reorder text in a
 /// line: C0 and C1 controls (ESC, CSI, OSC, BEL, CR, DEL...), the Unicode line
 /// and paragraph separators, the bidirectional embeddings, overrides and
-/// isolates (LRE RLE PDF LRO RLO, LRI RLI FSI PDI), and invisible characters
-/// that make text vanish (zero-width space, BOM, word joiner and invisible
-/// operators, the tag block that smuggles ASCII). The marks LRM, RLM and ALM
-/// stay, since right-to-left text uses them. The zero-width joiners
-/// (U+200C, U+200D) are handled in context by [`display_safe`].
+/// isolates (LRE RLE PDF LRO RLO, LRI RLI FSI PDI), and characters that
+/// render as nothing, so text can hide in them or ride on them: zero-width
+/// space, BOM, word joiner and invisible operators, soft hyphen, the combining
+/// grapheme joiner, Hangul and Braille fillers, Mongolian separators, the
+/// deprecated format characters, interlinear annotation and object
+/// replacement, the variation selectors, and the tag block that smuggles
+/// ASCII. The marks LRM, RLM and ALM stay, since right-to-left text uses them.
+/// The zero-width joiners and the emoji variation selectors (U+FE0E, U+FE0F)
+/// are decided in context by [`display_safe`].
 #[must_use]
 pub fn is_terminal_unsafe(character: char) -> bool {
     character.is_control()
         || matches!(
             character,
-            '\u{200b}'
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{08e2}'
+                | '\u{115f}'..='\u{1160}'
+                | '\u{17b4}'..='\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{200b}'
                 | '\u{2028}'..='\u{202e}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0d}'
                 | '\u{feff}'
-                | '\u{e0000}'..='\u{e007f}'
+                | '\u{ffa0}'
+                | '\u{fff9}'..='\u{fffc}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e01ef}'
         )
 }
 
@@ -96,16 +117,70 @@ fn is_joiner(character: char) -> bool {
     matches!(character, '\u{200c}' | '\u{200d}')
 }
 
-/// A joiner joins two characters that are not ASCII, white space or removed
-/// ones (an emoji sequence, a Persian or Indic word). Anywhere else it only
-/// hides.
-fn joins(before: Option<char>, after: Option<char>) -> bool {
-    let joinable = |c: Option<char>| {
-        c.is_some_and(|c| {
-            !c.is_ascii() && !c.is_whitespace() && !is_terminal_unsafe(c) && !is_joiner(c)
-        })
+fn is_emoji_selector(character: char) -> bool {
+    matches!(character, '\u{fe0e}' | '\u{fe0f}')
+}
+
+/// A character that can be an emoji or part of an emoji sequence: the symbol
+/// blocks and the pictograph planes, skin tones, and the emoji selector.
+fn emojiish(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00a9}'
+            | '\u{00ae}'
+            | '\u{203c}'
+            | '\u{2049}'
+            | '\u{2122}'
+            | '\u{2139}'
+            | '\u{2194}'..='\u{21aa}'
+            | '\u{231a}'..='\u{23ff}'
+            | '\u{24c2}'
+            | '\u{25aa}'..='\u{25fe}'
+            | '\u{2600}'..='\u{27bf}'
+            | '\u{2934}'..='\u{2935}'
+            | '\u{2b05}'..='\u{2b55}'
+            | '\u{3030}'
+            | '\u{303d}'
+            | '\u{3297}'
+            | '\u{3299}'
+            | '\u{1f000}'..='\u{1faff}'
+            | '\u{fe0f}'
+    )
+}
+
+/// Scripts that need the joiners: Arabic and Persian, the Indic scripts,
+/// Myanmar and Khmer.
+fn joining_script(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0620}'..='\u{06ff}'
+            | '\u{0750}'..='\u{077f}'
+            | '\u{08a0}'..='\u{08ff}'
+            | '\u{0900}'..='\u{0dff}'
+            | '\u{1000}'..='\u{109f}'
+            | '\u{1780}'..='\u{17ff}'
+            | '\u{fb50}'..='\u{fdff}'
+            | '\u{fe70}'..='\u{fefc}'
+    )
+}
+
+/// A zero-width joiner stays only inside an emoji sequence (both neighbours
+/// emoji); a non-joiner or joiner also between two letters of a script that
+/// needs them. Anywhere else, including next to a removed character, it only
+/// hides, and it is replaced.
+fn joins(joiner: char, before: Option<char>, after: Option<char>) -> bool {
+    let (Some(before), Some(after)) = (before, after) else {
+        return false;
     };
-    joinable(before) && joinable(after)
+    (joiner == '\u{200d}' && emojiish(before) && emojiish(after))
+        || (joining_script(before) && joining_script(after))
+}
+
+/// An emoji selector stays only after an emoji (or a keycap base followed by
+/// the combining keycap): elsewhere it carries a bit and shows nothing.
+fn selects(before: Option<char>, after: Option<char>) -> bool {
+    before.is_some_and(|c| emojiish(c) && c != '\u{fe0f}')
+        || (before.is_some_and(|c| matches!(c, '0'..='9' | '#' | '*')) && after == Some('\u{20e3}'))
 }
 
 fn sanitize(text: &str, keep_lines: bool, before: Option<char>, after: Option<char>) -> String {
@@ -115,7 +190,9 @@ fn sanitize(text: &str, keep_lines: bool, before: Option<char>, after: Option<ch
     for (index, &c) in characters.iter().enumerate() {
         let next = characters.get(index + 1).copied().or(after);
         let kept = if is_joiner(c) {
-            joins(previous, next)
+            joins(c, previous, next)
+        } else if is_emoji_selector(c) {
+            selects(previous, next)
         } else {
             !is_terminal_unsafe(c) || (keep_lines && matches!(c, '\n' | '\t'))
         };
@@ -282,6 +359,7 @@ mod tests {
             "שלום\u{200f} עולם\u{200e} \u{061c}مرحبا",
             "می\u{200c}خواهم",
             "e\u{301} combining, ünïcode",
+            "❤\u{fe0f} ☺\u{fe0e} 1\u{fe0f}\u{20e3} 👍🏽 🇯🇵",
         ] {
             assert_eq!(display_safe(kept), kept);
         }

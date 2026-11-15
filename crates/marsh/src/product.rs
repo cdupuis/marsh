@@ -905,7 +905,6 @@ fn services_command(
     Ok(ProductOutcome::Complete(0))
 }
 
-/// Ask on the terminal; with no terminal the caller must pass `--yes`.
 /// The projects a reset would delete the services data of, one per line.
 /// Their paths come from the daemon, so they are filtered.
 fn write_project_list(stderr: &mut impl Write, projects: &[String]) -> std::io::Result<()> {
@@ -915,6 +914,7 @@ fn write_project_list(stderr: &mut impl Write, projects: &[String]) -> std::io::
     Ok(())
 }
 
+/// Ask on the terminal; with no terminal the caller must pass `--yes`.
 fn confirm_services_removal(root: &std::path::Path) -> Result<bool, ProductError> {
     use std::io::{BufRead as _, IsTerminal as _};
     if !std::io::stdin().is_terminal() {
@@ -2015,31 +2015,52 @@ mod tests {
         }
     }
 
+    /// Through `confirm_services_in_reset` itself, the caller of the list.
     #[test]
     fn reset_confirmation_prints_no_terminal_control_from_project_paths() {
-        let evil = "/p/project-\u{1b}]52;c;AAAA\u{7}";
-        let mut out = Vec::new();
-        write_project_list(&mut out, &[evil.to_owned()]).unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert_eq!(out, "  /p/project-?]52;c;AAAA?\n");
+        let session = SessionConfig {
+            launch_directory: std::env::temp_dir(),
+            ..session()
+        };
+        let mut err = Vec::new();
+        let confirmed =
+            confirm_services_in_reset(&FakeClient::default(), &session, true, &mut err).unwrap();
+        assert_eq!(
+            confirmed,
+            Some(vec![EVIL.to_owned()]),
+            "the key stays exact"
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("  x?]52;c;AAAA?y\n"), "{err:?}");
+        assert!(!err.contains('\u{1b}') && !err.contains('\u{7}'), "{err:?}");
     }
 
+    /// Through `peer_review`, the caller of the table.
     #[test]
     fn peer_review_listing_prints_no_terminal_control() {
-        let status: marsh_daemon::peer_review::PeerReviewStatus = serde_json::from_value(json!({
-            "enabled": true, "disabled_by": [], "reviewers": [], "skipped": [{
-                "agent": "a\u{1b}[2J", "model": "m", "source": "/s/x", "reason": "r\u{1b}]0;t\u{7}",
-                "class": "small", "vendor": "v", "classified": "c"
-            }],
-        }))
+        let client = FakeClient {
+            status: Some(json!({"peer_review": {
+                "enabled": true, "disabled_by": [], "reviewers": [], "skipped": [{
+                    "agent": "a\u{1b}[2J", "model": "m", "source": "/s/x",
+                    "reason": "r\u{1b}]0;t\u{7}",
+                    "class": "small", "vendor": "v", "classified": "c"
+                }],
+            }})),
+            ..Default::default()
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let outcome = peer_review(
+            &ProductCommand::PeerReviewList { json: false },
+            &client,
+            &session(),
+            &mut out,
+            &mut err,
+        )
         .unwrap();
-        let mut out = Vec::new();
-        write_safe(&mut out, |out| {
-            Ok(crate::peer_review_cli::render(out, &status)?)
-        })
-        .unwrap();
+        assert_eq!(outcome, ProductOutcome::Complete(0));
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("a?[2J") && out.contains("r?]0;t?"), "{out:?}");
+        assert!(!out.contains('\u{1b}') && !out.contains('\u{7}'), "{out:?}");
     }
 
     #[test]
@@ -2197,6 +2218,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeClient {
+        /// The `marsh status --json` document, when a test needs more than the schema.
+        status: Option<serde_json::Value>,
         fail_prepare: bool,
         detached: AtomicBool,
         prepared: AtomicBool,
@@ -2273,7 +2296,14 @@ mod tests {
         }
 
         fn status_json(&self) -> Result<serde_json::Value, ClientError> {
-            Ok(json!({"schema": "marsh.status/v1"}))
+            Ok(self
+                .status
+                .clone()
+                .unwrap_or_else(|| json!({"schema": "marsh.status/v1"})))
+        }
+
+        fn services(&self, _: &marsh_daemon::ServicesRequest) -> Result<Value, ClientError> {
+            Ok(json!({"projects": [{"vm": "vm", "root": EVIL}]}))
         }
 
         fn jobs_json(&self) -> Result<serde_json::Value, ClientError> {

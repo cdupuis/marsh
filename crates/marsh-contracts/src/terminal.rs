@@ -321,6 +321,50 @@ mod tests {
         assert_eq!(DisplayFilter::default().push(&[0xff, b'a']), "\u{fffd}a");
     }
 
+    /// Each character the filter must replace, alone and in the combinations that
+    /// could carry a hidden bit: any one dropped from the hide table fails this.
+    #[test]
+    fn invisible_characters_and_unattached_joiners_and_selectors_are_replaced() {
+        for hidden in [
+            "a\u{00ad}b",
+            "a\u{034f}b",
+            "a\u{0600}b",
+            "a\u{06dd}b",
+            "a\u{115f}b",
+            "a\u{1160}b",
+            "a\u{17b4}b",
+            "a\u{180e}b",
+            "a\u{206a}b",
+            "a\u{2800}b",
+            "a\u{3164}b",
+            "a\u{fe00}b",
+            "a\u{ffa0}b",
+            "a\u{fff9}b",
+            "a\u{e0100}b",
+            "a\u{e0001}b",
+            "葛\u{e0101}",
+            "a\u{200d}\u{3164}",
+            "\u{3164}\u{200d}\u{3164}",
+            "\u{fe0f}\u{200d}\u{3164}",
+            // a joiner with only one side an emoji, or one side a script letter
+            "a\u{200d}👨",
+            "👨\u{200d}a",
+            "ب\u{200c}a",
+            "a\u{200c}ب",
+            "ب\u{200d}\u{200d}ب",
+            // a ZWNJ between emoji is not a join
+            "👨\u{200c}👩",
+            // selectors that follow nothing emoji
+            "a\u{fe0f}",
+            "a\u{fe0e}b",
+            "❤\u{fe0f}\u{fe0f}",
+            "1\u{fe0f}",
+        ] {
+            let shown = display_safe(hidden);
+            assert!(shown.contains('?'), "{hidden:?} -> {shown:?}");
+        }
+    }
+
     #[test]
     fn display_safe_hides_nothing_and_keeps_real_text() {
         // Characters that vanish, reorder, or smuggle ASCII.

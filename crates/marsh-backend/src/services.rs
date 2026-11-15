@@ -1515,24 +1515,42 @@ impl StockDaemonBackend {
                 }
             })
             .collect::<Vec<_>>();
+        self.forget_removed_projects(&components);
+        components
+    }
+}
+
+impl StockDaemonBackend {
+    /// What `reset --include-services` forgets of a project whose services VM
+    /// is gone (removed, or already absent): its holders, reap records, last
+    /// capture and Internet grant, as `services_remove` does.
+    pub(super) fn forget_removed_projects(&self, components: &[ScopeCleanupComponent]) {
+        let gone = |component: &&ScopeCleanupComponent| {
+            matches!(
+                component.state,
+                ScopeCleanupState::Removed | ScopeCleanupState::Absent
+            )
+        };
         let mut projects = self
             .services
             .projects
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for component in &components {
-            if component.state == ScopeCleanupState::Removed {
-                projects.remove(Path::new(&component.label));
-                self.services_reap_forget_project(Path::new(&component.label));
-            }
+        for component in components.iter().filter(gone) {
+            projects.remove(Path::new(&component.label));
+            self.services_reap_forget_project(Path::new(&component.label));
         }
         drop(projects);
-        for component in &components {
-            if component.state == ScopeCleanupState::Removed {
-                self.forget_last_capture(Path::new(&component.label));
+        for component in components.iter().filter(gone) {
+            let root = Path::new(&component.label);
+            self.forget_last_capture(root);
+            if let Err(error) = self.internet_grants().clear(&component.label) {
+                eprintln!(
+                    "marshd: services Internet grant of {}: {error}",
+                    root.display()
+                );
             }
         }
-        components
     }
 }
 
@@ -1837,6 +1855,43 @@ mod tests {
             mine(&components).contains("could not be stopped"),
             "{components:?}"
         );
+    }
+
+    /// `marsh reset --include-services` ends a project's Internet grant with its
+    /// VM, as `marsh docker rm` does; a VM that was kept, or whose removal is
+    /// uncertain, keeps it.
+    #[test]
+    fn reset_clears_the_internet_grant_of_a_removed_or_absent_services_vm() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let component = |label: &str, state| ScopeCleanupComponent {
+            kind: "services".into(),
+            label: label.into(),
+            state,
+            vm: Some("marsh-svc-test".into()),
+            detail: None,
+        };
+        let projects = [
+            ("/p/removed", ScopeCleanupState::Removed, false),
+            ("/p/absent", ScopeCleanupState::Absent, false),
+            ("/p/kept", ScopeCleanupState::Kept, true),
+            ("/p/uncertain", ScopeCleanupState::CleanupUncertain, true),
+        ];
+        for (project, _, _) in projects {
+            backend.internet_grants().set(project, true).unwrap();
+        }
+        let components = projects
+            .iter()
+            .map(|(project, state, _)| component(project, *state))
+            .collect::<Vec<_>>();
+        backend.forget_removed_projects(&components);
+        for (project, state, still_on) in projects {
+            assert_eq!(
+                backend.internet_grants().is_on(project),
+                still_on,
+                "{project} ({state:?})"
+            );
+        }
     }
 
     fn scope(config: Option<&str>) -> tempfile::TempDir {

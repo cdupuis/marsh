@@ -112,6 +112,7 @@ const SBX_COMPATIBILITY_TIMEOUT: Duration = Duration::from_secs(10);
 const KIT_RESOLUTION_TIMEOUT: Duration = Duration::from_mins(2);
 const KEEPALIVE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCAL_SCRATCH_STALE_AFTER: Duration = Duration::from_hours(1);
+const NO_MARKER_DETAIL: &str = "it has no marsh worker marker";
 const PREPARATION_SBX_TIMEOUT: Duration = Duration::from_mins(5);
 /// `sbx create` pulls the VM's image: on a slow link that alone takes many
 /// minutes, and stock SBX reports success or failure on its own. This only
@@ -2847,7 +2848,10 @@ impl StockSbx {
             NativeKitLocation::ImmutableOci(image) => image.clone(),
         };
         let (marker, legacy) = Self::published_kit_markers(spec)?;
-        let create = match self.classify_vm(&spec.name, false)? {
+        // A name still only an intent may have been created since the cached
+        // listing (an earlier daemon's create landing late): list afresh.
+        let intent_only = self.ownership.uuid(&spec.name).is_none();
+        let create = match self.classify_vm(&spec.name, intent_only)? {
             VmClass::Foreign => return Err(SbxError::ForeignVm(spec.name.clone())),
             VmClass::Owned { .. } => match self.kit_marker_state(spec, &marker, &legacy) {
                 Ok(KitMarkerState::Current | KitMarkerState::Legacy) => false,
@@ -3352,13 +3356,18 @@ impl StockSbx {
                 (selected_template != template.image().as_str()).then(|| template.digest());
             self.create_shell_from_template(spec, selected_template, pull_policy, expected_digest)
         };
-        let cold_started = match self.classify_vm(&spec.name, false)? {
+        // A name still only an intent may have been created since the cached
+        // listing (an earlier daemon's create landing late): list afresh.
+        let intent_only = self.ownership.uuid(&spec.name).is_none();
+        let cold_started = match self.classify_vm(&spec.name, intent_only)? {
             VmClass::Foreign => return Err(SbxError::ForeignVm(spec.name.clone())),
             VmClass::Owned { .. } => {
                 if let Err(error) = self.verify_owned_marker(&spec.name, &marker) {
                     self.ownership.invalidate();
                     // Our own VM from another shell image (an upgrade, or a
                     // dev build sharing the scope): replace it, as a reset would.
+                    // An owned VM with no marker at all is never replaced here
+                    // (`marsh reset` removes it by its UUID).
                     if !self.is_owned_shell_of_another_image(&spec.name, &marker) {
                         return Err(error);
                     }
@@ -6965,7 +6974,17 @@ impl StockSbx {
         current: &str,
         legacy: &str,
     ) -> Result<KitMarkerState, SbxError> {
-        let actual = self.read_owned_marker(&spec.name)?;
+        let actual = match self.read_owned_marker(&spec.name) {
+            Ok(actual) => actual,
+            // Owned by its recorded UUID yet never set up: a create that
+            // landed after the daemon that submitted it ended (or before its
+            // marker was written). marsh made it and may retire it; the
+            // caller creates it afresh.
+            Err(SbxError::IncompatibleVm { detail, .. }) if detail == NO_MARKER_DETAIL => {
+                return Ok(KitMarkerState::Stale);
+            }
+            Err(error) => return Err(error),
+        };
         if actual.schema == "marsh.worker/v1" && actual.basis == KIT_VM_BASIS {
             if actual.profile == current {
                 return Ok(KitMarkerState::Current);
@@ -7064,7 +7083,7 @@ impl StockSbx {
                     return Err(if stderr.starts_with("cat: ") {
                         SbxError::IncompatibleVm {
                             vm: vm.to_owned(),
-                            detail: "it has no marsh worker marker".into(),
+                            detail: NO_MARKER_DETAIL.into(),
                         }
                     } else {
                         SbxError::UnreadableVm {

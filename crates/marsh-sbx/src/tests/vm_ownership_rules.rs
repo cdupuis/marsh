@@ -169,7 +169,7 @@ fn admission_preflight_refuses_live_grants_but_not_idle_retained_ones() {
 }
 
 #[test]
-fn create_intent_persists_before_create_and_restart_adopts_present_or_drops_absent() {
+fn create_intent_persists_before_create_and_restart_adopts_present_and_keeps_absent() {
     let control = scratch();
     let map = control.path().join("vm-ownership.json");
     let model = StockModel::new();
@@ -198,8 +198,16 @@ fn create_intent_persists_before_create_and_restart_adopts_present_or_drops_abse
             running: true
         }
     );
-    // The absent startup intent was dropped: the Kit gets a fresh name.
-    assert_ne!(restarted.vm_name(VmPurpose::Kit, "kit-b").unwrap(), never);
+    // An intent that stays absent is never dropped, however many inventories
+    // list without it: its create may still land. The Kit reuses its name.
+    for _ in 0..3 {
+        restarted.ownership.invalidate();
+        assert!(matches!(
+            restarted.classify_vm(&created, true).unwrap(),
+            VmClass::Owned { .. }
+        ));
+    }
+    assert_eq!(restarted.vm_name(VmPurpose::Kit, "kit-b").unwrap(), never);
     assert_eq!(restarted.vm_name(VmPurpose::Kit, "kit-a").unwrap(), created);
     // The adopted VM is removable once fenced to its exact UUID.
     assert!(
@@ -208,6 +216,189 @@ fn create_intent_persists_before_create_and_restart_adopts_present_or_drops_abse
             .unwrap()
     );
     assert_eq!(model.vm_names(), [] as [std::string::String; 0]);
+}
+
+/// Audit B-06: an `sbx create` still in flight when the daemon restarted
+/// lands after the new daemon's first inventory. Its intent must survive that
+/// inventory, so the VM is adopted by its UUID and `marsh gc` can remove it
+/// (only it) instead of leaving an orphan no marsh command touches.
+#[test]
+fn a_create_that_lands_after_a_restart_is_adopted_and_removable_by_uuid() {
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let model = StockModel::new();
+    let first = StockSbx::new("sbx", Arc::clone(&model) as Arc<dyn CommandRunner>)
+        .with_vm_ownership(map.clone())
+        .unwrap();
+    let name = first.vm_name(VmPurpose::Kit, "kit-a").unwrap();
+    // The daemon dies while `sbx create` is still pulling the Kit's image.
+    drop(first);
+    let stranger = model.seed_vm("marsh-k-other");
+    model.with_vm("marsh-k-other", |vm| vm.running = false);
+
+    let restarted = StockSbx::new("sbx", Arc::clone(&model) as Arc<dyn CommandRunner>)
+        .with_vm_ownership(map.clone())
+        .unwrap();
+    // However many inventories list without it, however long it takes.
+    for _ in 0..5 {
+        assert_eq!(restarted.classify_vm(&name, true).unwrap(), VmClass::Absent);
+    }
+
+    // The create lands.
+    let landed = model.seed_vm(&name);
+    model.with_vm(&name, |vm| vm.running = false);
+    assert_eq!(
+        restarted.classify_vm(&name, true).unwrap(),
+        VmClass::Owned {
+            uuid: landed.clone(),
+            running: false
+        }
+    );
+    let (recorded, unrecorded) = restarted.recorded_vms().unwrap();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|vm| vm.name.as_str())
+            .collect::<Vec<_>>(),
+        [name.as_str()]
+    );
+    assert_eq!(unrecorded, ["marsh-k-other"]);
+
+    let removed = restarted
+        .remove_unused_kit_vm(
+            &name,
+            "kit-a",
+            &BTreeSet::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert!(removed);
+    assert_eq!(model.vm_names(), ["marsh-k-other"]);
+    assert_eq!(model.vm("marsh-k-other").unwrap().id, stranger);
+    assert!(matches!(
+        restarted.remove_unused_kit_vm(
+            "marsh-k-other",
+            "other",
+            &BTreeSet::new(),
+            Instant::now() + Duration::from_secs(5),
+        ),
+        Err(SbxError::ForeignVm(_))
+    ));
+    assert_eq!(model.vm_names(), ["marsh-k-other"]);
+}
+
+/// Review of B-06: the VM that lands late is bare (the daemon that would have
+/// written its worker marker is gone). It is ours by its recorded UUID, so the
+/// Kit's next preparation must retire it and create afresh, not fail on it.
+#[test]
+fn a_bare_late_landing_vm_is_replaced_by_the_kits_next_preparation() {
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let kit = KitFixture::published("marsh-kit-fixture");
+    write_map(
+        &map,
+        &serde_json::json!({
+            "version": 2,
+            "vms": {"marsh-kit-fixture": {"purpose": "kit", "key": "kit-a"}}
+        }),
+    );
+    let model = StockModel::new();
+    let restarted = StockSbx::new("sbx", Arc::clone(&model) as Arc<dyn CommandRunner>)
+        .with_vm_ownership(map)
+        .unwrap();
+    // The restarted daemon's first inventory lacks it; then the create lands.
+    assert_eq!(
+        restarted.classify_vm("marsh-kit-fixture", true).unwrap(),
+        VmClass::Absent
+    );
+    let bare = model.seed_vm("marsh-kit-fixture");
+
+    let ready = restarted.ensure_kit_vm(&kit.spec).unwrap();
+    assert!(ready.cold_started);
+    let vm = model.vm("marsh-kit-fixture").unwrap();
+    assert_ne!(vm.id, bare, "the bare VM was replaced");
+    assert_eq!(
+        vm.files["/var/lib/marsh/worker.json"],
+        kit.published_marker()
+    );
+    assert_eq!(model.vm_names(), ["marsh-kit-fixture"]);
+}
+
+/// Review of B-06, for the shell VM: a shell VM with no marker at all is never
+/// replaced (it may hold user state), so a bare late-landing one needs
+/// `marsh reset`; the first open must say so, not fail "already exists" on a
+/// stale listing, and the reset must remove it by its UUID.
+#[test]
+fn a_bare_late_landing_shell_vm_fails_closed_until_a_reset_removes_it_by_uuid() {
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let shell = ShellFixture::new();
+    write_map(
+        &map,
+        &serde_json::json!({
+            "version": 2,
+            "vms": {shell.spec.name.clone(): {"purpose": "shell", "key": "selected"}}
+        }),
+    );
+    let model = StockModel::new();
+    let restarted = StockSbx::new("sbx", Arc::clone(&model) as Arc<dyn CommandRunner>)
+        .with_vm_ownership(map)
+        .unwrap();
+    assert_eq!(
+        restarted.classify_vm(&shell.spec.name, true).unwrap(),
+        VmClass::Absent
+    );
+    let bare = model.seed_vm(&shell.spec.name);
+
+    assert!(matches!(
+        restarted.ensure_shell_vm(&shell.spec),
+        Err(SbxError::IncompatibleVm { .. })
+    ));
+    assert_eq!(model.count("create"), 0);
+    assert!(restarted.reset_shell_vm(&shell.spec).unwrap());
+    assert!(model.vm(&shell.spec.name).is_none(), "{bare}");
+    restarted.ensure_shell_vm(&shell.spec).unwrap();
+}
+
+/// Review of B-06: a reset that finds the name absent must not discard the
+/// intent of a create that may still land, nor may a restart after it.
+#[test]
+fn a_reset_while_a_create_is_pending_keeps_its_intent_for_the_late_vm() {
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let kit = KitFixture::published("marsh-kit-fixture");
+    write_map(
+        &map,
+        &serde_json::json!({
+            "version": 2,
+            "vms": {"marsh-kit-fixture": {"purpose": "kit", "key": "kit-a"}}
+        }),
+    );
+    let model = StockModel::new();
+    let runner = || Arc::clone(&model) as Arc<dyn CommandRunner>;
+    let adapter = StockSbx::new("sbx", runner())
+        .with_vm_ownership(map.clone())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    assert!(!adapter.reset_kit_vm_before(&kit.spec, deadline).unwrap());
+    assert!(
+        fs::read_to_string(&map)
+            .unwrap()
+            .contains("marsh-kit-fixture")
+    );
+    drop(adapter);
+
+    let landed = model.seed_vm("marsh-kit-fixture");
+    let restarted = StockSbx::new("sbx", runner())
+        .with_vm_ownership(map)
+        .unwrap();
+    assert_eq!(
+        restarted.classify_vm("marsh-kit-fixture", true).unwrap(),
+        VmClass::Owned {
+            uuid: landed,
+            running: true
+        }
+    );
 }
 
 #[test]

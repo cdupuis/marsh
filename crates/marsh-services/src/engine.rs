@@ -603,7 +603,8 @@ pub fn check_pool_fits(pool_bytes: u64, available: u64) -> Result<(), String> {
     if available < needed {
         return Err(format!(
             "marsh: the services disk has {} MiB free but a {} MiB pool needs {} MiB \
-             (including a {} MiB reserve); raise services.diskSize or lower services.poolSize",
+             (including a {} MiB reserve); set a larger disk with `marsh config services-disk-size` \
+             (it applies to a new VM: remove this project's Docker VM with `marsh docker rm` first)",
             available >> 20,
             pool_bytes >> 20,
             needed >> 20,
@@ -1303,6 +1304,9 @@ mod tests {
         let error = check_pool_fits(20 << 30, 8 << 30).unwrap_err();
         assert!(error.starts_with("marsh: "), "{error}");
         assert!(error.contains("free"), "{error}");
+        // The advice names settings that exist: there is no pool-size setting.
+        assert!(error.contains("marsh config services-disk-size"), "{error}");
+        assert!(!error.contains("poolSize"), "{error}");
         assert!(check_pool_fits(4 << 30, 8 << 30).is_ok());
     }
 

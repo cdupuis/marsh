@@ -159,8 +159,9 @@ A restart of the VM or of the container is a new `start`, so a new generation.
 
 ## Settings
 
-`services.poolSize` (default 24 GiB; test override `MARSH_SERVICES_POOL_BYTES`, read by
-`EngineSettings::from_env`). `EngineSettings::internet_open` is the project's Internet grant
+The pool is 24 GiB, fixed (there is no pool-size setting; test override
+`MARSH_SERVICES_POOL_BYTES`, read by `EngineSettings::from_env`), so a Docker disk below
+about 25g cannot start an engine. `EngineSettings::internet_open` is the project's Internet grant
 (`InternetGrants::is_on`), passed to `engine-up` as `--internet on|off` at every start. The Docker disk size is S1's `services.diskSize`.
 
 ## Break modes and holds (test builds only)

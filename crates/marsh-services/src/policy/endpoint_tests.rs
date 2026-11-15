@@ -1474,6 +1474,9 @@ fn a_volume_create_that_was_never_sent_gives_the_reservation_back() {
     assert!(!h.svc.ledger.has_volume("lane-a", "other"));
     assert!(!h.svc.volume_fenced("data"));
     assert!(!h.svc.volume_fenced("other"));
+    // Nothing was sent, so nothing is in flight.
+    assert!(!h.svc.create_pending("data"));
+    assert!(!h.svc.create_pending("other"));
 }
 
 /// The implicit create's dial fails after the inspect worked (the engine is
@@ -1618,6 +1621,109 @@ fn reconcile_keeps_the_owner_of_a_create_that_may_still_land() {
     std::thread::sleep(SHORT_FENCE + Duration::from_millis(300));
     h.svc.reconcile();
     assert!(!h.svc.ledger.has_volume("lane-a", "data"));
+}
+
+const SEEDED_OLD_A: &str = r#"{"containers":{},"networks":{},"volumes":{"data":{"scope":"lane-a","attempt":"att1","created":1}},"execs":{},"pins":{},"scope_networks":{}}"#;
+
+/// The two ways a create of `data` reaches the engine: an explicit create and a
+/// container create with a named volume.
+fn create_request(sock: &Path, implicit: bool) -> u16 {
+    if implicit {
+        let body = r#"{"Image":"busybox","HostConfig":{"Binds":["data:/x"]}}"#;
+        call(sock, "POST", "/containers/create", Some(body)).0
+    } else {
+        call(sock, "POST", "/volumes/create", DATA).0
+    }
+}
+
+/// A reconcile that runs while a create of the name is in flight (before its
+/// outcome is known) must not drop the owner: the name is in the in-flight
+/// registry from before the first byte is sent, and the reconcile cannot
+/// overtake the create.
+#[test]
+fn a_reconcile_during_a_create_that_then_times_out_keeps_the_owner() {
+    for implicit in [false, true] {
+        let engine = VolumeEngine::new();
+        engine.gate.store(true, Ordering::SeqCst);
+        let h = H::new(
+            &format!("inflightreconw4{implicit}"),
+            true,
+            engine.handler(),
+            |cfg| {
+                cfg.up_progress = Duration::from_millis(400);
+                cfg.delete_fence = SHORT_FENCE;
+                std::fs::write(&cfg.paths.ledger, SEEDED_OLD_A).unwrap();
+            },
+        );
+        assert!(h.svc.ledger.has_volume("lane-a", "data"));
+        let sock = h.serve(&h.auth);
+        engine.hold_next_create.store(true, Ordering::SeqCst);
+        let create = {
+            let sock = sock.clone();
+            std::thread::spawn(move || create_request(&sock, implicit))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        // The create is at the engine: a reconcile now sees no volume listed.
+        let svc = h.svc.clone();
+        let reconcile = std::thread::spawn(move || svc.reconcile());
+        assert!(create.join().unwrap() >= 500);
+        reconcile.join().unwrap();
+        h.svc.reconcile();
+        assert!(
+            h.svc.ledger.has_volume("lane-a", "data"),
+            "implicit={implicit}"
+        );
+        engine.create_release.store(true, Ordering::SeqCst);
+        assert!(wait_for(Duration::from_secs(5), || engine
+            .held_create_done
+            .load(Ordering::SeqCst)));
+        assert!(engine.store.lock().unwrap().contains_key("data"));
+        assert!(
+            h.svc.ledger.has_volume("lane-a", "data"),
+            "implicit={implicit}"
+        );
+    }
+}
+
+/// While a create of the name is of unknown outcome, a delete of it by any
+/// workspace, its sender too, is refused (503) instead of being answered 404 and
+/// releasing the name before the late create lands.
+#[test]
+fn a_delete_of_a_name_with_a_create_of_unknown_outcome_is_refused() {
+    for implicit in [false, true] {
+        let engine = VolumeEngine::new();
+        engine.gate.store(true, Ordering::SeqCst);
+        let h = H::new(
+            &format!("deletependingw4{implicit}"),
+            false,
+            engine.handler(),
+            |cfg| {
+                cfg.up_progress = Duration::from_millis(250);
+                cfg.delete_fence = SHORT_FENCE;
+            },
+        );
+        let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+        engine.hold_next_create.store(true, Ordering::SeqCst);
+        assert!(create_request(&sock_a, implicit) >= 500);
+        assert!(h.svc.ledger.has_volume("lane-a", "data"));
+        let (status, body) = call(&sock_a, "DELETE", "/volumes/data", None);
+        assert_eq!(status, 503, "implicit={implicit}: {body}");
+        // The owner is still the owner, and so is it when the create lands.
+        assert!(h.svc.ledger.has_volume("lane-a", "data"));
+        engine.create_release.store(true, Ordering::SeqCst);
+        assert!(wait_for(Duration::from_secs(5), || engine
+            .held_create_done
+            .load(Ordering::SeqCst)));
+        assert!(engine.store.lock().unwrap().contains_key("data"));
+        assert!(h.svc.ledger.has_volume("lane-a", "data"));
+        // Another workspace's delete is not forwarded either.
+        let (status, _) = call(&sock_b, "DELETE", "/volumes/data", None);
+        assert_ne!(status, 204);
+        assert!(engine.store.lock().unwrap().contains_key("data"));
+        // After the fence time the owner can delete.
+        std::thread::sleep(SHORT_FENCE + Duration::from_millis(300));
+        assert_eq!(call(&sock_a, "DELETE", "/volumes/data", None).0, 204);
+    }
 }
 
 fn raw_exchange(sock: &Path, request: &str, keep_reading_for: Duration) -> String {

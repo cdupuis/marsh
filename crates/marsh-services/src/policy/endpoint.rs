@@ -153,8 +153,11 @@ pub struct Services {
     tag_res: Mutex<TagRes>,
     /// Volume names with a delete of unknown outcome, and when it was sent.
     fenced: Mutex<HashMap<String, (String, std::time::Instant)>>,
-    /// Volume names with a CREATE of unknown outcome, and when it was sent: a
-    /// reconcile keeps their ledger records until the same time has passed.
+    /// The in-flight registry: volume names with a create that was sent and has
+    /// not been answered (removed on the answer, or if nothing was sent), and
+    /// when it started. A create whose outcome stays unknown stays here until
+    /// the fence time passes. While a name is here a reconcile keeps its
+    /// ledger record and a delete of it is refused.
     pending_creates: Mutex<HashMap<String, std::time::Instant>>,
     /// A pin is mounted and then recorded; both happen under the read side, and
     /// the sweep of unrecorded pins runs under the write side, so it can never
@@ -557,6 +560,10 @@ impl Services {
     }
 
     /// Names of volumes whose create may still land (within the fence time).
+    fn create_pending(&self, name: &str) -> bool {
+        self.pending_create_names().iter().any(|n| n == name)
+    }
+
     fn pending_create_names(&self) -> Vec<String> {
         let mut pending = self
             .pending_creates
@@ -590,19 +597,37 @@ impl Services {
         name: Option<&str>,
         body: Option<&[u8]>,
     ) -> CreateOutcome {
+        // In flight from before the first byte is sent.
+        if let Some(name) = name {
+            self.pending_creates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(name.to_owned(), std::time::Instant::now());
+        }
+        let done = |this: &Self| {
+            if let Some(name) = name {
+                this.pending_creates
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(name);
+            }
+        };
         let up = match self.dial() {
             Ok(up) => up,
-            Err(e) => return CreateOutcome::NotSent(e),
+            Err(e) => {
+                done(self);
+                return CreateOutcome::NotSent(e);
+            }
         };
         match self.exchange(up, "POST", "/volumes/create", body) {
-            Ok((resp, answer)) => CreateOutcome::Answered(resp, answer),
+            Ok((resp, answer)) => {
+                done(self);
+                CreateOutcome::Answered(resp, answer)
+            }
             Err(e) => {
+                // Unknown: it stays in the registry until the fence time.
                 if let Some(name) = name {
                     self.fence_volume(name, workspace);
-                    self.pending_creates
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(name.to_owned(), std::time::Instant::now());
                 }
                 self.log(&format!("create of volume {name:?} did not complete: {e}"));
                 CreateOutcome::Unknown(e)
@@ -810,10 +835,14 @@ impl Services {
         ) else {
             return;
         };
-        match self
+        // Not while a volume create or delete is in progress: the registry is
+        // read and the records dropped as one step with respect to them.
+        let guard = self.vol_enter();
+        let reconciled = self
             .ledger
-            .reconcile(&cs, &ns, &vs, &self.pending_create_names(), now())
-        {
+            .reconcile(&cs, &ns, &vs, &self.pending_create_names(), now());
+        drop(guard);
+        match reconciled {
             Ok(freed) => self.unpin_freed(freed),
             Err(e) => self.log(&format!("reconcile: {e}")),
         }
@@ -2968,6 +2997,19 @@ fn delete_volume(
     if !adm.query.is_empty() {
         path.push('?');
         path.push_str(&encode_query(&adm.query));
+    }
+    // A create of this name that has not been answered may still land: this
+    // delete (even the sender's) would be answered 404 and release the name
+    // before it does, so it is refused.
+    if svc.create_pending(name) {
+        drop(volume_op.take());
+        reply(
+            &mut conn.stream,
+            503,
+            "a create of this volume is in progress or its outcome is unknown; try again later",
+            false,
+        );
+        return !head.close;
     }
     // Nothing was sent if the engine cannot be dialed: no fence.
     let up = match svc.dial() {

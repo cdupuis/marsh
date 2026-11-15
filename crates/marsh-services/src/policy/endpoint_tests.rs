@@ -512,7 +512,8 @@ fn a_ledger_write_failure_refuses_and_leaves_no_engine_object() {
     assert_eq!(st, 201, "baseline create: {body}");
     assert_eq!(h.engine.created.load(Ordering::SeqCst), 1);
 
-    let tmp = h.dir.join("ledger.json.tmp");
+    let tmp = h.dir.join("ledger.lock");
+    std::fs::remove_file(&tmp).unwrap();
     std::fs::create_dir(&tmp).unwrap();
     let (st, body) = call(&sock, "POST", "/containers/create", Some(CREATE));
     assert_eq!(st, 503, "an unsaved create was acknowledged: {body}");

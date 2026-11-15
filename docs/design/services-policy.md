@@ -131,6 +131,15 @@ spellings.
 
 ## Ledger (A4)
 
+Every change takes an exclusive `flock` on `ledger.lock`, reloads the file if
+another agent process published since, writes a private temporary file, fsyncs
+it, renames it over `ledger.json` and fsyncs the directory. A file that does not
+parse is kept as `ledger.json.corrupt-*` (never deleted) and the agent boots on
+the first complete state in it, or an empty one. Enforced by the ledger tests
+`two_ledgers_on_one_file_keep_each_others_records`,
+`racing_writers_never_tear_or_lose_the_ledger` and
+`an_unparseable_ledger_is_set_aside_not_deleted`.
+
 `ledger.json` on the pool records the owner scope of containers, networks,
 volumes and exec IDs, plus pins and substituted sockets. Every object route
 resolves names, short IDs and full IDs inside the caller's scope only and

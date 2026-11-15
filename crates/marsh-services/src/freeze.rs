@@ -247,3 +247,350 @@ fn heartbeat_age(dir: &Path) -> Option<Duration> {
         .ok()
         .and_then(|t| t.elapsed().ok())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const E: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    /// What the fake engine does for one container.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Mode {
+        Paused,
+        Running,
+        Gone,
+        /// Accepts `unpause` and stays paused.
+        Stuck,
+        /// Answers 500 to everything.
+        Broken,
+    }
+
+    /// A small engine on a unix socket: inspect (`State.Paused`) and unpause,
+    /// per container, with every request recorded.
+    struct FakeEngine {
+        socket: PathBuf,
+        state: Arc<Mutex<HashMap<String, Mode>>>,
+        log: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl FakeEngine {
+        fn start(dir: &Path, containers: &[(&str, Mode)]) -> Self {
+            let socket = dir.join("engine.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let state: Arc<Mutex<HashMap<String, Mode>>> = Arc::new(Mutex::new(
+                containers
+                    .iter()
+                    .map(|(id, mode)| ((*id).to_owned(), *mode))
+                    .collect(),
+            ));
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (state2, log2, stop2) = (state.clone(), log.clone(), stop.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stop2.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Ok(stream) = stream {
+                        let (state, log) = (state2.clone(), log2.clone());
+                        std::thread::spawn(move || serve(stream, &state, &log));
+                    }
+                }
+            });
+            Self {
+                socket,
+                state,
+                log,
+                stop,
+            }
+        }
+
+        fn engine(&self) -> Engine {
+            Engine::new(&self.socket)
+        }
+
+        fn set(&self, id: &str, mode: Mode) {
+            self.state.lock().unwrap().insert(id.to_owned(), mode);
+        }
+
+        fn mode(&self, id: &str) -> Mode {
+            self.state.lock().unwrap()[id]
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for FakeEngine {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = UnixStream::connect(&self.socket);
+        }
+    }
+
+    fn serve(stream: UnixStream, state: &Mutex<HashMap<String, Mode>>, log: &Mutex<Vec<String>>) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut first = String::new();
+        if reader.read_line(&mut first).unwrap_or(0) == 0 {
+            return;
+        }
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        let mut words = first.split_whitespace();
+        let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+        log.lock().unwrap().push(format!("{method} {path}"));
+        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let (code, body) = match (method, parts.as_slice()) {
+            (_, ["containers", id, action, ..]) => {
+                let mut state = state.lock().unwrap();
+                match (state.get(*id).copied(), method, *action) {
+                    (None | Some(Mode::Gone), ..) => {
+                        (404, r#"{"message":"No such container"}"#.to_owned())
+                    }
+                    (Some(Mode::Broken), ..) => (500, r#"{"message":"engine error"}"#.to_owned()),
+                    (Some(mode), "GET", "json") => (
+                        200,
+                        format!(
+                            r#"{{"State":{{"Paused":{}}}}}"#,
+                            matches!(mode, Mode::Paused | Mode::Stuck)
+                        ),
+                    ),
+                    (Some(mode), "POST", "unpause") => {
+                        if mode == Mode::Paused {
+                            state.insert((*id).to_owned(), Mode::Running);
+                        }
+                        (204, String::new())
+                    }
+                    _ => (400, String::new()),
+                }
+            }
+            _ => (404, String::new()),
+        };
+        let mut stream = stream;
+        let _ = write!(
+            stream,
+            "HTTP/1.0 {code} X\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("freeze-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn stage(dir: &Path, journal: &[&str]) -> OwnedFd {
+        let stage = fsops::open_dir_by_path(dir).unwrap();
+        let ids: Vec<String> = journal.iter().map(|id| (*id).to_owned()).collect();
+        write_journal(&stage, "snap", &ids).unwrap();
+        stage
+    }
+
+    fn settled_ids(dir: &Path) -> Vec<String> {
+        let mut ids: Vec<String> = std::fs::read_dir(dir.join(SETTLED))
+            .map(|entries| {
+                entries
+                    .map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn a_journal_round_trips_and_a_bad_one_is_never_nothing_to_do() {
+        let dir = scratch("journal");
+        let stage = fsops::open_dir_by_path(&dir).unwrap();
+        assert!(read_journal(&stage).unwrap().is_none());
+        assert_eq!(unsettled(&stage).unwrap().len(), 0);
+
+        write_journal(&stage, "snap", &[A.to_owned(), B.to_owned()]).unwrap();
+        let journal = read_journal(&stage).unwrap().unwrap();
+        assert_eq!((journal.id.as_str(), journal.containers.len()), ("snap", 2));
+        // It grows atomically: the next write replaces the whole file.
+        write_journal(&stage, "snap", &[A.to_owned(), B.to_owned(), C.to_owned()]).unwrap();
+        assert_eq!(unsettled(&stage).unwrap(), [A, B, C]);
+
+        // Unreadable, corrupt, oversized and linked journals are errors: a
+        // capture whose journal cannot be read still has things to thaw.
+        for bad in [
+            b"{ not json".to_vec(),
+            vec![b' '; 256 * 1024 + 1],
+            br#"{"id":"snap"}"#.to_vec(),
+        ] {
+            std::fs::write(dir.join(JOURNAL), &bad).unwrap();
+            assert!(read_journal(&stage).is_err());
+            assert!(unsettled(&stage).is_err());
+        }
+        std::fs::remove_file(dir.join(JOURNAL)).unwrap();
+        std::fs::write(dir.join("elsewhere"), br#"{"id":"x","containers":[]}"#).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join(JOURNAL)).unwrap();
+        assert!(read_journal(&stage).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The freeze is over only for containers the engine confirmed: paused ones
+    /// that unpause, running ones, and removed ones. A stuck container and an
+    /// engine error stay unsettled, and a later pass finishes the job.
+    #[test]
+    fn thaw_settles_only_what_the_engine_confirmed() {
+        let dir = scratch("thaw");
+        let engine = FakeEngine::start(
+            &dir,
+            &[
+                (A, Mode::Paused),
+                (B, Mode::Running),
+                (C, Mode::Gone),
+                (D, Mode::Stuck),
+                (E, Mode::Broken),
+            ],
+        );
+        let stage = stage(&dir, &[A, B, C, D, E]);
+
+        let left = thaw(&engine.engine(), &stage, 2).unwrap();
+        let mut left_sorted = left.clone();
+        left_sorted.sort();
+        assert_eq!(left_sorted, [D, E]);
+        assert_eq!(settled_ids(&dir), [A, B, C]);
+        assert_eq!(engine.mode(A), Mode::Running);
+        let mut pending = unsettled(&stage).unwrap();
+        pending.sort();
+        assert_eq!(pending, [D, E]);
+        // Settled ones are not asked about again.
+        let before = engine.requests().iter().filter(|r| r.contains(A)).count();
+        engine.set(D, Mode::Paused);
+        engine.set(E, Mode::Paused);
+        assert_eq!(thaw(&engine.engine(), &stage, 2).unwrap().len(), 0);
+        assert_eq!(settled_ids(&dir), [A, B, C, D, E]);
+        assert_eq!(
+            engine.requests().iter().filter(|r| r.contains(A)).count(),
+            before
+        );
+        assert_eq!(unsettled(&stage).unwrap().len(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A journal entry that is not a container id is never sent to the engine
+    /// and never written as a marker (the id becomes a path component).
+    #[test]
+    fn thaw_never_uses_a_journal_entry_that_is_not_a_container_id() {
+        let dir = scratch("badid");
+        let engine = FakeEngine::start(&dir, &[(A, Mode::Paused)]);
+        let stage = stage(&dir, &["../escape", "abc", A]);
+        let left = thaw(&engine.engine(), &stage, 1).unwrap();
+        assert_eq!(left, ["../escape", "abc"]);
+        assert_eq!(settled_ids(&dir), [A]);
+        assert!(!dir.join("escape").exists());
+        assert!(
+            engine
+                .requests()
+                .iter()
+                .all(|request| !request.contains("escape") && !request.contains("abc")),
+            "{:?}",
+            engine.requests()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn revoking_is_idempotent_and_visible() {
+        let dir = scratch("revoke");
+        let stage = fsops::open_dir_by_path(&dir).unwrap();
+        assert!(!is_revoked(&stage));
+        revoke(&stage);
+        revoke(&stage);
+        assert!(is_revoked(&stage));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn watchdog(engine: &FakeEngine, dir: &Path, bound_ms: u64) -> std::thread::JoinHandle<i32> {
+        let args = [
+            "--engine-socket".to_owned(),
+            engine.socket.display().to_string(),
+            "--dir".to_owned(),
+            dir.display().to_string(),
+            "--bound-ms".to_owned(),
+            bound_ms.to_string(),
+        ];
+        std::thread::spawn(move || watchdog_main(&args))
+    }
+
+    /// With no heartbeat past the bound, the watchdog revokes first, then
+    /// thaws, and exits only once everything is confirmed.
+    #[test]
+    fn the_watchdog_revokes_then_thaws_when_the_heartbeat_is_overdue() {
+        let dir = scratch("watchdog");
+        let engine = FakeEngine::start(&dir, &[(A, Mode::Paused), (B, Mode::Stuck)]);
+        let stage = stage(&dir, &[A, B]);
+        let handle = watchdog(&engine, &dir, 200);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !is_revoked(&stage) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(is_revoked(&stage), "the capture was never told");
+        // B is stuck: the watchdog keeps retrying and does not exit.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!handle.is_finished());
+        assert_eq!(engine.mode(A), Mode::Running);
+        engine.set(B, Mode::Paused);
+        assert_eq!(handle.join().unwrap(), 0);
+        assert_eq!(settled_ids(&dir), [A, B]);
+        assert_eq!(unsettled(&stage).unwrap().len(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A fresh heartbeat holds the watchdog off.
+    #[test]
+    fn the_watchdog_leaves_a_live_capture_alone() {
+        let dir = scratch("alive");
+        let engine = FakeEngine::start(&dir, &[(A, Mode::Paused)]);
+        let stage = stage(&dir, &[A]);
+        std::fs::write(dir.join(ALIVE), b"").unwrap();
+        let handle = watchdog(&engine, &dir, 60_000);
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!handle.is_finished());
+        assert!(!is_revoked(&stage));
+        assert_eq!(engine.mode(A), Mode::Paused);
+        // The capture settles on its own: nothing is left, the watchdog ends.
+        mark_settled(&stage, A).unwrap();
+        assert_eq!(handle.join().unwrap(), 0);
+        assert_eq!(engine.mode(A), Mode::Paused);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_watchdog_rejects_bad_arguments_and_ignores_a_vanished_stage() {
+        assert_eq!(watchdog_main(&["--engine-socket".into()]), 2);
+        assert_eq!(watchdog_main(&["--bogus".into(), "x".into()]), 2);
+        assert_eq!(watchdog_main(&[]), 2);
+        let dir = scratch("gone");
+        let args = [
+            "--engine-socket".to_owned(),
+            "/nonexistent".to_owned(),
+            "--dir".to_owned(),
+            dir.join("missing").display().to_string(),
+        ];
+        assert_eq!(watchdog_main(&args), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

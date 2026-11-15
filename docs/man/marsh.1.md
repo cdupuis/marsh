@@ -328,12 +328,16 @@ they do with Bash. After **-c** or **--**, marsh interprets nothing.
 **docker stop** [**--json**]
 : Stop the current project's Docker VM. Its disk and data are kept.
 
-**docker rm** [**--yes**] [**--json**]
+**docker rm** [**--yes**] [**--json**] [**--project** *FOLDER*]
 : Remove the current project's Docker VM and its Docker disk: every
   container, volume and image in it, every lane's containers, and the saved Docker
   data of the project's checkpoints. Asks first on a terminal; with no terminal
   it needs **--yes**. This is the only way, besides **reset --include-services**,
-  that Docker data is deleted.
+  that Docker data is deleted. **--project** *FOLDER* names the old folder of a
+  project that was moved or deleted (**docker status** marks those); for a folder
+  that is gone it only accepts the exact folder of a Docker VM marsh made (a
+  folder on a drive that is not mounted looks gone too); for one that exists it
+  acts like **docker rm** run there.
 
 **docker internet** **on**|**off** [**--json**]
 : Grant or revoke Internet for the current project's Docker containers. The

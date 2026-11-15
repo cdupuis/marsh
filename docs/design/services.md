@@ -295,7 +295,7 @@ records first and closes after. A failure never claims `on`, and a restart
 after a half-done `off` comes up closed. With no engine yet the grant is
 recorded and `engine-up` applies it. The grant is a daemon-owned file
 (`services-internet.json` in the scope, private to the daemon); `marsh services
-rm` removes the project's entry.
+rm` and `reset --include-services` remove the project's entry.
 
 **Status.** `internet.on` is the grant; `governed` and `effective` are as above
 and `effective` also says what the running engine's gate reads back (`on`,

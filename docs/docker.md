@@ -368,7 +368,12 @@ marsh docker rm --yes
 ```
 
 `marsh docker status`, `stop`, and `rm` work even when Docker is off for
-the project, so turning Docker off never strands a VM.
+the project, so turning Docker off never strands a VM. A project folder that was
+moved or deleted still has its Docker VM and disk: `marsh docker status` marks it
+as gone, and `marsh docker rm --project /old/path` (from any folder) removes
+it. For a folder that is gone it only accepts the exact folder of a Docker VM
+marsh made (a folder on a drive that is not mounted looks gone too, so mount
+it first); for a folder that exists it acts like `marsh docker rm` run there.
 
 ## Checkpoints and Branch from here
 
@@ -733,7 +738,7 @@ protects, what it does not, and the risks marsh accepts.
 | `marsh docker status [--json]` | State of each project's Docker VM (`--json`: containers, ports, Internet) |
 | `marsh docker start [--json]` | Create or start the Docker VM and wait until it is ready |
 | `marsh docker stop [--json]` | Stop it, keeping its data |
-| `marsh docker rm [--yes] [--json]` | Remove it and all its data |
+| `marsh docker rm [--yes] [--json] [--project GONE_FOLDER]` | Remove it and all its data (`--project`: the old folder of a moved or deleted project) |
 | `marsh docker internet on\|off [--json]` | Grant or revoke Internet |
 | `marsh docker hold SECONDS`, `release HOLDER` | Keep the VM awake; for testing the idle timer |
 | `marsh reset --include-services [--yes]` | Also delete Docker data, after listing the projects |

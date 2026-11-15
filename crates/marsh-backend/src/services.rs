@@ -486,6 +486,20 @@ impl StockDaemonBackend {
         Ok(canonical)
     }
 
+    /// The project `rm` acts on: the exact folder of an owned VM whose folder
+    /// is gone, else the usual canonical existing directory (so any existing
+    /// folder is accepted as it is for every other request).
+    fn remove_target(
+        &self,
+        root: &Path,
+        owned: &[(String, String)],
+    ) -> Result<PathBuf, DaemonError> {
+        match missing_project_root(root, owned) {
+            Some(gone) => Ok(gone),
+            None => self.services_root(root),
+        }
+    }
+
     fn services_spec(&self, root: &Path, settings: &Settings) -> ServicesVmSpec {
         ServicesVmSpec {
             project: root.to_owned(),
@@ -534,7 +548,7 @@ impl StockDaemonBackend {
                 self.services_stop(&root)
             }
             ServicesRequest::Remove { root } => {
-                let root = self.services_root(&root)?;
+                let root = self.remove_target(&root, &self.sbx.owned_services_vms())?;
                 self.services_remove(&root)
             }
         }
@@ -1033,8 +1047,13 @@ impl StockDaemonBackend {
         } else {
             (Vec::new(), Vec::new(), None)
         };
+        let folder_missing = matches!(
+            fs::symlink_metadata(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
         let mut document = json!({
             "root": root,
+            "folder_missing": folder_missing,
             "enabled": settings.enabled_for(root),
             "state": state,
             "reason": reason,
@@ -1554,6 +1573,21 @@ impl StockDaemonBackend {
     }
 }
 
+/// The folder of a services VM this daemon owns whose project is gone from the
+/// Mac (moved or deleted), so `rm --project` can still reach it. Only an exact
+/// recorded key qualifies, and only when the folder is really absent: a folder
+/// that exists, or that cannot be checked, takes the normal path.
+fn missing_project_root(root: &Path, owned: &[(String, String)]) -> Option<PathBuf> {
+    let key = root.to_str()?;
+    if !owned.iter().any(|(_, recorded)| recorded == key) {
+        return None;
+    }
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(root.to_owned()),
+        _ => None,
+    }
+}
+
 /// What the project's services containers can reach right now, in one line.
 fn effective_internet(on: bool, governance: &Governance, gate: Option<&Gate>) -> String {
     if governance.governed {
@@ -1892,6 +1926,67 @@ mod tests {
                 "{project} ({state:?})"
             );
         }
+    }
+
+    /// `rm --project` reaches a services VM whose folder is gone, but only by
+    /// an exact recorded key, and never for a folder that still exists.
+    #[test]
+    fn rm_reaches_only_a_recorded_project_whose_folder_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("moved");
+        let present = dir.path().join("present");
+        fs::create_dir(&present).unwrap();
+        let key = |path: &Path| path.to_str().unwrap().to_owned();
+        let owned = vec![
+            ("marsh-svc-a".to_owned(), key(&gone)),
+            ("marsh-svc-b".to_owned(), key(&present)),
+        ];
+        assert_eq!(missing_project_root(&gone, &owned), Some(gone.clone()));
+        // The folder exists: the normal path (canonical, a directory) applies.
+        assert_eq!(missing_project_root(&present, &owned), None);
+        // Not a recorded key (a neighbour, a child, a spelling with `..`).
+        let other = dir.path().join("other");
+        assert_eq!(missing_project_root(&other, &owned), None);
+        assert_eq!(missing_project_root(&gone.join("sub"), &owned), None);
+        assert_eq!(
+            missing_project_root(&present.join("..").join("moved"), &owned),
+            None
+        );
+        // Nothing is owned: nothing is reachable.
+        assert_eq!(missing_project_root(&gone, &[]), None);
+        // A folder that cannot be checked is not treated as gone.
+        let file = dir.path().join("file");
+        fs::write(&file, "").unwrap();
+        let below = file.join("project");
+        let owned = vec![("marsh-svc-c".to_owned(), key(&below))];
+        assert_eq!(missing_project_root(&below, &owned), None);
+    }
+
+    /// What `rm` acts on: a recorded project whose folder is gone, or else the
+    /// usual rule; an unrecorded missing folder, and a recorded key spelled
+    /// differently, are refused.
+    #[test]
+    fn rm_acts_on_a_gone_recorded_folder_or_the_usual_rule() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let base = fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let (gone, present, stranger) = (
+            base.join("moved"),
+            base.join("present"),
+            base.join("never-owned"),
+        );
+        fs::create_dir(&present).unwrap();
+        let owned = vec![("marsh-svc-a".to_owned(), gone.to_str().unwrap().to_owned())];
+        assert_eq!(backend.remove_target(&gone, &owned).unwrap(), gone);
+        assert_eq!(backend.remove_target(&present, &owned).unwrap(), present);
+        assert!(backend.remove_target(&stranger, &owned).is_err());
+        assert!(backend.remove_target(&gone, &[]).is_err());
+        assert!(
+            backend
+                .remove_target(&present.join("..").join("moved"), &owned)
+                .is_err()
+        );
+        fs::remove_dir_all(&base).unwrap();
     }
 
     fn scope(config: Option<&str>) -> tempfile::TempDir {

@@ -283,6 +283,8 @@ mod tests {
         state: Arc<Mutex<HashMap<String, Mode>>>,
         log: Arc<Mutex<Vec<String>>>,
         stop: Arc<AtomicBool>,
+        /// Whether `revoked` already existed when the first unpause arrived.
+        revoked_first: Arc<Mutex<Option<bool>>>,
     }
 
     impl FakeEngine {
@@ -297,7 +299,9 @@ mod tests {
             ));
             let log = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
+            let revoked_first = Arc::new(Mutex::new(None));
             let (state2, log2, stop2) = (state.clone(), log.clone(), stop.clone());
+            let (revoked2, dir2) = (revoked_first.clone(), dir.to_path_buf());
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     if stop2.load(Ordering::SeqCst) {
@@ -305,7 +309,8 @@ mod tests {
                     }
                     if let Ok(stream) = stream {
                         let (state, log) = (state2.clone(), log2.clone());
-                        std::thread::spawn(move || serve(stream, &state, &log));
+                        let (revoked, dir) = (revoked2.clone(), dir2.clone());
+                        std::thread::spawn(move || serve(stream, &state, &log, (&revoked, &dir)));
                     }
                 }
             });
@@ -314,6 +319,7 @@ mod tests {
                 state,
                 log,
                 stop,
+                revoked_first,
             }
         }
 
@@ -341,7 +347,12 @@ mod tests {
         }
     }
 
-    fn serve(stream: UnixStream, state: &Mutex<HashMap<String, Mode>>, log: &Mutex<Vec<String>>) {
+    fn serve(
+        stream: UnixStream,
+        state: &Mutex<HashMap<String, Mode>>,
+        log: &Mutex<Vec<String>>,
+        stage: (&Mutex<Option<bool>>, &Path),
+    ) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut first = String::new();
         if reader.read_line(&mut first).unwrap_or(0) == 0 {
@@ -356,6 +367,13 @@ mod tests {
         let mut words = first.split_whitespace();
         let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
         log.lock().unwrap().push(format!("{method} {path}"));
+        if method == "POST" && path.ends_with("/unpause") {
+            stage
+                .0
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| stage.1.join(REVOKED).exists());
+        }
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let (code, body) = match (method, parts.as_slice()) {
             (_, ["containers", id, action, ..]) => {
@@ -554,6 +572,9 @@ mod tests {
         assert_eq!(engine.mode(A), Mode::Running);
         engine.set(B, Mode::Paused);
         assert_eq!(handle.join().unwrap(), 0);
+        // Revoked before the first thaw: a capture that still publishes while
+        // its containers are being thawed would publish an inconsistent copy.
+        assert_eq!(*engine.revoked_first.lock().unwrap(), Some(true));
         assert_eq!(settled_ids(&dir), [A, B]);
         assert_eq!(unsettled(&stage).unwrap().len(), 0);
         std::fs::remove_dir_all(&dir).unwrap();

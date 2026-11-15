@@ -75,7 +75,9 @@ struct Setup {
     /// Where task transcripts are kept in this container.
     dir: PathBuf,
     /// Tasks running at once (`tasks-live`, from `job.json`); finished ones
-    /// do not count. The tree's launch rate catches loops.
+    /// do not count. Only this server enforces it: an agent that calls
+    /// `marsh run` itself is held to `job-children` and the tree's launch
+    /// rate (`process.rs`), which also catch loops.
     live_cap: usize,
 }
 

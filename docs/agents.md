@@ -78,6 +78,10 @@ the caller's folder with [`marsh split apply ID LABEL --json`](split.md):
 limit, a name outside the spawn set) is a tool error with marsh's reason.
 One agent's task tool has at most 16 tasks running at once (`tasks-live`);
 finished tasks do not count, so a long session can start as many as it needs.
+That cap lives in the task tool, inside the agent's container, and is not a
+security bound: an agent that calls `marsh run` directly is held to the
+daemon's ordinary process limits instead (pool capacity, depth, `job-children`,
+`tree-launch-rate`, Kit VMs, the spawn set and the inherited wall time).
 A task's default agent is the caller's own, and it may hand work on the same
 way: there is no limit on `claude` calling `claude`.
 
@@ -278,7 +282,7 @@ link outside `MARSH_SPAWN` exits 126; other refusals, including those through
 | 16 live children per job (`job-children`) | `fan-out limit 16: job ... already has 16 live children; retry when one ends, or raise it with ...` |
 | 60 launches per tree in any rolling minute (`tree-launch-rate`); refused child calls count only up to 8 | `rate limit: 60 launches in the last minute; retry in 12s, or raise it with ...` |
 | 8 distinct Kit VMs used by live jobs in one tree (`tree-kit-vms`) | `NAME refused: tree already uses 8 Kit VMs (...); retry when one of their jobs ends, or raise it with ...` |
-| 16 running tasks per task tool (`tasks-live`) | `16 tasks are running in this task server (limit 16 at once); wait for one ...` |
+| 16 running tasks per task tool (`tasks-live`; enforced by the tool in the job, not by the daemon) | `16 tasks are running in this task server (limit 16 at once); wait for one ...` |
 | At least one second must remain before the parent's deadline | `deadline: parent job ... has ... ms of wall time left` |
 | A name outside `MARSH_SPAWN` | `spawn refused: NAME not in this job's spawn set (MARSH_SPAWN)` |
 | No terminal for a child | `interactive child jobs are not supported yet` |

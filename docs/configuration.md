@@ -83,7 +83,7 @@ restart.
 | `job-children` | `MARSH_JOB_CHILDREN` | 16. Live children of one job. | 1 to 128 | now |
 | `tree-depth` | `MARSH_TREE_DEPTH` | 4. Your command is depth 1. | 1 to 16 | now |
 | `tree-kit-vms` | `MARSH_TREE_KIT_VMS` | 8. Distinct Kit VMs used by live jobs in one tree. Aliases of the same Kit share a VM. | 1 to 64 | now |
-| `tasks-live` | `MARSH_TASKS_LIVE` | 16. Tasks one agent's [task tool](agents.md#the-task-tool) has running at once. Finished tasks do not count. | 1 to 128 | new jobs |
+| `tasks-live` | `MARSH_TASKS_LIVE` | 16. Tasks one agent's [task tool](agents.md#the-task-tool) has running at once. Finished tasks do not count. The task tool in the agent's container enforces it, so it is a courtesy cap for that tool, not a bound: a job that runs `marsh run` itself is held to the daemon's ordinary process limits (`job-children`, `tree-launch-rate`, depth, pool, Kit VMs, spawn set, wall time) instead. | 1 to 128 | new jobs |
 | `tree-launch-rate` | `MARSH_TREE_LAUNCH_RATE` | `60/60s`. Launches one job tree may make in any rolling window, as `LAUNCHES/SECONDS` (`60/1m` also works). It catches tight loops: a long session calling tools steadily never reaches it. Refused child calls count only up to 8 per window. | 1 to 10000 in 1 to 3600 s | now |
 | `job-cpu-millis` | `MARSH_JOB_CPU_MILLIS` | Half the Mac's cores, at least 2 (2000 = 2 CPUs). | 1 or more | new jobs |
 | `job-memory-bytes` | `MARSH_JOB_MEMORY_BYTES` | A quarter of the Mac's memory, from 4 GiB to 8 GiB. A Kit VM created while it is above stock SBX's VM size (half the Mac's memory) is made big enough for one such job. | 1 or more | new jobs |

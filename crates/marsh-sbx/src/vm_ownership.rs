@@ -14,7 +14,9 @@
 //! - A VM is usable only if its name exists with the recorded UUID. A name
 //!   present with a different UUID, or not in the map, is foreign: refuse.
 //! - Stop/remove only ever target a recorded UUID that is currently present.
-//!   Removal drops the entry, so the next use gets a new random name.
+//!   Removal drops the entry, so the next use gets a new random name, except
+//!   that a replacement created under a just-removed name keeps it
+//!   (`restore_intent`), and `record` restores a retired name's purpose/key.
 //!
 //! The inventory view is refreshed (one `sbx ls --json`) only on cold start,
 //! after a lifecycle change, or after a failure. Warm requests use the cache.

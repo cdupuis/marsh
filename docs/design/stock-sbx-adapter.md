@@ -8,9 +8,11 @@ run a registered command directly in a VM. Host `sbx` is trusted.
 
 ## Version and installation
 
-Startup requires stock SBX v0.47.0 or newer,
-checks the exact reported version and commit, and probes the local Kit v3
-create surface before creating product state. Older inventory fixtures (from
+Startup requires stock SBX v0.47.0 or newer: it parses the reported version
+line (a release, or a nightly whose `-N-gABBREV` suffix matches the line's
+40-hex commit), refuses an older one, and probes the local Kit v3 create
+surface before creating product state. It pins no version and no commit beyond
+that minimum. Older inventory fixtures (from
 v0.46.0, for example) remain as parser and model coverage, not supported
 releases. The version check does
 not qualify every later version or prove that a build has the EROFS
@@ -65,8 +67,17 @@ from `(purpose, key)` to name and observed UUID in the host control directory.
   loaded at startup, whose name is absent.
 - A VM is usable only if its name is present with the recorded UUID. A name
   with a different UUID, or not in the map, is foreign and refused.
-- Stop and remove target only a recorded UUID that is currently present.
-  Removal drops the entry, so the next use gets a new name.
+- Stop and remove target only a recorded UUID that is currently present
+  (`remove_owned_vm` classifies afresh first). Removal drops the entry, so the
+  next use gets a new name, except that a replacement created under a
+  just-removed name (an unhealthy Kit VM, a shell VM whose image changed)
+  persists that name as an intent again (`restore_intent`), and `record`
+  restores a name retired in this process to its old purpose and key.
+- The warm paths that mount, pull an image into, or install a binary in a Kit
+  VM address it by name, on the `ReadyKitVm` that classification produced
+  when it was made ready; they do not classify again. They rely on the host
+  trust and the name rule above (no other actor creates a VM under a name this
+  daemon chose), not on a UUID check at each call.
 
 Warm requests use a cached `sbx ls --json` view, refreshed on cold start, after
 a lifecycle change, or after a failure. `docs/model/Ownership.tla` specifies

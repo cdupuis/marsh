@@ -84,7 +84,11 @@ journey. Do not grow mock suites or a parallel test framework to claim progress.
 - Host `sbx` is trusted. Use only its public CLI; never ship a patched SBX.
 - VM names are random (`marsh-k-xxxxxxxx`, `marsh-s-xxxxxxxx`) and recorded in
   the per-daemon ownership map before `sbx create`. Never stop, remove, mount,
-  or exec into a VM that is not in that map with its recorded UUID.
+  or exec into a VM that is not in that map. Stop and remove check the recorded
+  UUID in a fresh listing; the warm Kit paths (`mount_shared_grant`,
+  `prewarm_image`, `install_binary`) act by name on a VM that was classified when
+  it became ready, so they rest on the trusted host and on random names that
+  only this daemon creates (`docs/design/stock-sbx-adapter.md`).
 - Keep session, job, attempt, worker, VM, and container identities distinct.
 - Never replay a job after transport loss; mark it cleanup-uncertain and
   quarantine the VM, with its reason. The daemon retires it once it verified

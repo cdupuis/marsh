@@ -23,6 +23,16 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// The label the agent stamps on every object it admits (A4).
 pub const SCOPE_LABEL: &str = "dev.marsh.scope";
 pub const ATTEMPT_LABEL: &str = "dev.marsh.attempt";
+/// The one host address the relay dials for a `tcp` channel. Published ports
+/// are tracked and authorized only on this address: other loopback addresses
+/// (`127.0.0.2`, `::1`) are distinct bindings that the relay never reaches,
+/// so two workspaces may hold the same port on different ones.
+pub const RELAY_DIAL_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::LOCALHOST;
+
+fn is_relay_ip(ip: &str) -> bool {
+    ip.parse::<std::net::IpAddr>()
+        .is_ok_and(|a| a == std::net::IpAddr::V4(RELAY_DIAL_IP))
+}
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -74,6 +84,8 @@ pub struct MountSummary {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PortSummary {
+    #[serde(default, rename = "IP")]
+    pub ip: String,
     #[serde(default)]
     pub public_port: u16,
     #[serde(default, rename = "Type")]
@@ -98,6 +110,14 @@ pub struct ContainerSummary {
     pub mounts: Option<Vec<MountSummary>>,
     #[serde(default)]
     pub ports: Option<Vec<PortSummary>>,
+}
+
+impl PortSummary {
+    /// A published TCP port on the address the relay dials.
+    #[must_use]
+    pub fn is_relay_tcp(&self) -> bool {
+        self.public_port != 0 && self.kind == "tcp" && is_relay_ip(&self.ip)
+    }
 }
 
 impl ContainerSummary {
@@ -158,6 +178,8 @@ struct DetailNetwork {
 #[serde(rename_all = "PascalCase")]
 struct DetailBinding {
     #[serde(default)]
+    host_ip: String,
+    #[serde(default)]
     host_port: String,
 }
 
@@ -178,7 +200,7 @@ impl ContainerDetail {
             .map(String::as_str)
     }
 
-    /// Does the container publish this TCP port on the host side?
+    /// Does the container publish this TCP port on the address the relay dials?
     #[must_use]
     pub fn publishes_tcp(&self, port: u16) -> bool {
         self.network_settings
@@ -187,6 +209,7 @@ impl ContainerDetail {
             .flatten()
             .filter(|(key, _)| key.ends_with("/tcp"))
             .flat_map(|(_, bindings)| bindings.iter().flatten())
+            .filter(|binding| is_relay_ip(&binding.host_ip))
             .any(|binding| binding.host_port.parse::<u16>().is_ok_and(|p| p == port))
     }
 }

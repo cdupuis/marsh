@@ -401,6 +401,164 @@ fn a_reset_while_a_create_is_pending_keeps_its_intent_for_the_late_vm() {
     );
 }
 
+/// Audit B-11: `forget` and `record` changed memory first, so a failed write
+/// left memory and disk apart until the next restart.
+#[test]
+fn a_failed_map_write_leaves_memory_as_it_was() {
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let ownership = VmOwnership::persisted(map.clone()).unwrap();
+    let recorded = ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
+    ownership.record(&recorded, "uuid-a").unwrap();
+    let intent = ownership.assign(VmPurpose::Kit, "kit-b").unwrap();
+    let absent = ownership.assign(VmPurpose::Kit, "kit-c").unwrap();
+    drop(ownership);
+    let ownership = VmOwnership::persisted(map.clone()).unwrap();
+    let on_disk = fs::read(&map).unwrap();
+    let writable = |yes: bool| {
+        let mode = if yes { 0o700 } else { 0o500 };
+        fs::set_permissions(control.path(), fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let view = || {
+        StockInventory::decode(
+            format!(
+                r#"[{{"name":"{intent}","id":"11111111-1111-4111-8111-111111111111","status":"running","workspaces":[]}}]"#
+            )
+            .as_bytes(),
+        )
+    };
+
+    writable(false);
+    let forgotten = ownership.forget(&recorded);
+    let adopted = ownership.record(&intent, "uuid-b");
+    let reconciled = ownership.store_view(view().unwrap());
+    writable(true);
+
+    assert!(forgotten.is_err() && adopted.is_err() && reconciled.is_err());
+    assert!(ownership.cached_view().is_none());
+    assert_eq!(ownership.uuid(&recorded).as_deref(), Some("uuid-a"));
+    assert_eq!(ownership.uuid(&intent), None);
+    assert_eq!(
+        ownership.lookup(VmPurpose::Kit, "kit-c").as_deref(),
+        Some(absent.as_str())
+    );
+    assert_eq!(fs::read(&map).unwrap(), on_disk);
+}
+
+/// Audit B-11 review: the new map is published by the rename, so a failure
+/// of the directory sync after it must not roll memory back to the old map.
+#[test]
+fn a_directory_sync_failure_after_the_rename_keeps_memory_equal_to_the_disk() {
+    use crate::vm_ownership::{DIRECTORY_SYNCS, FAIL_DIRECTORY_SYNC};
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let ownership = VmOwnership::persisted(map.clone()).unwrap();
+    let before = DIRECTORY_SYNCS.with(std::cell::Cell::get);
+    let recorded = ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
+    ownership.record(&recorded, "uuid-a").unwrap();
+    // Every write syncs the directory after its rename.
+    assert_eq!(DIRECTORY_SYNCS.with(std::cell::Cell::get), before + 2);
+    let intent = ownership.assign(VmPurpose::Kit, "kit-b").unwrap();
+
+    FAIL_DIRECTORY_SYNC.with(|fail| fail.set(true));
+    let forgotten = ownership.forget(&recorded);
+    let adopted = ownership.record(&intent, "uuid-b");
+    let fresh = ownership.assign(VmPurpose::Kit, "kit-c");
+    let retired = ownership.mark_retired(&intent);
+    FAIL_DIRECTORY_SYNC.with(|fail| fail.set(false));
+
+    assert!(forgotten.is_err() && adopted.is_err() && fresh.is_err() && retired.is_err());
+    let reloaded = VmOwnership::persisted(map).unwrap();
+    for name in [&recorded, &intent] {
+        assert_eq!(ownership.uuid(name), reloaded.uuid(name), "{name}");
+    }
+    assert_eq!(ownership.uuid(&recorded), None);
+    // After the first failure the map is not known durable, so the later
+    // writes are refused before they change anything.
+    assert_eq!(ownership.uuid(&intent), None);
+    assert_eq!(ownership.host_names(), reloaded.host_names());
+    assert_eq!(ownership.retired_names(), reloaded.retired_names());
+}
+
+/// Review of B-11: a bare relative file name has the empty parent directory.
+#[test]
+fn the_map_can_be_written_under_a_bare_relative_file_name() {
+    let control = scratch();
+    let previous = std::env::current_dir().unwrap();
+    std::env::set_current_dir(control.path()).unwrap();
+    let written = VmOwnership::persisted(PathBuf::from("vm-ownership.json"))
+        .and_then(|ownership| ownership.assign(VmPurpose::Kit, "kit-a"));
+    std::env::set_current_dir(previous).unwrap();
+    written.unwrap();
+    assert!(control.path().join("vm-ownership.json").is_file());
+}
+
+/// Review of B-11: a map write that was published but whose directory sync
+/// failed is not durable; a retry that finds the answer in memory must not
+/// hand out ownership (a name to create under) until a write succeeds.
+#[test]
+fn a_retry_after_a_failed_directory_sync_does_not_take_the_map_for_durable() {
+    use crate::vm_ownership::FAIL_DIRECTORY_SYNC;
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let ownership = VmOwnership::persisted(map.clone()).unwrap();
+    FAIL_DIRECTORY_SYNC.with(|fail| fail.set(true));
+    assert!(ownership.assign(VmPurpose::Kit, "kit-a").is_err());
+    // The intent is in memory and on disk, but not known durable: asking
+    // again fails while the sync still fails, instead of answering from memory.
+    assert!(ownership.assign(VmPurpose::Kit, "kit-a").is_err());
+    let name = ownership.lookup(VmPurpose::Kit, "kit-a").unwrap();
+    assert!(ownership.record(&name, "uuid-a").is_err());
+    FAIL_DIRECTORY_SYNC.with(|fail| fail.set(false));
+
+    assert_eq!(ownership.assign(VmPurpose::Kit, "kit-a").unwrap(), name);
+    ownership.record(&name, "uuid-a").unwrap();
+    let reloaded = VmOwnership::persisted(map).unwrap();
+    assert_eq!(reloaded.uuid(&name).as_deref(), Some("uuid-a"));
+}
+
+/// Review of B-11 (GPT's reproduction): a replacement whose restored intent
+/// could not be made durable must not be created by the next preparation,
+/// which finds the name absent in a listing that changes no entry.
+#[test]
+fn no_create_is_submitted_while_a_restored_intent_is_not_durable() {
+    use crate::vm_ownership::{DIRECTORY_SYNCS, FAIL_SYNCS_FROM};
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let model = StockModel::new();
+    let adapter = StockSbx::new("sbx", Arc::clone(&model) as Arc<dyn CommandRunner>)
+        .with_vm_ownership(map.clone())
+        .unwrap();
+    let kit = KitFixture::published("marsh-kit-fixture");
+    // A durably owned VM that was never set up (no marker): the next
+    // preparation retires it, forgets it, restores its intent and recreates.
+    adapter.ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
+    model.seed_vm("marsh-kit-fixture");
+    adapter.ownership.invalidate();
+    let owned = adapter.adopt_created("marsh-kit-fixture");
+    assert!(owned.is_ok(), "{owned:?}");
+
+    // The sync after the forget (the restore) fails, and every later one.
+    let from = DIRECTORY_SYNCS.with(std::cell::Cell::get) + 1;
+    FAIL_SYNCS_FROM.with(|fail| fail.set(Some(from)));
+    let first = adapter.ensure_kit_vm(&kit.spec);
+    let second = adapter.ensure_kit_vm(&kit.spec);
+    FAIL_SYNCS_FROM.with(|fail| fail.set(None));
+
+    assert!(first.is_err() && second.is_err(), "{first:?} {second:?}");
+    assert_eq!(
+        model.count("create"),
+        0,
+        "a create ran on an undurable intent"
+    );
+    // The failed attempt quarantined the name; the sync recovered, still no create.
+    assert!(matches!(
+        adapter.ensure_kit_vm(&kit.spec),
+        Err(SbxError::QuarantinedVm(_))
+    ));
+    assert_eq!(model.count("create"), 0);
+}
+
 #[test]
 fn ownership_mirror_holds_every_intent_before_create_and_tracks_removal() {
     let control = scratch();

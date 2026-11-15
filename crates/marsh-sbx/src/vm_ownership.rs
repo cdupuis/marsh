@@ -33,7 +33,10 @@ use std::{
     io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// Purpose recorded for VMs created by a daemon before purposes existed or
@@ -160,14 +163,67 @@ struct State {
     retired: BTreeMap<String, Entry>,
 }
 
+/// What a failed write must put back: the maps a mutation changes.
+type Snapshot = (BTreeMap<String, Entry>, BTreeMap<String, Entry>);
+
+impl State {
+    fn snapshot(&self) -> Snapshot {
+        (self.entries.clone(), self.retired.clone())
+    }
+
+    fn restore(&mut self, (entries, retired): Snapshot) {
+        self.entries = entries;
+        self.retired = retired;
+    }
+}
+
 pub(crate) struct VmOwnership {
     path: Option<PathBuf>,
     mirror: Option<PathBuf>,
     state: Mutex<State>,
     view: Mutex<Option<Arc<StockInventory>>>,
+    /// Whether the last [`Self::persist`] got as far as renaming the new map
+    /// into place. From then on the disk holds the new state whatever a later
+    /// step (the directory sync) reports, so a rollback must not restore the
+    /// old memory: memory would then disagree with what a restart reads.
+    published: AtomicBool,
+    /// A write was published but its directory sync failed: the map is on disk
+    /// but not known durable. No ownership authority is handed out again until
+    /// a later write succeeds in full (see [`Self::make_durable`]).
+    undurable: AtomicBool,
 }
 
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), SbxError> {
+#[cfg(test)]
+thread_local! {
+    /// Directory syncs attempted on this thread, and whether to fail them.
+    pub(crate) static DIRECTORY_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    pub(crate) static FAIL_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Fail every directory sync once this many have been attempted.
+    pub(crate) static FAIL_SYNCS_FROM: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+fn sync_directory(parent: &Path) -> Result<(), SbxError> {
+    #[cfg(test)]
+    {
+        DIRECTORY_SYNCS.with(|count| count.set(count.get() + 1));
+        let attempted = DIRECTORY_SYNCS.with(std::cell::Cell::get);
+        if FAIL_DIRECTORY_SYNC.with(std::cell::Cell::get)
+            || FAIL_SYNCS_FROM
+                .with(std::cell::Cell::get)
+                .is_some_and(|from| attempted >= from)
+        {
+            return Err(std::io::Error::other("injected directory sync failure").into());
+        }
+    }
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn write_atomically(
+    path: &Path,
+    bytes: &[u8],
+    published: Option<&AtomicBool>,
+) -> Result<(), SbxError> {
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     let _ = fs::remove_file(&temporary);
     let mut file = fs::OpenOptions::new()
@@ -178,6 +234,20 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), SbxError> {
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(&temporary, path)?;
+    if let Some(published) = published {
+        published.store(true, Ordering::Release);
+    }
+    // The rename itself is only durable once its directory is: without this a
+    // power loss can bring back the old map, losing an intent persisted
+    // "before create".
+    // A bare relative file name has the empty parent: the working directory.
+    if let Some(parent) = path.parent() {
+        sync_directory(if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        })?;
+    }
     Ok(())
 }
 
@@ -226,6 +296,8 @@ impl VmOwnership {
             mirror: None,
             state: Mutex::new(State::default()),
             view: Mutex::new(None),
+            published: AtomicBool::new(false),
+            undurable: AtomicBool::new(false),
         }
     }
 
@@ -286,6 +358,8 @@ impl VmOwnership {
                 retired: BTreeMap::new(),
             }),
             view: Mutex::new(None),
+            published: AtomicBool::new(false),
+            undurable: AtomicBool::new(false),
         };
         if migrated {
             ownership.persist(&ownership.lock())?;
@@ -325,6 +399,7 @@ impl VmOwnership {
         let Some(path) = &self.path else {
             return Ok(());
         };
+        self.published.store(false, Ordering::Release);
         let bytes = serde_json::to_vec_pretty(&OwnershipFile {
             version: 2,
             vms: state.entries.clone(),
@@ -332,15 +407,44 @@ impl VmOwnership {
         })?;
         // The mirror is written first: it never names fewer VMs than the map.
         if let Some(mirror) = &self.mirror {
-            write_atomically(mirror, &bytes)?;
+            write_atomically(mirror, &bytes, None)?;
         }
-        write_atomically(path, &bytes)
+        write_atomically(path, &bytes, Some(&self.published))?;
+        self.undurable.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether the map is known durable, finishing a published-but-unsynced
+    /// write first. The gate in front of every `sbx create`.
+    pub(crate) fn confirm_durable(&self) -> Result<(), SbxError> {
+        let state = self.lock();
+        self.make_durable(&state)
+    }
+
+    /// Before answering from the map, finish a write that was published but
+    /// not synced: a retry must not take the failed barrier for durable.
+    fn make_durable(&self, state: &State) -> Result<(), SbxError> {
+        if self.undurable.load(Ordering::Acquire) {
+            self.persist(state)?;
+        }
+        Ok(())
+    }
+
+    /// Undo a mutation whose write failed, unless the write had already
+    /// published it: then the disk holds the new state and memory keeps it.
+    fn rollback(&self, state: &mut State, before: Snapshot) {
+        if self.published.load(Ordering::Acquire) {
+            self.undurable.store(true, Ordering::Release);
+        } else {
+            state.restore(before);
+        }
     }
 
     /// Name for `(purpose, key)`. An existing entry is reused; otherwise a
     /// fresh random name is persisted as an intent before any create.
     pub(crate) fn assign(&self, purpose: VmPurpose, key: &str) -> Result<String, SbxError> {
         let mut state = self.lock();
+        self.make_durable(&state)?;
         if let Some(name) = state
             .entries
             .iter()
@@ -355,6 +459,7 @@ impl VmOwnership {
                 break candidate;
             }
         };
+        let before = state.snapshot();
         state.entries.insert(
             name.clone(),
             Entry {
@@ -364,7 +469,7 @@ impl VmOwnership {
             },
         );
         if let Err(error) = self.persist(&state) {
-            state.entries.remove(&name);
+            self.rollback(&mut state, before);
             return Err(error);
         }
         Ok(name)
@@ -396,6 +501,7 @@ impl VmOwnership {
     /// with it: no later lookup returns it, and every daemon removes it.
     pub(crate) fn mark_retired(&self, name: &str) -> Result<String, SbxError> {
         let mut state = self.lock();
+        let before = state.snapshot();
         let Some(entry) = state.entries.get_mut(name) else {
             return Err(SbxError::HostGrantFence(format!(
                 "{name} is not recorded in the VM ownership map"
@@ -403,9 +509,7 @@ impl VmOwnership {
         };
         let prior = std::mem::replace(&mut entry.purpose, RETIRED.into());
         if let Err(error) = self.persist(&state) {
-            if let Some(entry) = state.entries.get_mut(name) {
-                entry.purpose = prior;
-            }
+            self.rollback(&mut state, before);
             return Err(error);
         }
         Ok(prior)
@@ -425,6 +529,7 @@ impl VmOwnership {
                 "{name} was replaced while it stopped"
             )));
         }
+        let before = state.snapshot();
         let Some(entry) = state.entries.get_mut(name) else {
             return Err(SbxError::HostGrantFence(format!(
                 "{name} is not recorded in the VM ownership map"
@@ -432,9 +537,7 @@ impl VmOwnership {
         };
         entry.purpose = prior;
         if let Err(error) = self.persist(&state) {
-            if let Some(entry) = state.entries.get_mut(name) {
-                entry.purpose = RETIRED.into();
-            }
+            self.rollback(&mut state, before);
             return Err(error);
         }
         Ok(())
@@ -489,6 +592,8 @@ impl VmOwnership {
 
     pub(crate) fn record(&self, name: &str, uuid: &str) -> Result<(), SbxError> {
         let mut state = self.lock();
+        self.make_durable(&state)?;
+        let before = state.snapshot();
         let retired = state.retired.remove(name);
         let entry = state.entries.entry(name.to_owned()).or_insert_with(|| {
             retired.unwrap_or_else(|| Entry {
@@ -501,7 +606,11 @@ impl VmOwnership {
             return Ok(());
         }
         entry.uuid = Some(uuid.to_owned());
-        self.persist(&state)
+        if let Err(error) = self.persist(&state) {
+            self.rollback(&mut state, before);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Drop the record of a VM that is gone. An intent that was never adopted
@@ -516,10 +625,14 @@ impl VmOwnership {
         {
             return Ok(());
         }
+        let before = state.snapshot();
         if let Some(mut entry) = state.entries.remove(name) {
-            self.persist(&state)?;
             entry.uuid = None;
             state.retired.insert(name.to_owned(), entry);
+            if let Err(error) = self.persist(&state) {
+                self.rollback(&mut state, before);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -528,12 +641,11 @@ impl VmOwnership {
     /// replacement VM is created under it.
     pub(crate) fn restore_intent(&self, name: &str) -> Result<(), SbxError> {
         let mut state = self.lock();
+        let before = state.snapshot();
         if let Some(entry) = state.retired.remove(name) {
             state.entries.insert(name.to_owned(), entry);
             if let Err(error) = self.persist(&state) {
-                if let Some(entry) = state.entries.remove(name) {
-                    state.retired.insert(name.to_owned(), entry);
-                }
+                self.rollback(&mut state, before);
                 return Err(error);
             }
         }
@@ -588,6 +700,7 @@ impl VmOwnership {
     ) -> Result<Arc<StockInventory>, SbxError> {
         {
             let mut state = self.lock();
+            let before = state.snapshot();
             let mut changed = false;
             for (name, entry) in &mut state.entries {
                 if entry.uuid.is_none()
@@ -597,8 +710,9 @@ impl VmOwnership {
                     changed = true;
                 }
             }
-            if changed {
-                self.persist(&state)?;
+            if changed && let Err(error) = self.persist(&state) {
+                self.rollback(&mut state, before);
+                return Err(error);
             }
         }
         let inventory = Arc::new(inventory);

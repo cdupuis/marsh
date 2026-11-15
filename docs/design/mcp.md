@@ -105,8 +105,9 @@ path, uses `/tmp/marsh-mcp-<uid>-<key>`; the broker then says so on stderr when
 it starts, because another local user can block that directory by creating it
 first (a denial of service, not access).
 A broker started by an earlier build listens under `/tmp` and holds the scope
-lease; this build cannot see or stop it. `broker-start` detects it (the socket
-under `/tmp` and the held lease) and fails with its pid and the command that
+lease; this build cannot see or stop it. `broker-start` detects it (a socket
+under `/tmp` keyed on the scope root as spelled or as canonicalized, and the held lease; a stale pid
+in an unlocked `control.lock` is never reported) and fails with its pid and the command that
 works without the old binary: `kill <pid>`. Sandboxes loaded through that
 broker lose their MCP connection until they reload.
 

@@ -135,20 +135,19 @@ impl BrokerOptions {
     /// this build looks elsewhere, and it still holds the scope lease (its pid
     /// is in `control.lock`). This build cannot stop it, so say what does.
     fn earlier_broker_holding_scope(&self) -> Option<String> {
-        let legacy = legacy_endpoint(self);
-        if self.uses_shared_tmp()
-            || !fs::symlink_metadata(&legacy).is_ok_and(|meta| {
+        let legacy = self.earlier_endpoints().into_iter().find(|path| {
+            fs::symlink_metadata(path).is_ok_and(|meta| {
                 meta.file_type().is_socket() && meta.uid() == rustix::process::geteuid().as_raw()
             })
-        {
-            return None;
-        }
+        })?;
         let lock = self.scope_root.join("control.lock");
         let file = fs::OpenOptions::new()
             .read(true)
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
             .open(&lock)
             .ok()?;
+        // Only a lease that is held names a live broker: a stale pid in the
+        // file must never turn into advice to kill some unrelated process.
         let held =
             rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared).is_err();
         if !held {
@@ -161,6 +160,20 @@ impl BrokerOptions {
             "an earlier marsh-mcp broker (pid {pid}, listening at {}) still holds this scope and predates this build, which cannot stop it. Run `kill {pid}` (sandboxes loaded through it lose their MCP connection), then run this command again",
             legacy.display()
         ))
+    }
+
+    /// Where an earlier build listened for this scope, other than where this
+    /// build does: the `/tmp` directory keyed on the scope root as it was
+    /// spelled to that build (it hashed the raw spelling), and on the canonical
+    /// one.
+    fn earlier_endpoints(&self) -> Vec<PathBuf> {
+        let mut paths = vec![
+            legacy_endpoint_for(&self.scope_root),
+            legacy_endpoint_for(&self.canonical_scope_root()),
+        ];
+        paths.dedup();
+        paths.retain(|path| *path != self.endpoint());
+        paths
     }
 
     fn canonical_scope_root(&self) -> PathBuf {
@@ -367,10 +380,7 @@ pub async fn broker_start(options: BrokerOptions) -> Result<(), String> {
         return Err(message);
     }
     if options.uses_shared_tmp() {
-        eprintln!(
-            "marsh-mcp: note: this scope root is outside a marsh-mcp-scopes directory or too deep for a private socket path, so the broker listens under /tmp, where another local user can block it by creating {} first",
-            endpoint_parent.display()
-        );
+        eprintln!("{}", shared_tmp_note(endpoint_parent));
     }
     let current = std::env::current_exe()
         .map_err(|error| format!("cannot locate marsh-mcp executable: {error}"))?;
@@ -995,13 +1005,30 @@ const MAX_SOCKET_PATH_BYTES: usize = 100;
 
 /// The earlier endpoint: a directory under `/tmp` named for the user and scope.
 fn legacy_endpoint(options: &BrokerOptions) -> PathBuf {
+    legacy_endpoint_for(&options.canonical_scope_root())
+}
+
+/// The `/tmp` endpoint for `scope_root` spelled as given: the key is a hash of
+/// those bytes, which is what the earlier build computed from the raw spelling.
+fn legacy_endpoint_for(scope_root: &Path) -> PathBuf {
+    let mut digest = Sha256::new();
+    digest.update(scope_root.as_os_str().as_encoded_bytes());
+    let key = marsh_contracts::process::hex(&digest.finalize());
     PathBuf::from("/tmp")
         .join(format!(
             "marsh-mcp-{}-{}",
             rustix::process::geteuid().as_raw(),
-            &options.endpoint_key()[..16]
+            &key[..16]
         ))
         .join("broker.sock")
+}
+
+/// What `broker-start` tells the user when the broker must listen in `/tmp`.
+fn shared_tmp_note(directory: &Path) -> String {
+    format!(
+        "marsh-mcp: note: this scope root is outside a marsh-mcp-scopes directory or too deep for a private socket path, so the broker listens under /tmp, where another local user can block it by creating {} first",
+        directory.display()
+    )
 }
 
 fn prepare_private_root(path: &Path) -> Result<(), String> {
@@ -1275,47 +1302,143 @@ mod tests {
         );
     }
 
+    fn generated_scope(root: &Path, hash: &str) -> PathBuf {
+        let scope = root
+            .join("Library/Application Support/marsh-mcp-scopes")
+            .join(hash);
+        fs::create_dir_all(&scope).unwrap();
+        for directory in [scope.parent().unwrap(), &scope] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        scope
+    }
+
+    /// The scope lease an earlier broker held: its pid in `control.lock`, and
+    /// the file locked (`held` false leaves a stale pid in an unlocked file).
+    fn lease(scope: &Path, pid: u32, held: bool) -> fs::File {
+        let lock = scope.join("control.lock");
+        fs::write(&lock, format!("{pid}\n")).unwrap();
+        let file = fs::File::open(&lock).unwrap();
+        if held {
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        }
+        file
+    }
+
+    /// A socket where an earlier build listened (a directory under `/tmp`).
+    fn earlier_socket(path: &Path) -> (RemoveOnDrop, std::os::unix::net::UnixListener) {
+        let directory = path.parent().unwrap().to_path_buf();
+        let cleanup = RemoveOnDrop(directory.clone());
+        prepare_private_root(&directory).unwrap();
+        (
+            cleanup,
+            std::os::unix::net::UnixListener::bind(path).unwrap(),
+        )
+    }
+
     #[test]
     fn an_earlier_builds_broker_holding_the_scope_is_named_with_a_command_that_stops_it() {
         let root = short_root();
-        let scope = root
-            .path()
-            .join("Library/Application Support/marsh-mcp-scopes/bbbbbbbbbbbbbbbb");
-        fs::create_dir_all(&scope).unwrap();
+        let scope = generated_scope(root.path(), "bbbbbbbbbbbbbbbb");
         let options = options_for(scope.clone(), root.path());
-        assert_eq!(
-            options.earlier_broker_holding_scope(),
-            None,
-            "nothing is running"
-        );
+        assert_eq!(options.earlier_broker_holding_scope(), None, "nothing runs");
 
-        // What the earlier build left: a socket under /tmp and the held lease
-        // with its pid.
-        let legacy_dir = shared_tmp_dir(&options);
-        let _cleanup = RemoveOnDrop(legacy_dir.clone());
-        prepare_private_root(&legacy_dir).unwrap();
-        let _socket =
-            std::os::unix::net::UnixListener::bind(legacy_dir.join("broker.sock")).unwrap();
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(scope.join("control.lock"))
-            .unwrap();
-        assert_eq!(
-            options.earlier_broker_holding_scope(),
-            None,
-            "lease not held"
-        );
-        fs::write(scope.join("control.lock"), "4242\n").unwrap();
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
-
+        let legacy = legacy_endpoint(&options);
+        let (_cleanup, _socket) = earlier_socket(&legacy);
+        let _lease = lease(&scope, 4242, true);
         let message = options.earlier_broker_holding_scope().expect("named");
         assert!(
             message.contains("pid 4242") && message.contains("`kill 4242`"),
             "{message}"
         );
-        assert!(message.contains(legacy_dir.to_str().unwrap()), "{message}");
+        assert!(message.contains(legacy.to_str().unwrap()), "{message}");
+    }
+
+    #[test]
+    fn a_stale_pid_never_becomes_advice_to_kill_something() {
+        let root = short_root();
+        let scope = generated_scope(root.path(), "cccccccccccccccc");
+        let options = options_for(scope.clone(), root.path());
+        let (_cleanup, _socket) = earlier_socket(&legacy_endpoint(&options));
+        // The pid is in the file, the socket is there, but nothing holds the lease.
+        let _unlocked = lease(&scope, 4242, false);
+        assert_eq!(options.earlier_broker_holding_scope(), None);
+    }
+
+    #[test]
+    fn only_a_socket_counts_as_an_earlier_broker() {
+        let root = short_root();
+        let scope = generated_scope(root.path(), "dddddddddddddddd");
+        let options = options_for(scope.clone(), root.path());
+        let legacy = legacy_endpoint(&options);
+        let _cleanup = RemoveOnDrop(legacy.parent().unwrap().to_path_buf());
+        prepare_private_root(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"not a socket").unwrap();
+        let _lease = lease(&scope, 4242, true);
+        assert_eq!(options.earlier_broker_holding_scope(), None);
+    }
+
+    #[test]
+    fn the_endpoint_this_build_uses_is_never_an_earlier_one() {
+        // An explicit scope root listens at its `/tmp` endpoint under this build
+        // too: a broker there is the current one, not an earlier build's.
+        let root = short_root();
+        let scope = root.path().join("explicit-root");
+        fs::create_dir_all(&scope).unwrap();
+        let options = options_for(scope.clone(), root.path());
+        assert!(options.uses_shared_tmp());
+        let (_cleanup, _socket) = earlier_socket(&options.endpoint());
+        let _lease = lease(&scope, 4242, true);
+        assert_eq!(options.earlier_broker_holding_scope(), None);
+    }
+
+    /// The earlier build keyed its `/tmp` directory on the scope root as it was
+    /// spelled (no canonicalizing): `..` and a symlinked prefix give another key.
+    #[test]
+    fn an_earlier_broker_is_found_under_the_raw_spelling_of_the_scope_root() {
+        let root = short_root();
+        let scope = generated_scope(root.path(), "eeeeeeeeeeeeeeee");
+        let spelled = scope.join("..").join("eeeeeeeeeeeeeeee");
+        let options = options_for(spelled.clone(), root.path());
+        // The earlier algorithm, written out.
+        let key =
+            marsh_contracts::process::hex(&Sha256::digest(spelled.as_os_str().as_encoded_bytes()));
+        let old = PathBuf::from("/tmp")
+            .join(format!(
+                "marsh-mcp-{}-{}",
+                rustix::process::geteuid().as_raw(),
+                &key[..16]
+            ))
+            .join("broker.sock");
+        assert_ne!(
+            old,
+            legacy_endpoint(&options),
+            "a spelling that changes the key"
+        );
+        let (_cleanup, _socket) = earlier_socket(&old);
+        let _lease = lease(&scope, 4242, true);
+        let message = options.earlier_broker_holding_scope().expect("named");
+        assert!(message.contains("`kill 4242`"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn broker_start_stops_for_an_earlier_broker_instead_of_starting_another() {
+        let root = short_root();
+        let scope = generated_scope(root.path(), "ffffffffffffffff");
+        let options = options_for(scope.clone(), root.path());
+        let (_cleanup, _socket) = earlier_socket(&legacy_endpoint(&options));
+        let _lease = lease(&scope, 4242, true);
+        let error = broker_start(options).await.unwrap_err();
+        assert!(error.contains("`kill 4242`"), "{error}");
+    }
+
+    #[test]
+    fn the_shared_tmp_note_names_the_directory_anyone_could_block() {
+        let note = shared_tmp_note(Path::new("/tmp/marsh-mcp-501-abc"));
+        assert!(
+            note.contains("/tmp/marsh-mcp-501-abc") && note.contains("another local user"),
+            "{note}"
+        );
     }
 
     #[tokio::test]

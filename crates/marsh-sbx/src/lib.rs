@@ -42,6 +42,12 @@ pub mod skills;
 mod source_chain;
 mod source_permissions;
 mod stock_inventory;
+#[cfg(all(feature = "test-support", marsh_release_packaging))]
+compile_error!(
+    "the test-support feature (the stuck-engine harness and its helpers) is for test builds only; release packaging (MARSH_RELEASE_PACKAGING=1) refuses it"
+);
+#[cfg(any(test, feature = "test-support"))]
+pub mod stuck_engine;
 mod vm_ownership;
 pub use ephemeral_home::{EphemeralHomeLease, EphemeralHomeToken};
 pub use shell_template_reference::ShellTemplateReference;

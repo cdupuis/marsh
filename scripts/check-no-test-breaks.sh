@@ -4,7 +4,10 @@
 #      records it when the feature is enabled for that crate or for a marsh-*
 #      crate it depends on (crates/marsh-provenance), whether or not any
 #      test-only code is linked in; marsh-contracts also keeps it, and
-#   2. the environment name MARSH_TEST_BREAK (defense in depth).
+#   2. the environment name MARSH_TEST_BREAK (defense in depth), and
+#   3. the test-support harness's marker `marsh-feature:test-support`
+#      (crates/marsh-sbx/src/stuck_engine.rs), kept by any binary that links the
+#      harness however the feature or cfg got switched on.
 # A release artifact has neither (docs/design/test-breaks.md). This is the
 # backstop to the build's provenance manifest (scripts/provenance.py), which
 # does not depend on the binary's contents.
@@ -25,6 +28,9 @@ for file in "$@"; do
   text=$(strings -a "$file")
   if printf '%s\n' "$text" | grep -q "marsh-feature:test-breaks"; then
     echo "check-no-test-breaks: $file was built with test-breaks (the build recorded its provenance in the binary); refusing to package it" >&2
+    status=1
+  elif printf '%s\n' "$text" | grep -q "marsh-feature:test-support"; then
+    echo "check-no-test-breaks: $file carries the test-support harness (marsh-feature:test-support); refusing to package it" >&2
     status=1
   elif printf '%s\n' "$text" | grep -q MARSH_TEST_BREAK; then
     echo "check-no-test-breaks: $file contains MARSH_TEST_BREAK; refusing to package it" >&2

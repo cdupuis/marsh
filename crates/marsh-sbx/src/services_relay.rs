@@ -452,6 +452,15 @@ pub struct ServicesRelays {
     /// Projects whose relay was refused during its handshake because of what
     /// the VM sent (no entry exists for them): quarantined all the same.
     refused: Mutex<BTreeMap<PathBuf, String>>,
+    /// Engine generations whose worker was still inside an admitted `sbx`
+    /// call when they were detached (a failed start, a replaced or closed
+    /// entry): owned here until the worker is gone, whether or not a relay was
+    /// ever registered for them, so a stop can wait for every one.
+    stuck: Mutex<Vec<(PathBuf, Arc<EngineHandle>)>>,
+    /// How long a detach waits for a worker inside a call.
+    detach_wait: Duration,
+    /// Extra time past the engine's own ready timeout before a start is given up.
+    ready_grace: Duration,
 }
 
 impl ServicesRelays {
@@ -478,6 +487,9 @@ impl ServicesRelays {
             locks: Mutex::new(BTreeMap::new()),
             unrecovered: Mutex::new(BTreeSet::new()),
             refused: Mutex::new(BTreeMap::new()),
+            stuck: Mutex::new(Vec::new()),
+            detach_wait: crate::services_engine::DETACH_WAIT,
+            ready_grace: Duration::from_secs(30),
         }
     }
 
@@ -687,13 +699,31 @@ impl ServicesRelays {
         let settings = self.settings.clone()?.for_project(grants, root);
         let artifacts =
             EngineArtifacts::from_guest_dir(directory).map_err(|error| error.to_string())?;
-        let handle = Arc::new(engine.start(vm.clone(), artifacts, settings.clone()));
-        let generation = handle
-            .wait_ready(settings.ready_timeout + Duration::from_secs(30))
-            .inspect_err(|_| handle.detach())?;
+        let (handle, generation) = self.start_ready(root, &engine, &vm, artifacts, &settings)?;
         let entry = self.bind(root, &engine, &vm, handle, generation, None)?;
         self.unrecovered().remove(root);
         Ok(entry)
+    }
+
+    /// Starts an engine generation and waits for it to be ready. One that is
+    /// not ready in time is handed to the registry (`detach_owned`) before the
+    /// error returns, so a worker still inside an admitted call stays known to
+    /// every later `close`.
+    fn start_ready(
+        &self,
+        root: &Path,
+        engine: &ServicesEngine,
+        vm: &ServicesVmRef,
+        artifacts: EngineArtifacts,
+        settings: &EngineSettings,
+    ) -> Result<(Arc<EngineHandle>, Generation), String> {
+        let handle = Arc::new(engine.start(vm.clone(), artifacts, settings.clone()));
+        let generation = handle
+            .wait_ready(settings.ready_timeout + self.ready_grace)
+            .inspect_err(|_| {
+                self.detach_owned(root, &handle);
+            })?;
+        Ok((handle, generation))
     }
 
     /// Starts a relay for a ready generation and records it.
@@ -715,7 +745,7 @@ impl ServicesRelays {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(root.to_owned(), reason.clone());
                 }
-                handle.detach();
+                self.detach_owned(root, &handle);
                 return Err(error.to_string());
             }
         };
@@ -757,17 +787,74 @@ impl ServicesRelays {
         Ok(entry)
     }
 
-    fn close_entry(&self, root: &Path, reason: &str) {
+    /// How long a detach waits for a worker inside a call (tests shorten it).
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_detach_wait(mut self, wait: Duration) -> Self {
+        self.detach_wait = wait;
+        self
+    }
+
+    /// Extra time past the ready timeout before a start is given up (tests
+    /// shorten it).
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_ready_grace(mut self, grace: Duration) -> Self {
+        self.ready_grace = grace;
+        self
+    }
+
+    fn stuck(&self) -> std::sync::MutexGuard<'_, Vec<(PathBuf, Arc<EngineHandle>)>> {
+        self.stuck
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Detach `handle`; one whose worker is still inside an admitted call is
+    /// kept in [`Self::stuck`] for `root`.
+    pub(crate) fn detach_owned(&self, root: &Path, handle: &Arc<EngineHandle>) -> bool {
+        let gone = handle.detach_within(self.detach_wait);
+        if !gone {
+            self.stuck().push((root.to_owned(), Arc::clone(handle)));
+        }
+        gone
+    }
+
+    /// Wait again for the generations of `root` that were stuck: whether all
+    /// are gone now.
+    fn settle_stuck(&self, root: &Path) -> bool {
+        let held: Vec<_> = {
+            let mut stuck = self.stuck();
+            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *stuck)
+                .into_iter()
+                .partition(|(r, _)| r == root);
+            *stuck = rest;
+            mine
+        };
+        held.into_iter().fold(true, |all, (_, handle)| {
+            self.detach_owned(root, &handle) && all
+        })
+    }
+
+    /// Whether every engine worker of `root` is gone. The entry is always
+    /// removed, so a replacement never overwrites one still running: an
+    /// unquiesced generation moves to [`Self::stuck`] and the next close waits
+    /// for it again.
+    fn close_entry(&self, root: &Path, reason: &str) -> bool {
+        let mut quiesced = self.settle_stuck(root);
         let entry = self.entries().remove(root);
         if let Some(entry) = entry {
             entry.relay.close(reason);
-            entry.handle.detach();
+            quiesced = self.detach_owned(root, &entry.handle) && quiesced;
         }
+        quiesced
     }
 
     /// Closes the project's relay and every channel on it (the VM is being
-    /// stopped or removed, or services were turned off).
-    pub fn close(&self, root: &Path, reason: &str) {
+    /// stopped or removed, or services were turned off). Returns whether the
+    /// engine worker is gone; `false` means an admitted `sbx` call may still
+    /// land, so the VM must not be stopped yet.
+    pub fn close(&self, root: &Path, reason: &str) -> bool {
         let lock = self.lock_for(root);
         let _operation = lock
             .lock()
@@ -776,14 +863,14 @@ impl ServicesRelays {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(root);
-        self.close_entry(root, reason);
+        self.close_entry(root, reason)
     }
 
     /// Closes every relay (the daemon is going away).
     pub fn close_all(&self, reason: &str) {
         let roots: Vec<PathBuf> = self.entries().keys().cloned().collect();
         for root in roots {
-            self.close(&root, reason);
+            let _ = self.close(&root, reason);
         }
     }
 
@@ -852,6 +939,101 @@ impl ServicesRelays {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stuck_engine::start_held;
+
+    /// A start that is not ready in time while its worker is inside an admitted
+    /// call (the failed-establish path of `establish`): `close` must refuse to
+    /// report the VM stoppable until that worker is gone.
+    #[test]
+    fn a_start_that_times_out_inside_a_call_is_still_known_to_close() {
+        let held = Arc::new(crate::stuck_engine::HeldCopy::default());
+        let stock = Arc::new(StockSbx::new("sbx", held.clone()));
+        let relays = ServicesRelays::new(stock, None, DaemonBudget::new(1), None)
+            .with_detach_wait(Duration::from_millis(50))
+            .with_ready_grace(Duration::ZERO);
+        let engine = ServicesEngine::new(PathBuf::from("sbx"), held.clone());
+        let mut settings = EngineSettings::default();
+        settings.ready_timeout = Duration::from_millis(200);
+        let root = PathBuf::from("/Users/alice/project");
+        let vm = crate::stuck_engine::test_vm();
+
+        let started = relays.start_ready(
+            &root,
+            &engine,
+            &vm,
+            crate::stuck_engine::test_artifacts(),
+            &settings,
+        );
+        assert!(started.is_err());
+        held.wait_held();
+        assert!(
+            !relays.close(&root, "stop"),
+            "the worker is still inside its call"
+        );
+        held.release();
+        assert!(relays.close(&root, "stop"));
+    }
+
+    /// The other failure path: a ready generation whose relay cannot start
+    /// (`bind`), while its worker is inside an admitted call, is also kept.
+    #[test]
+    fn a_relay_that_fails_to_start_leaves_its_busy_generation_known_to_close() {
+        let (held, handle) = start_held(false);
+        let stock = Arc::new(StockSbx::new("sbx", held.clone()));
+        let relays = ServicesRelays::new(stock, None, DaemonBudget::new(1), None)
+            .with_detach_wait(Duration::from_millis(50));
+        let engine = ServicesEngine::new(PathBuf::from("sbx"), held.clone());
+        let root = PathBuf::from("/Users/alice/project");
+        let generation = Generation {
+            boot_id: "boot-1".into(),
+            engine_id: "engine-1".into(),
+        };
+
+        let bound = relays.bind(
+            &root,
+            &engine,
+            &crate::stuck_engine::test_vm(),
+            handle,
+            generation,
+            None,
+        );
+        assert!(bound.is_err());
+        assert!(
+            !relays.close(&root, "stop"),
+            "the worker is still inside its call"
+        );
+        held.release();
+        assert!(relays.close(&root, "stop"));
+    }
+
+    /// Review of DA4-05: a generation whose worker is still inside an admitted
+    /// call is tracked whether or not a relay was ever registered for it (a
+    /// failed start, a replaced entry), so a stop waits for every one of them,
+    /// and no later generation overwrites it.
+    #[test]
+    fn close_waits_for_every_generation_still_inside_a_call() {
+        let (first, failed_start) = start_held(false);
+        let stock = Arc::new(StockSbx::new("sbx", first.clone()));
+        let mut relays = ServicesRelays::new(stock, None, DaemonBudget::new(1), None);
+        relays.detach_wait = Duration::from_millis(50);
+        let root = PathBuf::from("/Users/alice/project");
+        let (second, replaced) = start_held(false);
+
+        // A start that failed (no relay entry) while a call was admitted.
+        assert!(!relays.detach_owned(&root, &failed_start));
+        // Closing the project finds no entry and must still not report it gone.
+        assert!(!relays.close(&root, "stop"));
+        // A second generation detached for a replacement is tracked alongside.
+        assert!(!relays.detach_owned(&root, &replaced));
+        assert_eq!(relays.stuck().len(), 2);
+        assert!(!relays.close(&root, "stop"));
+
+        first.release();
+        assert!(!relays.close(&root, "stop"), "the second is still running");
+        second.release();
+        assert!(relays.close(&root, "stop"));
+        assert!(relays.stuck().is_empty());
+    }
 
     /// Eight MiB with no newline, then an escape-laden line: the tail keeps one
     /// bounded, plain line each and nothing grows.

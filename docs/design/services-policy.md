@@ -360,6 +360,18 @@ witness and nothing else; `e3/witness.sh` runs the in-process rows
   `outputs` query check does not see it. Refusing it would need parsing the
   h2c/gRPC `Control.Solve` request, which D21 moves out of E3; the egress is
   limited to what the engine's network policy lets the project's VM reach.
+- **A build fetches from the engine's own network namespace** (RR3 DA1-03). The
+  `Dockerfile` and context are streamed unread, so `FROM`, `# syntax=`, `cachefrom`
+  and `ADD <url>` are fetched by dockerd/BuildKit outside the Internet gate and the
+  registry allowlist (only a pull, a create and, on the REST `/build` route alone, a
+  `BUILDKIT_SYNTAX` build argument are checked; the default `docker build` and
+  `buildx` go over `/grpc` and `/session` and get no frontend check). Every scope publishes on `127.0.0.1` of that namespace (and a port published on
+  another loopback address, `127.0.0.2`, is reachable the same way), so a
+  build can GET another scope's published HTTP service. Loopback is not blocked: the
+  agent's relay dials `127.0.0.1` there for `tcp` channels, so a plain `OUTPUT` rule
+  would cut the ports too. Closing it needs a per-scope builder or a cgroup-scoped
+  `OUTPUT` rule for the build processes. The classic builder (`version=1`) is still
+  admitted and pulls `FROM` in dockerd itself.
 - The agent's argv carries break modes only in `test-breaks` builds (DECISIONS 22).
 - Images are shared by every scope of a project: any scope may run an image
   another created. Only the tag names are owned, and only on the REST routes

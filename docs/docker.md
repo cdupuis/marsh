@@ -598,6 +598,30 @@ builds:
   from containers, while a fetch or push BuildKit makes itself is made by
   Docker, which is also why pulls work. Do not treat Internet off as a promise
   that a build cannot reach out.
+- **A build fetches from the Docker VM's own network, and so can reach what
+  other workspaces of the project publish.** `ADD http://127.0.0.1:PORT/...`
+  (and a git or HTTP source) is fetched by Docker inside the VM, where every
+  workspace's published ports are on the one `127.0.0.1` (and a port published on
+  another loopback address, such as `127.0.0.2`, is reachable from a build the same
+  way, whether or not marsh forwards it into jobs). A lane's build can
+  therefore read, with a GET, an HTTP service another lane or the base
+  workspace published, and the answer becomes a layer of the lane's image. It
+  is the same user and the same project, and a lane starts as a copy of the
+  base, but it breaks the separation that two lanes' containers otherwise
+  have. marsh does not block it: the services agent that forwards your ports
+  dials `127.0.0.1` in that same network, so a rule against loopback would cut
+  the ports too.
+- **The registry allowlist does not cover what a build pulls.** The allowlist
+  (Docker Hub and `ghcr.io` while Internet is off) is checked for `docker
+  pull`, for the image of a container, and for a `BUILDKIT_SYNTAX` build
+  argument, but that last check applies only to a build sent over Docker's REST
+  API. A normal `docker build` or `docker buildx build` talks to BuildKit over its
+  own stream, which the filter does not read, so it gets no such check. The
+  allowlist is not checked for `FROM`, for a `# syntax=` line, for
+  `--cache-from`, or for anything else inside the build context: the filter
+  does not read the context, and a build with the older builder
+  (`DOCKER_BUILDKIT=0`) pulls `FROM` images itself. A build can pull from any
+  registry the Docker VM can reach.
 - **The build cache is shared across lanes of one project.** A cache written by
   one lane is readable by another lane of the same project. This is the same
   user and the same project, and lanes are copies of one tree, so marsh accepts

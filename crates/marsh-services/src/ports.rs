@@ -6,7 +6,7 @@
 //! engine events (start, die, stop, ...), coalescing bursts, and re-lists
 //! after every reconnect, so it never depends on a poll interval.
 
-use crate::engine_api::{Engine, SCOPE_LABEL};
+use crate::engine_api::{ContainerSummary, Engine, SCOPE_LABEL};
 use crate::frame::{AgentFrame, ScopePorts};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
@@ -23,6 +23,17 @@ fn snapshot(
     admitted: &dyn Fn(&str, &str) -> bool,
 ) -> Option<BTreeMap<String, BTreeSet<u16>>> {
     let containers = engine.list_containers(false).ok()?;
+    Some(scope_ports(&containers, admitted))
+}
+
+/// The ports each scope publishes on the address the relay dials. A binding
+/// on another address is not the relay's to reach, so it never counts: the
+/// same port on `127.0.0.2` in one scope and `127.0.0.1` in another is not
+/// one port listed for two workspaces.
+fn scope_ports(
+    containers: &[ContainerSummary],
+    admitted: &dyn Fn(&str, &str) -> bool,
+) -> BTreeMap<String, BTreeSet<u16>> {
     let mut map: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
     for container in containers.iter().filter(|c| c.state == "running") {
         let Some(scope) = container.label(SCOPE_LABEL) else {
@@ -33,14 +44,14 @@ fn snapshot(
             continue;
         }
         for port in container.ports.iter().flatten() {
-            if port.public_port != 0 && port.kind == "tcp" {
+            if port.is_relay_tcp() {
                 map.entry(scope.to_owned())
                     .or_default()
                     .insert(port.public_port);
             }
         }
     }
-    Some(map)
+    map
 }
 
 fn frame_for(map: &BTreeMap<String, BTreeSet<u16>>) -> AgentFrame {
@@ -121,4 +132,41 @@ pub fn spawn_watcher(
             std::thread::sleep(Duration::from_millis(500));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine_api::ContainerSummary;
+
+    fn running(id: &str, scope: &str, ports: &str) -> ContainerSummary {
+        serde_json::from_str(&format!(
+            r#"{{"Id":"{id}","State":"running","Labels":{{"dev.marsh.scope":"{scope}"}},"Ports":{ports}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn two_scopes_on_one_port_at_different_loopback_addresses_do_not_collide() {
+        // The base publishes 127.0.0.1:8080; a lane publishes 127.0.0.2:8080 and
+        // [::1]:8080. Both are valid for dockerd, and the relay dials only
+        // 127.0.0.1, so only the base owns the port: no scope pair shares one.
+        let containers = [
+            running(
+                "a",
+                "base",
+                r#"[{"IP":"127.0.0.1","PrivatePort":80,"PublicPort":8080,"Type":"tcp"}]"#,
+            ),
+            running(
+                "b",
+                "lane",
+                r#"[{"IP":"127.0.0.2","PrivatePort":80,"PublicPort":8080,"Type":"tcp"},{"IP":"::1","PrivatePort":80,"PublicPort":8080,"Type":"tcp"}]"#,
+            ),
+        ];
+        let map = scope_ports(&containers, &|_, _| true);
+        assert_eq!(map.get("base"), Some(&BTreeSet::from([8080])));
+        assert_eq!(map.get("lane"), None);
+        let seen: usize = map.values().map(BTreeSet::len).sum();
+        assert_eq!(seen, 1, "{map:?}");
+    }
 }

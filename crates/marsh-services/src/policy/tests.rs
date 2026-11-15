@@ -511,14 +511,19 @@ fn a_port_key_without_a_protocol_is_tcp_and_still_loopback() {
 
 #[test]
 fn published_ports_are_forced_to_loopback() {
-    let v = create(&json!({"PortBindings": {"80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}, {"HostIp": "", "HostPort": "8081"}, {"HostIp": "::1", "HostPort": "8082"}, {"HostIp": "10.1.2.3", "HostPort": ""}]}})).unwrap();
+    let v = create(&json!({"PortBindings": {"80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}, {"HostIp": "", "HostPort": "8081"}, {"HostIp": "::1", "HostPort": "8082"}, {"HostIp": "10.1.2.3", "HostPort": ""}, {"HostIp": "127.0.0.2", "HostPort": "8083"}]}})).unwrap();
     let ips: Vec<&str> = v["HostConfig"]["PortBindings"]["80/tcp"]
         .as_array()
         .unwrap()
         .iter()
         .map(|b| b["HostIp"].as_str().unwrap())
         .collect();
-    assert_eq!(ips, ["127.0.0.1", "127.0.0.1", "::1", "127.0.0.1"]);
+    // Loopback aliases are kept: the relay and the port tracking only
+    // ever use the `127.0.0.1` ones (see `ports.rs` and `relay.rs`).
+    assert_eq!(
+        ips,
+        ["127.0.0.1", "127.0.0.1", "::1", "127.0.0.1", "127.0.0.2"]
+    );
 }
 
 #[test]

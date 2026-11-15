@@ -187,6 +187,12 @@ and disappears within about a second of it stopping.
 - **Not on the network.** Docker publishes ports on loopback only. A request to
   publish on another address, such as `-p 0.0.0.0:5432:5432`, is rewritten to
   loopback instead of being refused.
+- **Only `127.0.0.1` is forwarded.** Loopback is a whole range, and a container
+  may publish on another loopback address (`-p 127.0.0.2:8080:80`) or on
+  `::1`. Docker accepts that, and two workspaces of a project can each hold
+  port 8080 on a different address. marsh forwards only what is published on
+  `127.0.0.1`: a port published on any other address stays inside the Docker
+  VM and does not appear in jobs or the shell.
 
 `marsh docker status` tells you whether a project's Docker VM is up:
 

@@ -264,7 +264,7 @@ impl LedgerPorts {
                     && c.ports
                         .iter()
                         .flatten()
-                        .any(|p| p.kind == "tcp" && p.public_port == port)
+                        .any(|p| p.is_relay_tcp() && p.public_port == port)
             })
         })
     }
@@ -767,7 +767,7 @@ fn establish(
             if !shared.port_policy.allows(authority, port) {
                 return Err("marsh: that port is not published for this workspace".into());
             }
-            let address = SocketAddr::from(([127, 0, 0, 1], port));
+            let address = SocketAddr::from((crate::engine_api::RELAY_DIAL_IP, port));
             TcpStream::connect_timeout(&address, DIAL_TIMEOUT)
                 .map(Target::Tcp)
                 .map_err(|error| format!("could not connect: {error}"))
@@ -1810,6 +1810,36 @@ mod tests {
                 inspect("running", Some("ws"), "null"),
                 15432,
                 false,
+            ),
+            (
+                "a loopback alias the relay does not dial",
+                inspect(
+                    "running",
+                    Some("ws"),
+                    r#"{"80/tcp":[{"HostIp":"127.0.0.2","HostPort":"15432"}]}"#,
+                ),
+                15432,
+                false,
+            ),
+            (
+                "an IPv6 loopback binding the relay does not dial",
+                inspect(
+                    "running",
+                    Some("ws"),
+                    r#"{"80/tcp":[{"HostIp":"::1","HostPort":"15432"}]}"#,
+                ),
+                15432,
+                false,
+            ),
+            (
+                "an alias next to the dialled address",
+                inspect(
+                    "running",
+                    Some("ws"),
+                    r#"{"80/tcp":[{"HostIp":"127.0.0.2","HostPort":"15432"},{"HostIp":"127.0.0.1","HostPort":"15433"}]}"#,
+                ),
+                15433,
+                true,
             ),
         ] {
             assert_eq!(may_dial(&detail, "ws", port), want, "{name}");

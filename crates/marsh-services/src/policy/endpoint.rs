@@ -2848,7 +2848,7 @@ fn record(
         }
         Post::ExecCreate { container } if created => {
             if let Some(id) = id_of(body) {
-                svc.ledger.add_exec(&id, container).map_err(led)?;
+                svc.ledger.add_exec(&id, container);
             }
         }
         Post::NetworkCreate { name } if created => {

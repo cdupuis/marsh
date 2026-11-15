@@ -109,6 +109,9 @@ pub struct ProtectedId {
     pub ino: u64,
 }
 
+/// Execs remembered per container; a new one past this forgets the oldest.
+pub const MAX_EXECS_PER_CONTAINER: usize = 256;
+
 /// At most this many identities are kept per project root. The earliest are the
 /// most trustworthy, so a full list stops growing rather than evicting.
 pub const MAX_PROTECTED_IDS: usize = 64;
@@ -140,7 +143,13 @@ struct State {
     /// Older ledgers have none.
     #[serde(default)]
     tags: BTreeMap<String, TagRec>,
-    execs: BTreeMap<String, String>,
+    /// Exec ID -> (sequence, container). Not persisted: an exec outlives
+    /// neither its container nor the agent's connections, and a ledger that
+    /// kept every `docker exec` would grow and slow every write without bound.
+    #[serde(skip)]
+    execs: BTreeMap<String, (u64, String)>,
+    #[serde(skip)]
+    exec_seq: u64,
     pins: BTreeMap<String, PinRec>,
     scope_networks: BTreeMap<String, String>,
     /// Per project root (as the authority gave it): the `(dev, ino)` of every
@@ -499,7 +508,7 @@ impl Ledger {
             let Some(rec) = s.containers.remove(id) else {
                 return (Vec::new(), false);
             };
-            s.execs.retain(|_, c| c != id);
+            s.execs.retain(|_, (_, c)| c != id);
             (release_unreferenced(s, &rec.pins), true)
         })
     }
@@ -763,11 +772,26 @@ impl Ledger {
         })
     }
 
-    pub fn add_exec(&self, exec: &str, container: &str) -> LedgerResult<()> {
-        self.mutate(|s| {
-            s.execs.insert(exec.to_string(), container.to_string());
-            ((), true)
-        })
+    /// Remember that `exec` belongs to `container`, in memory only and at most
+    /// [`MAX_EXECS_PER_CONTAINER`] per container.
+    pub fn add_exec(&self, exec: &str, container: &str) {
+        self.with(|s| {
+            s.exec_seq += 1;
+            s.execs
+                .insert(exec.to_string(), (s.exec_seq, container.to_string()));
+            let mine = s.execs.values().filter(|(_, c)| c == container).count();
+            if mine > MAX_EXECS_PER_CONTAINER {
+                let oldest = s
+                    .execs
+                    .iter()
+                    .filter(|(_, (_, c))| c == container)
+                    .min_by_key(|(_, (seq, _))| *seq)
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = oldest {
+                    s.execs.remove(&id);
+                }
+            }
+        });
     }
 
     #[must_use]
@@ -776,7 +800,7 @@ impl Ledger {
             match s
                 .execs
                 .get(exec)
-                .and_then(|c| s.containers.get(c).map(|r| (c, r)))
+                .and_then(|(_, c)| s.containers.get(c).map(|r| (c, r)))
             {
                 Some((c, r)) if r.scope == scope => Lookup::Own(c.clone()),
                 _ => Lookup::Missing,
@@ -843,7 +867,7 @@ impl Ledger {
                     freed.extend(release_unreferenced(s, &rec.pins));
                     changed = true;
                 }
-                s.execs.retain(|_, c| *c != id);
+                s.execs.retain(|_, (_, c)| *c != id);
             }
             let (n0, v0) = (s.networks.len(), s.volumes.len());
             s.networks
@@ -934,6 +958,8 @@ fn fresh(path: &Path, held: &State) -> std::io::Result<State> {
         )
     })?;
     state.missing.clone_from(&held.missing);
+    state.execs.clone_from(&held.execs);
+    state.exec_seq = held.exec_seq;
     state.seen = sig;
     Ok(state)
 }
@@ -1573,5 +1599,46 @@ mod tests {
             );
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// A job that runs `docker exec` forever does not grow the ledger: execs
+    /// are bounded per container, and never written to the file.
+    #[test]
+    fn execs_are_bounded_and_not_persisted() {
+        let dir = scratch("execs");
+        let path = dir.join("ledger.json");
+        let l = Ledger::open(&path).unwrap();
+        l.add_container("db", rec("base", "db")).unwrap();
+        l.add_container("web", rec("base", "web")).unwrap();
+        l.add_exec("web-exec", "web");
+        let before = std::fs::metadata(&path).unwrap().len();
+        for i in 0..(MAX_EXECS_PER_CONTAINER * 4) {
+            l.add_exec(&format!("exec-{i}"), "db");
+        }
+        l.add_container("late", rec("base", "late")).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&after).contains("exec-"));
+        assert!(
+            after.len() as u64 - before < 400,
+            "the file grew with execs"
+        );
+        let last = MAX_EXECS_PER_CONTAINER * 4 - 1;
+        assert_eq!(
+            l.exec_container("base", &format!("exec-{last}")),
+            Lookup::Own("db".into())
+        );
+        assert_eq!(l.exec_container("base", "exec-0"), Lookup::Missing);
+        let kept = (0..=last)
+            .filter(|i| l.exec_container("base", &format!("exec-{i}")) != Lookup::Missing)
+            .count();
+        assert_eq!(kept, MAX_EXECS_PER_CONTAINER);
+        // Another container's exec is not evicted by this one's churn, and is
+        // still scoped.
+        assert_eq!(
+            l.exec_container("base", "web-exec"),
+            Lookup::Own("web".into())
+        );
+        assert_eq!(l.exec_container("lane", "web-exec"), Lookup::Missing);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

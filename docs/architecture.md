@@ -172,7 +172,7 @@ are protected host inputs, not guest-home content.
 - New command: add a registry mapping to a native Kit v3 source or immutable
   reference ([command registry](design/command-registry.md)). marsh has no Kit
   schema of its own.
-- Shell behavior: change Brush through a small patch in
+- Shell behavior: change Brush and fold the change into the area patch in
   `docs/upstream/brush/` and add a Bash differential test.
 - Ownership, worker lifecycle, mounts, cancellation, or grants: update
   `docs/model/` (invariant, negative control, code-location table) and add a

@@ -13,6 +13,7 @@ use std::{
     },
 };
 
+mod confirm_durable;
 mod corpus;
 mod grants;
 mod kit_lifecycle;

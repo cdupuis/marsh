@@ -147,7 +147,17 @@ admitted earlier cannot publish its ownership after a later operation or fence,
 and an old delete cannot land after the name was given to another workspace
 (`a_delayed_delete_cannot_remove_a_volume_another_workspace_now_owns`,
 `a_volume_create_holds_the_name_from_admission_to_the_end_of_its_engine_call`).
-This was chosen over fencing at the start of every delete and re-checking the
+Both are made by the agent itself (`exchange`, one absolute `up_progress`
+deadline), not through the client's connection: a client that leaves does not
+cancel the engine call, ownership is recorded by its result, and a create the
+engine does not answer keeps the sender's reservation and fences the name like an
+unanswered delete
+(`a_volume_create_whose_client_disconnected_still_records_its_owner`,
+`a_hung_volume_create_is_bounded_and_fences_the_name`,
+`a_connection_takes_the_volume_lock_again_after_a_volume_create`). Container
+creates (including a named volume: the volume part runs inside admission under the
+same lock, the container create itself is streamed and not under it) and network
+creates are not agent-owned. This was chosen over fencing at the start of every delete and re-checking the
 fence after a create's engine call, because that would have to undo a volume the
 create may or may not have made; holding the lock needs no undo and fails closed
 (the cost is the queue below). The agent
@@ -177,8 +187,7 @@ the volume and the reply is passed on. The reply to a delete is the engine's
 (status line, headers, body; keep-alive when the client asked for it). Every
 engine call the agent makes itself ends at one absolute deadline, `up_progress` (30 s)
 after it started: each write attempt (in pieces of 16 KiB), the response head, every
-read of the body including chunk-size lines, trailers and the terminal chunk, and
-the acceptance of the end of the body
+read of the body including chunk-size lines, trailers and the terminal chunk
 (`a_drip_fed_response_head_obeys_the_whole_call_deadline`,
 `a_drip_fed_chunked_reply_obeys_the_whole_call_deadline`,
 `a_drip_fed_terminal_chunk_obeys_the_whole_call_deadline`,

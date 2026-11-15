@@ -1087,6 +1087,141 @@ fn a_slowly_read_request_obeys_the_whole_call_deadline() {
     drop(reader);
 }
 
+/// A volume create is made by the agent, not through the client's connection:
+/// the client leaving cannot end it early. Lane A's create is held at the
+/// engine and A disconnects; lane B's create of the name waits (it is not let
+/// in after the old 2 s disconnect poll), and when A's create lands its
+/// ownership is recorded, so B is refused and nothing is left without an owner.
+#[test]
+fn a_volume_create_whose_client_disconnected_still_records_its_owner() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("createdisc", false, engine.handler(), |_| {});
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    engine.hold_next_create.store(true, Ordering::SeqCst);
+    {
+        let mut c = UnixStream::connect(&sock_a).unwrap();
+        let body = r#"{"Name":"data"}"#;
+        write!(
+            c,
+            "POST /volumes/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        assert!(wait_for(Duration::from_secs(5), || !engine
+            .hold_next_create
+            .load(Ordering::SeqCst)));
+    } // A is gone, its create still at the engine
+    let create_b = {
+        let sock = sock_b.clone();
+        std::thread::spawn(move || call(&sock, "POST", "/volumes/create", DATA).0)
+    };
+    std::thread::sleep(Duration::from_millis(2600));
+    assert!(
+        !create_b.is_finished(),
+        "the name was released with the client"
+    );
+    assert!(!engine.store.lock().unwrap().contains_key("data"));
+    engine.create_release.store(true, Ordering::SeqCst);
+    assert_eq!(
+        create_b.join().unwrap(),
+        403,
+        "lane A's create was recorded first"
+    );
+    assert!(engine.store.lock().unwrap().contains_key("data"));
+    assert!(h.svc.ledger.has_volume("lane-a", "data"));
+    assert!(!h.svc.ledger.has_volume("lane-b", "data"));
+}
+
+/// A create the engine does not answer is bounded by the call deadline like a
+/// delete: the lock is not held past it (another name's create goes through),
+/// the reservation stays with the sender, and the name is fenced against other
+/// workspaces, which the sender itself is exempt from.
+#[test]
+fn a_hung_volume_create_is_bounded_and_fences_the_name() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("createhung", false, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(300);
+        cfg.delete_fence = SHORT_FENCE;
+    });
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    engine.hold_next_create.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    let first = {
+        let sock = sock_a.clone();
+        std::thread::spawn(move || call(&sock, "POST", "/volumes/create", DATA).0)
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    let (status, _) = call(
+        &sock_b,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"other"}"#),
+    );
+    assert_eq!(status, 201);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(first.join().unwrap(), 502);
+    assert!(
+        h.svc.ledger.has_volume("lane-a", "data"),
+        "the reservation was given up"
+    );
+    assert!(h.svc.volume_fenced("data"));
+    assert_eq!(call(&sock_b, "POST", "/volumes/create", DATA).0, 503);
+    assert_eq!(
+        call(&sock_a, "POST", "/volumes/create", DATA).0,
+        201,
+        "the sender is exempt"
+    );
+    engine.create_release.store(true, Ordering::SeqCst);
+}
+
+/// The lock a volume create holds for its whole request is released with it: a
+/// later request on the same connection (the same thread) takes it again.
+#[test]
+fn a_connection_takes_the_volume_lock_again_after_a_volume_create() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("lockflag", false, engine.handler(), |_| {});
+    let sock = h.serve(&h.auth);
+    let mut c = UnixStream::connect(&sock).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let body = r#"{"Name":"data"}"#;
+    write!(
+        c,
+        "POST /volumes/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut buf = vec![0_u8; 4096];
+    let n = c.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 201"));
+    // Another thread holds the volume lock; the next request on this
+    // connection (a container with a named volume) must wait for it.
+    let held = h.svc.vol_lock.lock().unwrap();
+    let create = r#"{"Image":"busybox","HostConfig":{"Binds":["data:/x"]}}"#;
+    write!(
+        c,
+        "POST /containers/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{create}",
+        create.len()
+    )
+    .unwrap();
+    c.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    assert!(
+        c.read(&mut buf).is_err(),
+        "the request did not wait for the volume lock"
+    );
+    drop(held);
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let n = c.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 201"));
+}
+
 fn raw_exchange(sock: &Path, request: &str, keep_reading_for: Duration) -> String {
     let mut c = UnixStream::connect(sock).unwrap();
     c.set_read_timeout(Some(keep_reading_for)).unwrap();

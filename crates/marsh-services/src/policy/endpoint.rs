@@ -2022,6 +2022,9 @@ fn handle_request(scope: &Arc<Scope>, conn: &mut Conn, head: &Head) -> io::Resul
     if let Post::VolumeDelete { name } = adm.post.clone() {
         return Ok(delete_volume(scope, conn, head, &adm, &name));
     }
+    if let Post::VolumeCreate { name, .. } = adm.post.clone() {
+        return Ok(create_volume(scope, conn, head, &adm, name.as_deref()));
+    }
     let result = forward(scope, conn, head, &mut adm, m.kind);
     match result {
         Ok(keep) => Ok(keep),
@@ -2898,6 +2901,75 @@ fn delete_volume(
                 &mut conn.stream,
                 502,
                 "the engine did not answer the delete; the volume name stays reserved until it is known to be gone",
+                true,
+            );
+            false
+        }
+    }
+}
+
+/// A volume create, made by the agent itself like a delete: dialed and sent
+/// under the volume lock the request already holds, bounded as a whole by
+/// `up_progress`, and not cut short by the client leaving (the engine call is
+/// finished, ownership recorded by its result, and the reply relayed if the
+/// client is still there). If the engine does not answer, the create may still
+/// land: the sender keeps its reservation and the name is fenced against other
+/// workspaces like an unanswered delete.
+fn create_volume(
+    scope: &Arc<Scope>,
+    conn: &mut Conn,
+    head: &Head,
+    adm: &Admitted,
+    name: Option<&str>,
+) -> bool {
+    let svc = &scope.svc;
+    let keep = !head.close;
+    let up = match svc.dial() {
+        Ok(up) => up,
+        Err(e) => {
+            // Nothing was sent: give back the reservation.
+            undo_post(scope, &adm.post);
+            reply(
+                &mut conn.stream,
+                502,
+                &format!("the engine is not available: {e}"),
+                true,
+            );
+            return false;
+        }
+    };
+    let body = match &adm.body {
+        ReqBody::Json(b) => Some(b.as_slice()),
+        _ => None,
+    };
+    match svc.exchange(up, "POST", &adm.path, body) {
+        Ok((resp, answer)) => {
+            let mut out = answer.clone();
+            if let Err(r) = record(scope, &adm.post, resp.status, &answer, &mut out) {
+                scope_log(&format!("not recorded: {}", r.msg));
+                reply(&mut conn.stream, r.status, &r.msg, false);
+                return keep;
+            }
+            let sent = write_resp_head(
+                &mut conn.stream,
+                &resp,
+                Out::Length(out.len() as u64),
+                keep,
+                Some(out.len()),
+            )
+            .and_then(|()| conn.stream.write_all(&out));
+            keep && sent.is_ok()
+        }
+        Err(e) => {
+            // Sent, no answer: it may still land, so the reservation stays.
+            if let Some(name) = name {
+                svc.fence_volume(name, &scope.auth.workspace);
+            }
+            svc.log(&format!("create of volume {name:?} did not complete: {e}"));
+            reply(
+                &mut conn.stream,
+                502,
+                "the engine did not answer the volume create; the volume name stays reserved until the fence expires",
                 true,
             );
             false

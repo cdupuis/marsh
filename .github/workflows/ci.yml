@@ -145,6 +145,9 @@ jobs:
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: 'true'
+      # The SEC-13 confinement test fails, instead of skipping, on a runner
+      # whose kernel cannot enforce Landlock (the Ubuntu runner kernels can).
+      MARSH_REQUIRE_LANDLOCK: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

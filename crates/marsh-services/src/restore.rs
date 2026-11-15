@@ -3043,6 +3043,25 @@ mod linux {
             std::fs::remove_dir_all(&f.root).unwrap();
         }
 
+        /// A volume directory that is a relative link to another volume stays
+        /// beneath the data root, which only NO_SYMLINKS refuses: the other
+        /// volume is not written into.
+        #[test]
+        fn install_never_writes_through_a_relative_link_to_another_volume() {
+            let f = fixture("rellink");
+            let volumes = f.root.join("pool").join(fsops::DATA_ROOT).join("volumes");
+            symlink("vol", volumes.join("alias")).unwrap();
+            let outcome = f.install(&[("alias", snap(), 3)]);
+            assert!(outcome[0].is_some(), "{outcome:?}");
+            assert_eq!(Fixture::names(&f.volume("vol")), ["_data"]);
+            assert_eq!(
+                Fixture::names(&f.volume("vol").join("_data")),
+                ["old"],
+                "the other volume was written into"
+            );
+            std::fs::remove_dir_all(&f.root).unwrap();
+        }
+
         /// Volumes are installed and reported one by one: a failure in one
         /// does not stop or spoil the other.
         #[test]

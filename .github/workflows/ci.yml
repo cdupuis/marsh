@@ -448,6 +448,34 @@ jobs:
         if: github.event_name != 'pull_request'
         run: make test-tools PUBLISHER_PYTHON="${{ steps.publisher-python.outputs.python-path }}"
 
+  deny:
+    # Supply-chain policy (deny.toml): licenses, banned or unknown sources, and
+    # advisories. Licenses and sources block. Advisories only warn: a new
+    # advisory against a dependency we did not change must not fail an unrelated
+    # pull request. Duplicate versions are reported as warnings.
+    name: Dependency policy (cargo-deny)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - name: cargo-deny
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -fsSL -o "$RUNNER_TEMP/cargo-deny.tgz" https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $RUNNER_TEMP/cargo-deny.tgz" | sha256sum -c
+          tar -xzf "$RUNNER_TEMP/cargo-deny.tgz" --strip-components=1 -C "$HOME/.cargo/bin" cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny
+      - name: Licenses, bans and sources
+        run: cargo deny --locked check licenses bans sources
+      - name: Advisories (warning only)
+        continue-on-error: true
+        run: cargo deny --locked check advisories
+
   docs:
     name: Docs and site
     runs-on: ubuntu-26.04
@@ -586,7 +614,7 @@ jobs:
     # the classifier fails, every lane runs, so its own result is not counted.)
     # When release.yml asks for every lane, a skipped lane fails too.
     name: CI passed
-    needs: [lint, linux-unit, linux-callers, linux-bash, tools, macos-unit, macos-callers, docs, model, images, renovate-config]
+    needs: [lint, linux-unit, linux-callers, linux-bash, tools, macos-unit, macos-callers, deny, docs, model, images, renovate-config]
     if: always()
     runs-on: ubuntu-26.04
     timeout-minutes: 5

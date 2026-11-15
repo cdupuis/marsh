@@ -1478,3 +1478,22 @@ fn reserved_names_are_refused_in_build_outputs_as_in_tag_and_build() {
         assert!(matches!(&r, Err(e) if e.status == 403), "{name}: {r:?}");
     }
 }
+
+/// The registry allowlist covers a build's `BUILDKIT_SYNTAX` build argument (on
+/// the REST `/build` route; the default client's `/grpc` stream has no such check)
+/// and nothing else a build fetches. The rest is documented in `docs/docker.md`
+/// ("Builds and the cache"); this pins where the filter's reach ends, so that
+/// a change to it is a change to those docs.
+#[test]
+fn the_registry_allowlist_reaches_a_builds_frontend_argument_and_nothing_else() {
+    let tar = [("Content-Type", "application/x-tar")];
+    let build = |query: &str| eval("POST", &format!("/build?{query}"), &tar, None);
+    let args = |frontend: &str| enc(&format!(r#"{{"BUILDKIT_SYNTAX":"{frontend}"}}"#));
+    let r = build(&format!("buildargs={}", args("evil.example/frontend")));
+    assert!(matches!(&r, Err(e) if e.status == 403), "{r:?}");
+    assert!(build(&format!("buildargs={}", args("docker/dockerfile:1"))).is_ok());
+    // Not seen: the cache sources, and everything inside the streamed context
+    // (`FROM`, `# syntax=`, `ADD <url>`), which is never read.
+    let cache = enc(r#"["evil.example/cache:1","type=registry,ref=evil.example/c"]"#);
+    assert!(build(&format!("cachefrom={cache}")).is_ok());
+}

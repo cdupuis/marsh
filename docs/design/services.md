@@ -304,9 +304,16 @@ and `effective` also says what the running engine's gate reads back (`on`,
 **Registries.** The pull allowlist is the filter's (`Config::registry_allow`,
 E3), not the network's, and it follows the gate: `EngineConfig::for_internet`
 (`docker.io` and `ghcr.io` while closed, every registry while open) is written
-with the gate by `internet::set`, read by the relay's filter for every image
-reference, and checked by the gate's supervisor
-(`docs/design/services-engine.md`).
+with the gate by `internet::set`, read by the relay's filter for the image of a pull
+(`/images/create`), of a container create, and, on the REST `/build` route only, of a build's `BUILDKIT_SYNTAX`
+argument (the default `docker build` and `buildx` use `/grpc` and `/session` and are
+not checked), and checked by the gate's supervisor (`docs/design/services-engine.md`).
+It is **not** applied to `FROM`, a `# syntax=` line, `cachefrom` or an `ADD <url>`
+of a build: the filter streams the build context unread and checks `cachefrom` for
+shape only (unit `the_registry_allowlist_reaches_a_builds_frontend_argument_and_nothing_else`).
+Those are fetched by the engine itself, in the engine's network namespace, outside
+the Internet gate (`DOCKER-USER` only) and the allowlist; see `services-policy.md`
+"Known limits".
 
 ## Relay (daemon to the services agent)
 

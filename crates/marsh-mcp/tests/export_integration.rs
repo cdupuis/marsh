@@ -344,6 +344,23 @@ impl TestHarness {
         }
     }
 
+    /// The same host executables with no daemon on the home: a call has to
+    /// start one. `marshd` is `marshd_script`.
+    fn without_daemon(marshd_script: &str) -> Self {
+        let harness = Self::new(Arc::new(TestKitBackend::new(Vec::new())));
+        harness.stop.store(true, Ordering::Release);
+        // Wait for the serving thread to end and release the socket.
+        let mut harness = harness;
+        harness.server.take().unwrap().join().unwrap();
+        let _ = fs::remove_dir_all(&harness.home);
+        fs::create_dir(&harness.home).unwrap();
+        fs::set_permissions(&harness.home, fs::Permissions::from_mode(0o700)).unwrap();
+        let marshd = harness.temp.path().join("marshd");
+        fs::write(&marshd, marshd_script).unwrap();
+        fs::set_permissions(&marshd, fs::Permissions::from_mode(0o755)).unwrap();
+        harness
+    }
+
     fn host_config(&self) -> HostConfig {
         HostConfig::new(&self.workspace, &self.home, &self.marsh, &self.sbx, false).unwrap()
     }
@@ -943,6 +960,66 @@ async fn test_call_tool_success_executes_real_daemon_path() {
         vec!["--run", "--filter", "unit_suite", "--coverage"]
     );
     assert_eq!(String::from_utf8(recorded.stdin).unwrap(), "sample payload");
+}
+
+/// D-04 through the real caller: a Kit-command call with no daemon running
+/// starts `marshd`, which must not inherit the gateway's environment.
+#[tokio::test]
+async fn a_kit_call_starts_the_daemon_without_the_gateways_environment() {
+    let harness = TestHarness::without_daemon("#!/bin/sh\n/usr/bin/env > \"$0.env\"\nexit 1\n");
+    let connection = harness.connect(make_declaration("test-report")).await;
+    let result = connection.call(json!({"filter": "x"})).await;
+    assert_eq!(result.is_error, Some(true), "{result:?}");
+    assert!(
+        error_text(&result).contains("cannot connect to daemon"),
+        "{result:?}"
+    );
+
+    let seen = fs::read_to_string(harness.temp.path().join("marshd.env")).unwrap();
+    // The test process has these (cargo and nextest set them); the daemon must not.
+    let gateway: Vec<String> = std::env::vars()
+        .map(|(name, _)| name)
+        .filter(|name| name.starts_with("CARGO") || name.starts_with("NEXTEST"))
+        // The export server forwards these two on purpose.
+        .filter(|name| !matches!(name.as_str(), "CARGO_HOME" | "RUSTUP_HOME"))
+        .collect();
+    assert!(!gateway.is_empty(), "the gateway has no variable to leak");
+    for name in gateway {
+        assert!(
+            !seen
+                .lines()
+                .any(|line| line.starts_with(&format!("{name}="))),
+            "the daemon inherited {name}: {seen}"
+        );
+    }
+    assert!(
+        seen.lines().any(|line| line.starts_with("MARSH_SBX=")),
+        "{seen}"
+    );
+
+    // The gateway's tuning reaches the daemon, its image overrides do not. A
+    // test cannot set its own environment, so the scenario runs again in a
+    // child process that has them.
+    if std::env::var_os("MARSH_KIT_GATEWAY_TEST_CHILD").is_some() {
+        assert!(
+            seen.lines().any(|line| line == "MARSH_VM_IDLE_SECONDS=60"),
+            "{seen}"
+        );
+        assert!(!seen.contains("MARSH_SHELL_IMAGE"), "{seen}");
+    } else {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_kit_call_starts_the_daemon_without_the_gateways_environment",
+                "--test-threads=1",
+            ])
+            .env("MARSH_KIT_GATEWAY_TEST_CHILD", "1")
+            .env("MARSH_VM_IDLE_SECONDS", "60")
+            .env("MARSH_SHELL_IMAGE", "evil.example/image")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the scenario with tuning set failed");
+    }
 }
 
 #[tokio::test]

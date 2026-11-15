@@ -8269,7 +8269,18 @@ impl Client {
         daemon_program: &Path,
         stock_sbx: &Path,
     ) -> Result<Self, DaemonError> {
-        daemon_startup::ensure_running(home, daemon_program, stock_sbx)
+        daemon_startup::ensure_running(home, daemon_program, stock_sbx, None)
+    }
+
+    /// [`Self::ensure_running`] for a caller whose own environment must not
+    /// reach the daemon: it starts with exactly `environment` and `MARSH_SBX`.
+    pub fn ensure_running_with_environment(
+        home: &Path,
+        daemon_program: &Path,
+        stock_sbx: &Path,
+        environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    ) -> Result<Self, DaemonError> {
+        daemon_startup::ensure_running(home, daemon_program, stock_sbx, Some(environment))
     }
 
     /// Connect to a live daemon without starting one, first replacing an

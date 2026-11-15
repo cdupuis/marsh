@@ -3080,6 +3080,47 @@ fn every_daemon_error_prints_no_terminal_control() {
     }
 }
 
+/// The Kit-command export server starts the resident daemon with an explicit
+/// environment, never the gateway's own.
+#[test]
+fn a_started_daemon_gets_only_the_environment_it_is_given() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = home();
+    let sbx = stock_sbx(b"stock-sbx-env");
+    let bin = tempfile::tempdir().unwrap();
+    let marshd = bin.path().join("marshd");
+    fs::write(&marshd, "#!/bin/sh\n/usr/bin/env > \"$0.env\"\nexit 1\n").unwrap();
+    fs::set_permissions(&marshd, fs::Permissions::from_mode(0o755)).unwrap();
+    let given = [
+        (
+            std::ffi::OsString::from("PATH"),
+            std::ffi::OsString::from("/usr/bin:/bin"),
+        ),
+        (
+            std::ffi::OsString::from("USER"),
+            std::ffi::OsString::from("someone"),
+        ),
+    ];
+
+    let error = Client::ensure_running_with_environment(home.path(), &marshd, sbx.path(), &given)
+        .expect_err("the stand-in exits");
+    assert!(matches!(error, DaemonError::StartupFailed(_)), "{error}");
+
+    let seen = fs::read_to_string(marshd.with_extension("env")).unwrap();
+    let mut names = seen
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+        // The shell itself adds these.
+        .filter(|name| !matches!(*name, "PWD" | "OLDPWD" | "SHLVL" | "_"))
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["MARSH_INTERNAL_STARTUP_STDERR", "MARSH_SBX", "PATH", "USER"],
+        "{seen}"
+    );
+}
+
 #[test]
 fn matching_installed_daemon_build_is_reused() {
     let home = home();

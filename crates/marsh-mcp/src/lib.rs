@@ -83,6 +83,80 @@ pub(crate) fn forward_host_environment(command: &mut std::process::Command) {
     }
 }
 
+/// The whole environment of a host child of this server: fixed identity and
+/// `PATH`, then the [`forward_host_environment`] allowlist.
+pub(crate) fn apply_host_environment(
+    command: &mut std::process::Command,
+    config: &HostConfig,
+    home: &Path,
+) {
+    command
+        .env_clear()
+        .env("MARSH_HOME", home)
+        .env("MARSH_SBX", &config.sbx)
+        .env("USER", &config.username)
+        .env("LOGNAME", &config.username)
+        .env("PATH", fixed_minimal_path());
+    forward_host_environment(command);
+}
+
+/// Settings the resident daemon reads from its own environment and that only
+/// tune it (numbers and switches): the per-job and launch limits
+/// (`marsh_daemon::limits::LIMITS`) and these. A daemon an export starts keeps
+/// serving later CLI sessions, so it needs the user's tuning. Not here:
+/// anything that names an image, an executable or a directory
+/// (`MARSH_SHELL_IMAGE`, `MARSH_KIT_IMAGE_CACHE`, `MARSH_GUEST_ARTIFACTS`,
+/// `MARSH_SKILLS_HOME`...), and credentials, proxies, `SSH_AUTH_SOCK` and
+/// `DOCKER_*`, which the daemon never reads (it runs `sbx` with a cleared
+/// environment of its own).
+pub(crate) const DAEMON_KNOBS: [&str; 8] = [
+    "MARSH_AUTO_UPDATE",
+    "MARSH_OPEN_URLS",
+    "MARSH_VM_IDLE_SECONDS",
+    "MARSH_SERVICES_IDLE_SECONDS",
+    "MARSH_SERVICES_STOP_WAIT_SECONDS",
+    "MARSH_SERVICES_POOL_BYTES",
+    "MARSH_SERVICES_POOL_RESERVE_BYTES",
+    "MARSH_CLOUD_DETACHED_RETENTION",
+];
+
+/// The environment of the resident daemon an export starts: that of the host
+/// `marsh` children (`apply_host_environment`), plus the [`DAEMON_KNOBS`] and
+/// limit variables that `lookup` (the gateway's environment) has.
+pub(crate) fn daemon_environment(
+    config: &HostConfig,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut probe = std::process::Command::new("daemon-environment");
+    apply_host_environment(&mut probe, config, &config.home);
+    let mut environment = probe
+        .get_envs()
+        .filter_map(|(name, value)| Some((name.to_owned(), value?.to_owned())))
+        .collect::<Vec<_>>();
+    let limits = marsh_daemon::limits::LIMITS
+        .iter()
+        .map(|spec| spec.variable);
+    for name in DAEMON_KNOBS.into_iter().chain(limits) {
+        if let Some(value) = lookup(name) {
+            environment.push((name.into(), value));
+        }
+    }
+    environment
+}
+
+/// The resident daemon this server starts gets [`daemon_environment`], not the
+/// gateway's own.
+pub(crate) fn start_daemon(
+    config: &HostConfig,
+) -> Result<marsh_daemon::Client, marsh_daemon::DaemonError> {
+    marsh_daemon::Client::ensure_running_with_environment(
+        &config.home,
+        &config.marshd,
+        &config.sbx,
+        &daemon_environment(config, &|name| env::var_os(name)),
+    )
+}
+
 pub(crate) const INHERITED_ENV: [&str; 13] = [
     "HOME",
     // The host state root: every host-side write follows the caller's
@@ -2721,18 +2795,12 @@ async fn run_bounded_cancel(
     command
         .args(&spec.arguments)
         .current_dir(&config.workspace)
-        .env_clear()
-        .env("MARSH_HOME", &spec.home)
-        .env("MARSH_SBX", &config.sbx)
-        .env("USER", &config.username)
-        .env("LOGNAME", &config.username)
-        .env("PATH", fixed_minimal_path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .process_group(0);
-    forward_host_environment(command.as_std_mut());
+    apply_host_environment(command.as_std_mut(), config, &spec.home);
     // On macOS a descriptor (another command's pipe, a daemon connection)
     // becomes close-on-exec only after creation; never spawn in between.
     let mut child = marsh_runtime::with_host_descriptor_creation_excluded(|| command.spawn())
@@ -4457,6 +4525,106 @@ mod tests {
         assert_eq!(operations[&owner_id].state, OperationState::Failed);
         assert_eq!(operations[&peer_id].state, OperationState::Running);
         assert!(!*peer_cancelled.borrow());
+    }
+
+    /// The export server's Kit-command path starts the resident daemon: it must
+    /// see the pinned environment, never the gateway's.
+    #[test]
+    fn the_daemon_an_export_starts_gets_the_host_child_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let home = root.path().join("home");
+        let marsh = root.path().join("marsh");
+        fs::create_dir(&workspace).unwrap();
+        executable(&marsh, "#!/bin/sh\nexit 0\n");
+        let sbx = supporting_executables(&marsh);
+        let marshd = root.path().join("marshd");
+        executable(&marshd, "#!/bin/sh\n/usr/bin/env > \"$0.env\"\nexit 1\n");
+        let config = HostConfig::new(&workspace, &home, &marsh, &sbx, false).unwrap();
+
+        assert!(start_daemon(&config).is_err(), "the stand-in exits");
+
+        let seen = fs::read_to_string(marshd.with_extension("env")).unwrap();
+        let allowed = [
+            "MARSH_HOME",
+            "MARSH_SBX",
+            "USER",
+            "LOGNAME",
+            "PATH",
+            "MARSH_INTERNAL_STARTUP_STDERR",
+            // The shell itself adds these.
+            "PWD",
+            "OLDPWD",
+            "SHLVL",
+            "_",
+        ];
+        for name in seen.lines().filter_map(|line| line.split_once('=')) {
+            assert!(
+                allowed.contains(&name.0)
+                    || INHERITED_ENV.contains(&name.0)
+                    || marsh_runtime::STOCK_SBX_SELECTORS.contains(&name.0),
+                "the daemon inherited {}: {seen}",
+                name.0
+            );
+        }
+        let path = format!("PATH={}", fixed_minimal_path().to_string_lossy());
+        assert!(seen.lines().any(|line| line == path), "{seen}");
+        assert!(
+            seen.lines()
+                .any(|line| line == format!("USER={}", config.username))
+        );
+    }
+
+    #[test]
+    fn the_daemon_environment_keeps_tuning_and_drops_everything_else() {
+        let (_root, config) = fixture();
+        let gateway = std::collections::BTreeMap::from([
+            ("MARSH_TREE_LAUNCH_RATE", "5/s"),
+            ("MARSH_AUTO_UPDATE", "0"),
+            ("MARSH_VM_IDLE_SECONDS", "60"),
+            // None of these reaches a daemon that outlives the gateway.
+            ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+            ("HTTPS_PROXY", "http://proxy.example"),
+            ("DOCKER_HOST", "tcp://elsewhere"),
+            ("MARSH_DAEMON_TOKEN", "secret"),
+            ("MARSH_SHELL_IMAGE", "evil.example/image"),
+            ("MARSH_GUEST_ARTIFACTS", "/tmp/evil"),
+            ("XDG_DATA_HOME", "/tmp/data"),
+        ]);
+        let environment = daemon_environment(&config, &|name| {
+            gateway.get(name).map(std::ffi::OsString::from)
+        });
+        let names = environment
+            .iter()
+            .map(|(name, _)| name.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        for kept in [
+            "MARSH_TREE_LAUNCH_RATE",
+            "MARSH_AUTO_UPDATE",
+            "MARSH_VM_IDLE_SECONDS",
+        ] {
+            assert!(
+                names.iter().any(|name| name == kept),
+                "{kept} missing: {names:?}"
+            );
+        }
+        for dropped in [
+            "SSH_AUTH_SOCK",
+            "HTTPS_PROXY",
+            "DOCKER_HOST",
+            "MARSH_DAEMON_TOKEN",
+            "MARSH_SHELL_IMAGE",
+            "MARSH_GUEST_ARTIFACTS",
+            "XDG_DATA_HOME",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == dropped),
+                "{dropped} leaked: {names:?}"
+            );
+        }
+        for pinned in ["MARSH_HOME", "MARSH_SBX", "USER", "LOGNAME", "PATH"] {
+            assert!(names.iter().any(|name| name == pinned), "{pinned} missing");
+        }
     }
 
     #[tokio::test]

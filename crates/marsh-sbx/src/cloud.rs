@@ -1112,7 +1112,8 @@ impl CloudSbx {
     ///
     /// # Errors
     /// Refuses a name marsh would not create, a foreign or colliding
-    /// identity, an invalid record, or a full ownership map.
+    /// identity (including a sandbox owned here for a run), an invalid
+    /// record, or a full ownership map.
     pub fn adopt(
         &self,
         name: &str,
@@ -1138,7 +1139,13 @@ impl CloudSbx {
         }
         self.update(|file| {
             if let Some(existing) = file.entries.get(name) {
-                return if existing.id.as_ref() == Some(id) {
+                // Only an earlier adoption (cleanup-only, retried): never a
+                // sandbox this daemon owns for a run.
+                let adopted = matches!(
+                    existing.phase,
+                    CloudPhase::Quarantined | CloudPhase::Removing
+                ) && !existing.detached;
+                return if existing.id.as_ref() == Some(id) && adopted {
                     Ok(())
                 } else {
                     Err(CloudError::Foreign(name.to_owned()))
@@ -1564,6 +1571,67 @@ mod tests {
             .collect::<Vec<_>>();
         kept.sort();
         assert_eq!(kept, ["marsh-s-listed00", "marsh-s-other000"]);
+    }
+
+    /// C-05: a recorded child that names a sandbox this daemon owns for a
+    /// run (not an adopted, cleanup-only record) is refused, never adopted
+    /// into a deletion.
+    #[test]
+    fn adoption_never_aliases_a_sandbox_that_is_owned_for_a_run() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("control")).unwrap();
+        let directory = dir.path().join("control").canonicalize().unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let inventory = dir.path().join("inventory.json");
+        fs::write(
+            &inventory,
+            r#"[{"name":"marsh-s-cccccccc","id":"sbx_ccc","status":"running","agent":"codex"}]"#,
+        )
+        .unwrap();
+        let stock = dir.path().join("sbx");
+        fs::write(
+            &stock,
+            "#!/bin/sh\n[ \"$2\" = ls ] && exec cat \"$MARSH_TEST_INVENTORY\"\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stock, fs::Permissions::from_mode(0o755)).unwrap();
+        let runner = marsh_runtime::SystemCommandRunner::new(dir.path())
+            .with_stock_environment([("MARSH_TEST_INVENTORY".into(), inventory.into())]);
+        let kit = format!("docker.io/docker/codex@sha256:{}", "c".repeat(64));
+        let adapter = CloudSbx::open(stock, Arc::new(runner), directory).unwrap();
+        let id = CloudSandboxId::parse("sbx_ccc".into()).unwrap();
+        for (phase, detached) in [
+            (CloudPhase::Ready, false),
+            (CloudPhase::Detached, true),
+            (CloudPhase::Ready, true),
+            (CloudPhase::Quarantined, true),
+        ] {
+            adapter
+                .update(|file| {
+                    file.entries.insert(
+                        "marsh-s-cccccccc".into(),
+                        CloudRecord {
+                            name: "marsh-s-cccccccc".into(),
+                            id: Some(id.clone()),
+                            image: kit.clone(),
+                            agent: Some("codex".into()),
+                            phase,
+                            observed: true,
+                            detached,
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    adapter.adopt("marsh-s-cccccccc", &id, &kit, Some("codex")),
+                    Err(CloudError::Foreign(_))
+                ),
+                "{phase:?} {detached}"
+            );
+            assert_eq!(adapter.records().unwrap()[0].phase, phase);
+        }
     }
 
     /// A detached run's agent sandbox is adopted (for deletion only) just

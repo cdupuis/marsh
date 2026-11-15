@@ -94,13 +94,13 @@ summary, cloud finish notices and `marsh cloud` messages and job lines, daemon
 errors (`DaemonError` text, and every `marsh: ...` error line), shell notices and
 control errors, and `mcp publish` and `acp` status text. Tests feed a controlled
 string through: the receipt, results list, status, gc, services, notices, the
-lifecycle summary, the reset confirmation, `peer-review ls`, every `DaemonError`
-variant, the notice and control-error lines, the cloud job lines, `RunError`,
-and the refusal text of `marsh jobs`. The other filtered paths (the cloud
-discard line, `workers stop` entries, `forget-cloud` and `kit uninstall`
-messages, the `detached_json` notice, `acp` and `mcp publish` prints, and the
-calls that attach the notice helpers to the shell relay) are one-line calls to
-the same filter with no test of their own.
+lifecycle summary, the reset confirmation, `peer-review ls`, `workers stop`,
+`workers forget-cloud` and `kit uninstall`, every `DaemonError` variant, the
+notice and control-error lines, the cloud job lines, `RunError`, and the refusal
+text of `marsh jobs`. The other filtered paths (the cloud discard line, the
+`detached_json` notice, `acp` and `mcp publish` prints, and the calls that attach
+the notice helpers to the shell relay) are one-line calls to the same filter
+with no test of their own.
 
 Left as the workload wrote it:
 - the output stream of a job or a cloud run (`marsh cloud attach` replays its

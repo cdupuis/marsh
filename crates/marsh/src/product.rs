@@ -1975,6 +1975,46 @@ mod tests {
         write_gc_report(&mut out, &report).unwrap();
     }
 
+    const EVIL: &str = "x\u{1b}]52;c;AAAA\u{7}y";
+
+    /// The one-line prints of daemon replies, through `prepare` itself.
+    #[test]
+    fn daemon_reply_lines_print_no_terminal_control() {
+        use crate::cli::ProductCommand as C;
+        for command in [
+            C::WorkersStop {
+                selection: LoadSelection::All,
+                json: false,
+            },
+            C::WorkersForgetCloud { name: "n".into() },
+            C::KitUninstall {
+                command: "fixture".into(),
+            },
+        ] {
+            let mut stdout = Vec::new();
+            prepare(
+                ParsedCli {
+                    command,
+                    brush_args: vec!["marsh".into()],
+                    load: None,
+                    ephemeral_home: false,
+                    session_id: None,
+                    ephemeral_home_backing: None,
+                    guest: false,
+                    shell: None,
+                },
+                Arc::new(FakeClient::default()),
+                session(),
+                &mut stdout,
+                Vec::new(),
+            )
+            .unwrap();
+            let out = String::from_utf8(stdout).unwrap();
+            assert!(out.contains("x?]52;c;AAAA?y"), "{out:?}");
+            assert!(!out.contains('\u{1b}') && !out.contains('\u{7}'), "{out:?}");
+        }
+    }
+
     #[test]
     fn reset_confirmation_prints_no_terminal_control_from_project_paths() {
         let evil = "/p/project-\u{1b}]52;c;AAAA\u{7}";
@@ -2184,6 +2224,26 @@ mod tests {
 
         fn registered_commands(&self) -> Result<Vec<String>, ClientError> {
             Ok(vec!["fixture".into()])
+        }
+
+        fn stop_workers(
+            &self,
+            _: &LoadSelection,
+        ) -> Result<marsh_daemon::WorkersStopReport, ClientError> {
+            Ok(marsh_daemon::WorkersStopReport {
+                entries: vec![marsh_daemon::WorkerStopEntry {
+                    message: EVIL.into(),
+                    ..Default::default()
+                }],
+            })
+        }
+
+        fn forget_cloud_create(&self, _: &str) -> Result<String, ClientError> {
+            Ok(EVIL.into())
+        }
+
+        fn uninstall_kit(&self, _: &str) -> Result<String, ClientError> {
+            Ok(EVIL.into())
         }
 
         fn prepare(

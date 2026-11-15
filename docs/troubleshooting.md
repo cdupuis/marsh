@@ -225,7 +225,9 @@ are not.
 
 `reset` and `stop` do not delete Docker Cloud sandboxes. marsh deletes each
 one when its `cloud` call ends; if a call ended `cleanup uncertain`, run
-`marsh workers reset cloud`. Cloud sandboxes also expire after 4 hours.
+`marsh workers reset cloud`. An attached call's sandbox also expires on its own when its `--ttl` ends (4 hours
+by default); a detached run's sandbox is suspended at its `--ttl` instead
+(2 hours by default), and deleted when collected or after 14 days uncollected.
 
 ### Garbage collection
 

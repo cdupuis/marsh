@@ -361,6 +361,18 @@ fn caller_words(arguments: &[Vec<u8>]) -> Vec<Vec<u8>> {
     kept
 }
 
+/// A sandbox lifetime as the user wrote it: `4 h`, `90 min`, or seconds.
+fn ttl_text(ttl: Duration) -> String {
+    let seconds = ttl.as_secs();
+    if seconds >= 3600 && seconds.is_multiple_of(3600) {
+        format!("{} h", seconds / 3600)
+    } else if seconds >= 60 && seconds.is_multiple_of(60) {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds} s")
+    }
+}
+
 /// Sandbox options chosen by the caller (`--cpus`, `--ttl`, `--image`).
 #[derive(Debug, Eq, PartialEq)]
 struct Options {
@@ -705,6 +717,16 @@ mod tests {
             settled: false,
         });
         assert_eq!(only_job_states(&store), [marsh_daemon::JobState::Failed]);
+    }
+
+    /// The capture-failure message names the sandbox's real lifetime, which is
+    /// whatever `--ttl` was (1 m to 24 h), not a fixed 4 hours.
+    #[test]
+    fn a_ttl_is_worded_as_the_user_would_write_it() {
+        assert_eq!(ttl_text(Duration::from_hours(4)), "4 h");
+        assert_eq!(ttl_text(Duration::from_mins(90)), "90 min");
+        assert_eq!(ttl_text(Duration::from_mins(1)), "1 min");
+        assert_eq!(ttl_text(Duration::from_secs(61)), "61 s");
     }
 
     /// The token reaches the sandbox only on one step's stdin: no
@@ -1060,7 +1082,9 @@ impl StockDaemonBackend {
             None => store.set_job_args(&job_id, &caller_words(&request.arguments)),
         }
         if origin.is_some() {
-            // The parent's remaining wall time bounds the sandbox's lifetime.
+            // The parent's remaining wall time bounds the sandbox's lifetime,
+            // but not below 60 s, the shortest `--ttl`: a child started in the
+            // parent's last minute can outlive it. The parent's end cancels it.
             let (left, _) = store.set_job_deadline(&job_id, options.ttl.as_secs());
             options.ttl = Duration::from_secs(left.max(60));
         }
@@ -1589,9 +1613,10 @@ impl StockDaemonBackend {
             settle.note(&format!(
                 "could not download the file changes: {message}; nothing was written back. \
                  The sandbox {} is kept with the files (inspect it with `sbx --cloud exec {} sh`); \
-                 `marsh workers reset cloud` deletes it, and it expires within 4 hours",
+                 `marsh workers reset cloud` deletes it, and it expires {} after it was created",
                 id.as_str(),
-                id.as_str()
+                id.as_str(),
+                ttl_text(options.ttl)
             ));
             return settle.finish(
                 ExecutionOutcome::Exited { code: exit_code },

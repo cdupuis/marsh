@@ -474,7 +474,9 @@ the exit status, and the cleanup result. Cloud calls count toward the
   remote command ended, nothing is written back and nothing is re-run. The job
   shows `cleanup uncertain` and holds its slot. Run
   `marsh workers reset cloud` to delete every cloud sandbox this daemon owns
-  and release it. Sandboxes also expire on their own after 4 hours.
+  and release it. An attached call's sandbox also expires on its own when its
+  `--ttl` ends (4 hours by default). A detached run's `--ttl` (2 hours by default)
+  suspends it instead, and a run nobody collects is deleted after 14 days.
 
 ## Current limits
 

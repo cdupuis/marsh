@@ -55,7 +55,9 @@ class CiChanges(unittest.TestCase):
 
     def test_documentation_needs_no_build_or_model_lane(self):
         self.check(["docs/split.md", "README.md", "CONTRIBUTING.md"])
-        self.check(["docs/model/README.md"])
+
+    def test_the_model_readme_runs_the_tooling_lane_that_checks_its_code_table(self):
+        self.check(["docs/model/README.md"], "tools")
 
     def test_renovate_configuration_runs_tooling_and_its_validator(self):
         for path in (".github/renovate.json5", ".github/renovate-version",

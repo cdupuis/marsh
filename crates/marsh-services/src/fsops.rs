@@ -1227,6 +1227,15 @@ mod tests {
         std::fs::create_dir_all(volumes.join("odd")).unwrap();
         symlink(root.join("elsewhere/_data"), volumes.join("odd/_data")).unwrap();
         assert!(pool.volume_source("odd").is_err());
+        // Links that stay beneath the data root are the case only NO_SYMLINKS
+        // refuses (RESOLVE_BENEATH accepts them): a volume that is a relative
+        // link to another volume, and `_data` a relative link into one.
+        symlink("db", volumes.join("sibling")).unwrap();
+        assert!(pool.volume_dir("sibling").is_err());
+        assert!(pool.volume_source("sibling").is_err());
+        std::fs::create_dir_all(volumes.join("inner")).unwrap();
+        symlink("../db/_data", volumes.join("inner/_data")).unwrap();
+        assert!(pool.volume_source("inner").is_err());
         std::fs::remove_dir_all(&root).unwrap();
 
         // The data root itself replaced by a link.

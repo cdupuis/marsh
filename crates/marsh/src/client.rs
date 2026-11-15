@@ -5,6 +5,7 @@ use crate::{
     registered_commands::{Invocation, RegisteredCommandExecutor},
     session::SessionConfig,
 };
+use marsh_contracts::terminal::display_safe_text;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -58,7 +59,7 @@ pub struct ClientError(pub String);
 
 impl fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&marsh_contracts::terminal::display_safe_text(&self.0))
     }
 }
 
@@ -618,7 +619,7 @@ impl CommandExecutor {
         };
         match result {
             Ok(message) => {
-                println!("{message}");
+                println!("{}", display_safe_text(&message));
                 0
             }
             Err(error) => {
@@ -695,7 +696,7 @@ impl CommandExecutor {
             ["unpublish", name] => self
                 .client
                 .acp_unpublish(&self.session, name)
-                .map(|message| println!("{message}")),
+                .map(|message| println!("{}", display_safe_text(&message))),
             _ => {
                 print_acp_help(args.first().copied(), true);
                 return 2;
@@ -745,7 +746,7 @@ impl CommandExecutor {
         acp_command_result(
             self.client
                 .acp_publish(id, &self.session, name, sandbox, kit)
-                .map(|message| println!("{message}")),
+                .map(|message| println!("{}", display_safe_text(&message))),
         )
     }
 
@@ -755,7 +756,7 @@ impl CommandExecutor {
             return print_json(&status.permissions);
         }
         if let Some(note) = status.permission_note {
-            println!("{note}");
+            println!("{}", display_safe_text(&note));
         }
         if status.permissions.is_empty() {
             println!("No pending one-time permissions.");
@@ -921,10 +922,10 @@ impl CommandExecutor {
             println!("Last turn: {}", serde_label(&reason));
         }
         if let Some(error) = status.last_error {
-            println!("Error: {error}");
+            println!("Error: {}", display_safe_text(&error));
         }
         if let Some(note) = &status.permission_note {
-            println!("{note}");
+            println!("{}", display_safe_text(note));
         }
         if !status.permissions.is_empty() {
             println!(
@@ -1023,7 +1024,7 @@ impl CommandExecutor {
                     return Err(ClientError(error.clone()));
                 }
                 if let Some(note) = &receipt.permission_note {
-                    eprintln!("acp: {note}");
+                    eprintln!("acp: {}", display_safe_text(note));
                 }
                 println!();
                 return if receipt.stop_reason == Some(marsh_acp::StopReason::EndTurn) {

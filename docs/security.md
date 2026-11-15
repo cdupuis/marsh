@@ -66,6 +66,54 @@ beyond mounted files, as described [below](#mcp-connections).
 The host control directory, the install, and Kit sources are never mounted.
 marsh refuses to start in a directory that contains them.
 
+Text a job, a Kit or a cloud run chose (command names and arguments, an agent
+call's summary, labels, a run's failure detail, file names in an error) is
+shown on your terminal through one filter,
+`marsh_contracts::terminal::display_safe`. It replaces with `?`:
+- the C0 and C1 controls (so escape sequences), the line and paragraph
+  separators, and the bidirectional embedding, override and isolate controls;
+- characters that render as nothing, so text can hide in them: zero-width space,
+  BOM, word joiner and the invisible operators (U+2060 to U+206F), soft hyphen,
+  the combining grapheme joiner, the Hangul and Braille fillers, the Mongolian
+  separators, the object-replacement and annotation characters, all variation
+  selectors but the emoji pair, and the tag block (this also reduces the
+  subdivision flags, such as England's, to a plain flag, and shows a Japanese
+  ideographic variant as its base character).
+
+Kept: right-to-left marks, CJK, combining marks, emoji, emoji presentation
+selectors after an emoji, and a zero-width joiner inside an emoji sequence or
+between letters of a script that needs it (Arabic, Persian, the Indic scripts,
+Myanmar, Khmer). The list of hidden characters is a list, not a promise that no
+invisible character can pass.
+
+Where it applies on the Mac, each path filtered where it prints: `marsh results`
+and `results show`, `marsh status`, `gc`, `services` and `workers stop`, the
+`workers forget-cloud` and `kit uninstall` messages, `peer-review ls`, the
+`reset --include-services` and `docker rm` confirmations, the `stop`/`reset`
+summary, cloud finish notices and `marsh cloud` messages and job lines, daemon
+errors (`DaemonError` text, and every `marsh: ...` error line), shell notices and
+control errors, and `mcp publish` and `acp` status text. Tests feed a controlled
+string through: the receipt, results list, status, gc, services, notices, the
+lifecycle summary, the reset confirmation, `peer-review ls`, `workers stop`,
+`workers forget-cloud` and `kit uninstall`, every `DaemonError` variant, the
+notice and control-error lines, the cloud job lines, `RunError`, and the refusal
+text of `marsh jobs`. The other filtered paths (the cloud discard line, the
+`detached_json` notice, `acp` and `mcp publish` prints, and the calls that attach
+the notice helpers to the shell relay) are one-line calls to the same filter
+with no test of their own.
+
+Left as the workload wrote it:
+- the output stream of a job or a cloud run (`marsh cloud attach` replays its
+  stdout and stderr), an agent's replies, and the shell itself, all of which
+  are the program's own terminal output;
+- `marsh cloud diff` when it is piped, so the patch stays exact (on a terminal
+  it is filtered);
+- JSON output (`--json`), where control characters are escaped by JSON;
+- the daemon's log files;
+- the status lines of `marsh` helper commands that run inside the VM (`split`,
+  `fanout`, `limits`): they print to the same terminal as the job itself and
+  are not filtered. (`marsh jobs` and `acp` status, which also run there, are.)
+
 ### Shell VM
 
 Your shell runs here as your user, with passwordless `sudo` and a private

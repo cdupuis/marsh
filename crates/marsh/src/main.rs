@@ -15,6 +15,7 @@ use marsh::{
     registered_commands::{RegisteredCommandExecutor, invocation_from_environment},
     session::{EphemeralHomeGuard, SessionConfig},
 };
+use marsh_contracts::terminal::{display_safe, display_safe_text};
 use marsh_mcp::{StdinBinding, ToolBindings, ToolDeclaration, WorkspaceIdentity};
 use nix::{
     sys::signal::{Signal, killpg},
@@ -469,7 +470,7 @@ fn run_with(
     match run_product(arguments) {
         Ok(status) => exit_code(status),
         Err(error) => {
-            eprintln!("marsh: {}", error.message);
+            eprintln!("marsh: {}", display_safe_text(&error.message));
             exit_code(error.status)
         }
     }
@@ -1121,7 +1122,7 @@ fn run_command(arguments: &[OsString]) -> i32 {
                 | marsh_daemon::DaemonError::Refused(message) => message,
                 other => other.to_string(),
             };
-            eprintln!("marsh: {message}");
+            eprintln!("marsh: {}", display_safe_text(&message));
             125
         }
     };
@@ -1563,7 +1564,7 @@ fn cloud_command(arguments: &[OsString]) -> i32 {
                 | marsh_daemon::DaemonError::Refused(message) => message,
                 other => other.to_string(),
             };
-            let message = message.strip_prefix("cloud: ").unwrap_or(&message);
+            let message = display_safe_text(message.strip_prefix("cloud: ").unwrap_or(&message));
             eprintln!("marsh: cloud: {message}");
             125
         }
@@ -1593,7 +1594,7 @@ fn detached_json(
             Frame::Stdout { bytes } | Frame::Stderr { bytes } => {
                 let _ = std::io::stderr().write_all(&bytes);
             }
-            Frame::Notice { message } => eprintln!("{message}"),
+            Frame::Notice { message } => eprintln!("{}", display_safe_text(&message)),
             Frame::JobStarted { job_id } => job = Some(job_id),
             Frame::Exited { code } => {
                 if code == 0
@@ -1623,9 +1624,7 @@ fn print_detached_notices(client: &marsh_daemon::Client) {
     if let Ok(reply) =
         client.cloud_detached(marsh_daemon::cloud_detached::CloudDetachedRequest::Notices)
     {
-        for notice in reply.notices {
-            eprintln!("{notice}");
-        }
+        let _ = product::write_notices(&mut std::io::stderr(), &reply.notices);
     }
 }
 
@@ -1658,9 +1657,11 @@ fn detached_command(action: &str, arguments: &[OsString]) -> i32 {
         };
         eprintln!(
             "marsh: {}",
-            message
-                .strip_prefix("cloud: ")
-                .map_or(message.clone(), |rest| format!("cloud: {rest}"))
+            display_safe_text(
+                &message
+                    .strip_prefix("cloud: ")
+                    .map_or(message.clone(), |rest| format!("cloud: {rest}"))
+            )
         );
         1
     };
@@ -1669,6 +1670,10 @@ fn detached_command(action: &str, arguments: &[OsString]) -> i32 {
         "diff" => {
             let mut offset = 0;
             let mut stdout = std::io::stdout().lock();
+            // A patch piped to `git apply` stays exact; on a terminal, the
+            // run's own bytes cannot act on it.
+            let mut filter = std::io::IsTerminal::is_terminal(&stdout)
+                .then(marsh_contracts::terminal::DisplayFilter::default);
             loop {
                 let reply = match client.cloud_detached(Request::Diff {
                     job: job.clone(),
@@ -1677,11 +1682,18 @@ fn detached_command(action: &str, arguments: &[OsString]) -> i32 {
                     Ok(reply) => reply,
                     Err(error) => return fail(error),
                 };
-                if stdout.write_all(&reply.bytes).is_err() {
+                let written = match &mut filter {
+                    Some(filter) => stdout.write_all(filter.push(&reply.bytes).as_bytes()),
+                    None => stdout.write_all(&reply.bytes),
+                };
+                if written.is_err() {
                     return 141;
                 }
                 offset += reply.bytes.len() as u64;
                 if reply.bytes.is_empty() || offset >= reply.total {
+                    if let Some(filter) = &mut filter {
+                        let _ = stdout.write_all(filter.finish().as_bytes());
+                    }
                     let _ = stdout.flush();
                     return 0;
                 }
@@ -1694,7 +1706,7 @@ fn detached_command(action: &str, arguments: &[OsString]) -> i32 {
     };
     match client.cloud_detached(request) {
         Ok(reply) => {
-            println!("{}", reply.message);
+            println!("{}", display_safe_text(&reply.message));
             0
         }
         Err(error) => fail(error),
@@ -1740,7 +1752,7 @@ fn sync_command(arguments: &[OsString]) -> i32 {
                 | marsh_daemon::DaemonError::Refused(message) => message,
                 other => other.to_string(),
             };
-            let message = message.strip_prefix("cloud: ").unwrap_or(&message);
+            let message = display_safe_text(message.strip_prefix("cloud: ").unwrap_or(&message));
             if json {
                 println!("{}", serde_json::json!({"synced": [], "error": message}));
             }
@@ -1752,10 +1764,10 @@ fn sync_command(arguments: &[OsString]) -> i32 {
         println!("{}", serde_json::json!({"synced": reply.synced}));
     }
     if !reply.message.is_empty() {
-        eprintln!("marsh: cloud: {}", reply.message);
+        eprintln!("marsh: cloud: {}", display_safe_text(&reply.message));
     }
     for report in &reply.synced {
-        eprintln!("marsh: cloud: {}", report.message);
+        eprintln!("marsh: cloud: {}", display_safe_text(&report.message));
     }
     i32::from(reply.synced.iter().any(|report| report.error.is_some()))
 }
@@ -1808,27 +1820,20 @@ fn attach_detached(
             && view.state != shown
         {
             if view.state == "paused" {
-                eprintln!("marsh: cloud job {} paused: {}", view.cursor, view.detail);
+                eprintln!("{}", paused_line(view));
             } else if shown == "paused" {
-                eprintln!("marsh: cloud job {} {}", view.cursor, view.state);
+                eprintln!(
+                    "marsh: cloud job {} {}",
+                    view.cursor,
+                    display_safe(&view.state)
+                );
             }
             shown.clone_from(&view.state);
         }
         if let Some(view) = view.filter(|view| view.settled)
             && !pending
         {
-            let exit = view
-                .exit_code
-                .map_or_else(String::new, |code| format!(" (exit {code})"));
-            let detail = if view.detail.is_empty() {
-                String::new()
-            } else {
-                format!("; {}", view.detail)
-            };
-            eprintln!(
-                "marsh: cloud job {} {}{exit}{detail}",
-                view.cursor, view.state
-            );
+            eprintln!("{}", settled_line(&view));
             if view.state == "kept-as-patch" {
                 eprintln!("marsh: review it with: marsh cloud diff {}", view.cursor);
             }
@@ -1840,6 +1845,34 @@ fn attach_detached(
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
+}
+
+/// The line for a paused detached run. The detail is text the run's workload
+/// or its write-back chose, so it is filtered.
+fn paused_line(view: &marsh_daemon::cloud_detached::DetachedView) -> String {
+    format!(
+        "marsh: cloud job {} paused: {}",
+        view.cursor,
+        display_safe_text(&view.detail)
+    )
+}
+
+/// The line for a settled detached run (state, exit code, detail), filtered
+/// like [`paused_line`].
+fn settled_line(view: &marsh_daemon::cloud_detached::DetachedView) -> String {
+    let exit = view
+        .exit_code
+        .map_or_else(String::new, |code| format!(" (exit {code})"));
+    let detail = if view.detail.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", display_safe_text(&view.detail))
+    };
+    format!(
+        "marsh: cloud job {} {}{exit}{detail}",
+        view.cursor,
+        display_safe(&view.state)
+    )
 }
 
 /// The daemon channel for `split`/`join`/`splits`: the session relay inside
@@ -4200,7 +4233,7 @@ struct RunError {
 impl RunError {
     fn new(message: impl Into<String>, status: i32) -> Self {
         Self {
-            message: message.into(),
+            message: display_safe_text(&message.into()),
             status,
         }
     }
@@ -4208,6 +4241,35 @@ impl RunError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_error_and_cloud_lines_print_no_terminal_control() {
+        use marsh_daemon::cloud_detached::DetachedView;
+        let evil = "x\u{1b}]52;c;AAAA\u{7}y";
+        let view = DetachedView {
+            job_id: "j".into(),
+            cursor: 3,
+            state: evil.into(),
+            exit_code: Some(1),
+            detail: evil.into(),
+            settled: true,
+            output_truncated: false,
+        };
+        let lines = [
+            super::RunError::new(evil, 1).message,
+            super::paused_line(&view),
+            super::settled_line(&view),
+        ];
+        for line in lines {
+            assert!(
+                !line
+                    .chars()
+                    .any(marsh_contracts::terminal::is_terminal_unsafe),
+                "{line:?}"
+            );
+            assert!(line.contains("x?]52;c;AAAA?y"), "{line:?}");
+        }
+    }
+
     #[test]
     fn a_missing_sbx_registration_still_matches_under_sbx_warnings() {
         use std::os::unix::process::ExitStatusExt as _;

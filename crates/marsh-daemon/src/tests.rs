@@ -3036,6 +3036,50 @@ fn a_relative_stock_sbx_path_is_refused_before_binding() {
     );
 }
 
+/// Every `DaemonError` that carries a path or relayed text prints no terminal
+/// control: the hosts print these errors from many places.
+#[test]
+fn every_daemon_error_prints_no_terminal_control() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let evil = "x\u{1b}]52;c;AAAA\u{7}y";
+    let path = || PathBuf::from(format!("/p/{evil}"));
+    let io = || io::Error::other(evil);
+    let errors = [
+        DaemonError::EndpointExists(path()),
+        DaemonError::UnsafeHome(path()),
+        DaemonError::UnsafeToken(path()),
+        DaemonError::NotFound(evil.into()),
+        DaemonError::InvalidState(evil.into()),
+        DaemonError::ShellCleanupUncertain(evil.into()),
+        DaemonError::ShellAttachmentBusy(evil.into()),
+        DaemonError::ShellInputTransportClosed(evil.into()),
+        DaemonError::ShellInputWriteFailed(io()),
+        DaemonError::EndpointInconsistent(path()),
+        DaemonError::Remote(evil.into()),
+        DaemonError::Refused(evil.into()),
+        DaemonError::JobUncertain(evil.into()),
+        DaemonError::Publication(PublicationOutcome::rejected(evil)),
+        DaemonError::Random(evil.into()),
+        DaemonError::Spawn(io()),
+        DaemonError::StartupFailed(StartupFailure {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            reason: evil.into(),
+        }),
+        DaemonError::StartupTimeout(path()),
+        DaemonError::Io(io()),
+        DaemonError::Json(serde_json::from_str::<u8>(&format!("\"{evil}\"")).unwrap_err()),
+    ];
+    for error in errors {
+        let shown = error.to_string();
+        assert!(
+            !shown
+                .chars()
+                .any(marsh_contracts::terminal::is_terminal_unsafe),
+            "{error:?} printed {shown:?}"
+        );
+    }
+}
+
 #[test]
 fn matching_installed_daemon_build_is_reused() {
     let home = home();

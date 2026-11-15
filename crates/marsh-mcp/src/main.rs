@@ -34,7 +34,10 @@ enum Mode {
 async fn main() {
     let _ = marsh_provenance::embed!();
     if let Err(error) = run().await {
-        eprintln!("marsh-mcp: {error}");
+        eprintln!(
+            "marsh-mcp: {}",
+            marsh_contracts::terminal::display_safe_text(&error)
+        );
         std::process::exit(1);
     }
 }

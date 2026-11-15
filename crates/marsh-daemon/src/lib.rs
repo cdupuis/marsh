@@ -9541,11 +9541,7 @@ fn relay_attachment_started<R: Read + Send + 'static, O: Write, E: Write>(
                 error.flush()?;
             }
             AttachmentFrame::Notice { message } => {
-                if terminal {
-                    write!(error, "{message}\r\n")?;
-                } else {
-                    writeln!(error, "{message}")?;
-                }
+                error.write_all(shell_client::notice_line(&message, terminal).as_bytes())?;
                 error.flush()?;
             }
             AttachmentFrame::JobStarted { job_id } => started(&job_id),
@@ -9554,7 +9550,9 @@ fn relay_attachment_started<R: Read + Send + 'static, O: Write, E: Write>(
             AttachmentFrame::ControlError {
                 operation, message, ..
             } => {
-                writeln!(error, "marsh: {operation}: {message}")?;
+                error.write_all(
+                    shell_client::control_error_line(&operation, &message, false).as_bytes(),
+                )?;
                 error.flush()?;
             }
             AttachmentFrame::Exited { code } => {
@@ -10122,58 +10120,66 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T, Daem
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// An error's text with every terminal control replaced
+/// (`marsh_contracts::terminal::display_safe_text`): daemon errors echo paths,
+/// project file names and relayed text that a job or a cloned repository chose.
+fn safe(value: impl std::fmt::Display) -> String {
+    marsh_contracts::terminal::display_safe_text(&value.to_string())
+}
+
 #[derive(Debug, Error)]
 pub enum DaemonError {
-    #[error("daemon endpoint already exists: {0}")]
+    #[error("daemon endpoint already exists: {}", safe(.0.display()))]
     EndpointExists(PathBuf),
-    #[error("unsafe MARSH_HOME or runtime directory: {0}")]
+    #[error("unsafe MARSH_HOME or runtime directory: {}", safe(.0.display()))]
     UnsafeHome(PathBuf),
-    #[error("unsafe daemon token: {0}")]
+    #[error("unsafe daemon token: {}", safe(.0.display()))]
     UnsafeToken(PathBuf),
-    #[error("daemon object not found: {0}")]
+    #[error("daemon object not found: {}", safe(.0))]
     NotFound(String),
-    #[error("invalid daemon state: {0}")]
+    #[error("invalid daemon state: {}", safe(.0))]
     InvalidState(String),
-    #[error("shell cleanup uncertain; authority retained and affected admissions fenced: {0}")]
+    #[error("shell cleanup uncertain; authority retained and affected admissions fenced: {}", safe(.0))]
     ShellCleanupUncertain(String),
     #[error(
-        "shell attachment generation is active; close its controller and wait for cleanup: {0}"
+        "shell attachment generation is active; close its controller and wait for cleanup: {}",
+        safe(.0)
     )]
     ShellAttachmentBusy(String),
     #[error("shell stdin closed")]
     ShellStdinClosed,
-    #[error("shell attachment transport closed: {0}")]
+    #[error("shell attachment transport closed: {}", safe(.0))]
     ShellInputTransportClosed(String),
-    #[error("shell attachment input write failed; terminal observation still required: {0}")]
+    #[error("shell attachment input write failed; terminal observation still required: {}", safe(.0))]
     ShellInputWriteFailed(io::Error),
     #[error("daemon backend is not configured")]
     BackendUnavailable,
-    #[error("daemon endpoint has stale or inconsistent lifecycle state: {0}")]
+    #[error("daemon endpoint has stale or inconsistent lifecycle state: {}", safe(.0.display()))]
     EndpointInconsistent(PathBuf),
-    #[error("daemon rejected the request: {0}")]
+    #[error("daemon rejected the request: {}", safe(.0))]
     Remote(String),
     /// A process admission refusal: the message is shown as is.
-    #[error("{0}")]
+    #[error("{}", safe(.0))]
     Refused(String),
     /// The daemon went away after it accepted the job or shell: the end of
     /// that job (and its children's) is unknown and nothing replays it.
-    #[error("job uncertain: lost the daemon ({0}); see `marsh jobs`")]
+    #[error("job uncertain: lost the daemon ({}); see `marsh jobs`", safe(.0))]
     JobUncertain(String),
-    #[error("{0}")]
+    #[error("{}", safe(.0))]
     Publication(PublicationOutcome),
     #[error("daemon frame is too large: {0} bytes")]
     FrameTooLarge(usize),
-    #[error("failed to obtain daemon authentication randomness: {0}")]
+    #[error("failed to obtain daemon authentication randomness: {}", safe(.0))]
     Random(String),
-    #[error("failed to start the resident daemon: {0}")]
+    #[error("failed to start the resident daemon: {}", safe(.0))]
     Spawn(io::Error),
-    #[error(transparent)]
+    #[error("{}", safe(.0))]
     StartupFailed(StartupFailure),
-    #[error("resident daemon did not become ready within 30 seconds: {0}")]
+    #[error("resident daemon did not become ready within 30 seconds: {}", safe(.0.display()))]
     StartupTimeout(PathBuf),
-    #[error("daemon I/O failed: {0}")]
+    #[error("daemon I/O failed: {}", safe(.0))]
     Io(#[from] io::Error),
-    #[error("daemon protocol failed: {0}")]
+    #[error("daemon protocol failed: {}", safe(.0))]
     Json(#[from] serde_json::Error),
 }
 

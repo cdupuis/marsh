@@ -449,7 +449,7 @@ fn a_failed_map_write_leaves_memory_as_it_was() {
 /// of the directory sync after it must not roll memory back to the old map.
 #[test]
 fn a_directory_sync_failure_after_the_rename_keeps_memory_equal_to_the_disk() {
-    use crate::vm_ownership::{DIRECTORY_SYNCS, FAIL_DIRECTORY_SYNC};
+    use crate::vm_ownership::{DIRECTORY_SYNCS, FailDirectorySync};
     let control = scratch();
     let map = control.path().join("vm-ownership.json");
     let ownership = VmOwnership::persisted(map.clone()).unwrap();
@@ -460,12 +460,12 @@ fn a_directory_sync_failure_after_the_rename_keeps_memory_equal_to_the_disk() {
     assert_eq!(DIRECTORY_SYNCS.with(std::cell::Cell::get), before + 2);
     let intent = ownership.assign(VmPurpose::Kit, "kit-b").unwrap();
 
-    FAIL_DIRECTORY_SYNC.with(|fail| fail.set(true));
+    let fail = FailDirectorySync::in_dir(control.path());
     let forgotten = ownership.forget(&recorded);
     let adopted = ownership.record(&intent, "uuid-b");
     let fresh = ownership.assign(VmPurpose::Kit, "kit-c");
     let retired = ownership.mark_retired(&intent);
-    FAIL_DIRECTORY_SYNC.with(|fail| fail.set(false));
+    drop(fail);
 
     assert!(forgotten.is_err() && adopted.is_err() && fresh.is_err() && retired.is_err());
     let reloaded = VmOwnership::persisted(map).unwrap();
@@ -498,18 +498,18 @@ fn the_map_can_be_written_under_a_bare_relative_file_name() {
 /// hand out ownership (a name to create under) until a write succeeds.
 #[test]
 fn a_retry_after_a_failed_directory_sync_does_not_take_the_map_for_durable() {
-    use crate::vm_ownership::FAIL_DIRECTORY_SYNC;
+    use crate::vm_ownership::FailDirectorySync;
     let control = scratch();
     let map = control.path().join("vm-ownership.json");
     let ownership = VmOwnership::persisted(map.clone()).unwrap();
-    FAIL_DIRECTORY_SYNC.with(|fail| fail.set(true));
+    let fail = FailDirectorySync::in_dir(control.path());
     assert!(ownership.assign(VmPurpose::Kit, "kit-a").is_err());
     // The intent is in memory and on disk, but not known durable: asking
     // again fails while the sync still fails, instead of answering from memory.
     assert!(ownership.assign(VmPurpose::Kit, "kit-a").is_err());
     let name = ownership.lookup(VmPurpose::Kit, "kit-a").unwrap();
     assert!(ownership.record(&name, "uuid-a").is_err());
-    FAIL_DIRECTORY_SYNC.with(|fail| fail.set(false));
+    drop(fail);
 
     assert_eq!(ownership.assign(VmPurpose::Kit, "kit-a").unwrap(), name);
     ownership.record(&name, "uuid-a").unwrap();

@@ -195,11 +195,45 @@ pub(crate) struct VmOwnership {
     undurable: AtomicBool,
 }
 
+/// Directories whose syncs fail (tests). Keyed by directory, so a test fails only
+/// its own temp directory's map, on whichever thread syncs it (a create may run
+/// on a scoped thread), and tests running side by side in one process do not
+/// disturb each other.
+#[cfg(test)]
+static FAILING_SYNC_DIRECTORIES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// While alive, every directory sync of `directory` fails. Dropped on a panic
+/// too, so a failing test cannot leave the failpoint set.
+#[cfg(test)]
+pub(crate) struct FailDirectorySync(PathBuf);
+
+#[cfg(test)]
+impl FailDirectorySync {
+    pub(crate) fn in_dir(directory: &Path) -> Self {
+        FAILING_SYNC_DIRECTORIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(directory.to_owned());
+        Self(directory.to_owned())
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailDirectorySync {
+    fn drop(&mut self) {
+        let mut directories = FAILING_SYNC_DIRECTORIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = directories.iter().position(|d| d == &self.0) {
+            directories.remove(index);
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Directory syncs attempted on this thread, and whether to fail them.
     pub(crate) static DIRECTORY_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    pub(crate) static FAIL_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Fail every directory sync once this many have been attempted.
     pub(crate) static FAIL_SYNCS_FROM: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
@@ -209,7 +243,11 @@ fn sync_directory(parent: &Path) -> Result<(), SbxError> {
     {
         DIRECTORY_SYNCS.with(|count| count.set(count.get() + 1));
         let attempted = DIRECTORY_SYNCS.with(std::cell::Cell::get);
-        if FAIL_DIRECTORY_SYNC.with(std::cell::Cell::get)
+        if FAILING_SYNC_DIRECTORIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|failing| failing == parent)
             || FAIL_SYNCS_FROM
                 .with(std::cell::Cell::get)
                 .is_some_and(|from| attempted >= from)

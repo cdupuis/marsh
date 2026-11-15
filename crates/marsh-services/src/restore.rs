@@ -2876,6 +2876,209 @@ mod linux {
             Err("the kernel enforces only part of the confinement".into())
         }
     }
+    #[cfg(test)]
+    mod install_tests {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        struct NoEndpoint;
+
+        impl DockerEndpoint for NoEndpoint {
+            fn serve(&self, _authority: Authority, _stream: std::os::unix::net::UnixStream) {}
+        }
+
+        struct Fixture {
+            root: PathBuf,
+            restorer: Restorer,
+            snapshot: OwnedFd,
+        }
+
+        fn scratch(name: &str) -> PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("restore-install-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// A pool with a snapshot `snap` whose volume `data` holds three
+        /// entries, and an engine volume `vol` whose `_data` holds `old`.
+        fn fixture(name: &str) -> Fixture {
+            let root = scratch(name);
+            let pool = root.join("pool");
+            let volume = pool.join(fsops::DATA_ROOT).join("volumes/vol");
+            std::fs::create_dir_all(volume.join("_data")).unwrap();
+            std::fs::write(volume.join("_data/old"), b"old").unwrap();
+            let source = pool.join("snapshots/snap/data");
+            std::fs::create_dir_all(source.join("a")).unwrap();
+            std::fs::write(source.join("a/b"), b"nested").unwrap();
+            std::fs::write(source.join("top"), b"top").unwrap();
+            symlink("/etc/passwd", source.join("link")).unwrap();
+            let restorer = Restorer::new(
+                &pool,
+                Engine::new(root.join("engine.sock")),
+                Arc::new(ScopeLocks::default()),
+                Arc::new(NoEndpoint),
+                RestoreConfig {
+                    workers: 2,
+                    run_root: root.join("run"),
+                    ..RestoreConfig::default()
+                },
+            )
+            .unwrap();
+            let snapshot = fsops::open_dir_by_path(&pool.join("snapshots/snap")).unwrap();
+            Fixture {
+                root,
+                restorer,
+                snapshot,
+            }
+        }
+
+        impl Fixture {
+            fn volume(&self, name: &str) -> PathBuf {
+                self.root
+                    .join("pool")
+                    .join(fsops::DATA_ROOT)
+                    .join("volumes")
+                    .join(name)
+            }
+
+            fn install(&self, jobs: &[(&str, VolumeSource, u64)]) -> Vec<Option<String>> {
+                let jobs: Vec<_> = jobs
+                    .iter()
+                    .map(|(name, source, expected)| {
+                        ((*name).to_owned(), source.clone_for_test(), *expected)
+                    })
+                    .collect();
+                self.restorer.install_with(&self.snapshot, &jobs, false)
+            }
+
+            fn names(dir: &Path) -> Vec<String> {
+                let mut names: Vec<String> = std::fs::read_dir(dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .collect();
+                names.sort();
+                names
+            }
+        }
+
+        impl VolumeSource {
+            fn clone_for_test(&self) -> Self {
+                match self {
+                    Self::Snapshot(id) => Self::Snapshot(id.clone()),
+                    Self::Live(name) => Self::Live(name.clone()),
+                }
+            }
+        }
+
+        fn snap() -> VolumeSource {
+            VolumeSource::Snapshot("data".into())
+        }
+
+        /// The snapshot's data replaces the new volume's `_data` in one swap,
+        /// links stay links, and no staging directory is left behind.
+        #[test]
+        fn install_swaps_the_snapshot_data_in_and_leaves_no_staging() {
+            let f = fixture("swap");
+            let outcome = f.install(&[("vol", snap(), 3)]);
+            assert_eq!(outcome, [None]);
+            let data = f.volume("vol").join("_data");
+            assert_eq!(std::fs::read(data.join("a/b")).unwrap(), b"nested");
+            assert_eq!(std::fs::read(data.join("top")).unwrap(), b"top");
+            assert_eq!(
+                std::fs::read_link(data.join("link")).unwrap(),
+                Path::new("/etc/passwd")
+            );
+            assert!(!data.join("old").exists(), "the empty volume's data stayed");
+            assert_eq!(Fixture::names(&f.volume("vol")), ["_data"]);
+            std::fs::remove_dir_all(&f.root).unwrap();
+        }
+
+        /// A copy with fewer entries than the snapshot recorded is a failure
+        /// that names the counts, and the volume is exactly as it was.
+        #[test]
+        fn install_refuses_a_short_copy_and_keeps_the_volume() {
+            let f = fixture("short");
+            let outcome = f.install(&[("vol", snap(), 99)]);
+            let why = outcome[0].as_deref().expect("a failure");
+            assert!(why.contains("3 of 99 entries"), "{why}");
+            assert_eq!(Fixture::names(&f.volume("vol")), ["_data"]);
+            assert_eq!(
+                std::fs::read(f.volume("vol").join("_data/old")).unwrap(),
+                b"old"
+            );
+            std::fs::remove_dir_all(&f.root).unwrap();
+        }
+
+        /// A snapshot directory replaced by a link to elsewhere is never read.
+        #[test]
+        fn install_never_reads_a_snapshot_directory_that_is_a_link() {
+            let f = fixture("srclink");
+            let outside = f.root.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("secret"), b"secret").unwrap();
+            let snapshots = f.root.join("pool/snapshots/snap");
+            symlink(&outside, snapshots.join("swapped")).unwrap();
+            let outcome = f.install(&[("vol", VolumeSource::Snapshot("swapped".into()), 1)]);
+            let why = outcome[0].as_deref().expect("a failure");
+            assert!(why.contains("could not be prepared"), "{why}");
+            assert_eq!(Fixture::names(&f.volume("vol")), ["_data"]);
+            assert!(!f.volume("vol").join("_data/secret").exists());
+            std::fs::remove_dir_all(&f.root).unwrap();
+        }
+
+        /// An engine volume directory replaced by a link is never written into.
+        #[test]
+        fn install_never_writes_through_a_volume_directory_that_is_a_link() {
+            let f = fixture("dstlink");
+            let outside = f.root.join("outside");
+            std::fs::create_dir_all(outside.join("_data")).unwrap();
+            let volumes = f.root.join("pool").join(fsops::DATA_ROOT).join("volumes");
+            symlink(&outside, volumes.join("hijacked")).unwrap();
+            let outcome = f.install(&[("hijacked", snap(), 3)]);
+            assert!(outcome[0].is_some(), "{outcome:?}");
+            assert_eq!(Fixture::names(&outside), ["_data"]);
+            assert_eq!(Fixture::names(&outside.join("_data")).len(), 0);
+            std::fs::remove_dir_all(&f.root).unwrap();
+        }
+
+        /// Volumes are installed and reported one by one: a failure in one
+        /// does not stop or spoil the other.
+        #[test]
+        fn install_reports_each_volume_on_its_own() {
+            let f = fixture("each");
+            std::fs::create_dir_all(f.volume("second/_data")).unwrap();
+            let outcome = f.install(&[("vol", snap(), 3), ("second", snap(), 7)]);
+            assert_eq!(outcome[0], None);
+            assert!(outcome[1].as_deref().unwrap().contains("3 of 7"));
+            assert!(f.volume("vol").join("_data/top").exists());
+            assert_eq!(Fixture::names(&f.volume("second")), ["_data"]);
+            assert_eq!(Fixture::names(&f.volume("second").join("_data")).len(), 0);
+            std::fs::remove_dir_all(&f.root).unwrap();
+        }
+
+        /// The production path (reflink clones): where the filesystem cannot
+        /// reflink the install fails, and where it can it succeeds. Either way
+        /// the volume is whole: the snapshot's data, or exactly what it was.
+        #[test]
+        fn the_production_install_never_leaves_a_half_installed_volume() {
+            let f = fixture("production");
+            let jobs = vec![("vol".to_owned(), snap(), 3_u64)];
+            let outcome = f.restorer.install(&f.snapshot, &jobs);
+            let data = f.volume("vol").join("_data");
+            match &outcome[0] {
+                None => assert_eq!(std::fs::read(data.join("top")).unwrap(), b"top"),
+                Some(why) => {
+                    assert!(why.contains("not installed"), "{why}");
+                    assert_eq!(std::fs::read(data.join("old")).unwrap(), b"old");
+                    assert!(!data.join("top").exists());
+                }
+            }
+            assert_eq!(Fixture::names(&f.volume("vol")), ["_data"]);
+            std::fs::remove_dir_all(&f.root).unwrap();
+        }
+    }
 }
 
 #[cfg(test)]

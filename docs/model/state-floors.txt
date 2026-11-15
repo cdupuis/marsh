@@ -1,0 +1,43 @@
+# The fewest distinct states each positive config (Module.cfg, Module_*_pass.cfg) must
+# reach. check.sh fails a positive config whose TLC run finds fewer, and one with no
+# line here. This is not an expected count: it is half of the count measured on
+# 2026-11-14 (two significant digits), so an edit that merely changes the model's size
+# passes, and one that leaves a handful of reachable states (a guard that is always
+# false, a bound set to 0, a typo in an action's name) fails instead of passing vacuously.
+# After a deliberate shrink, lower the line and say why in the commit message.
+#
+# Measured with TLC, the pinned tools jar, except two: Workspace_depth3_pass.cfg is half of the
+# weekly model.yml run of 2026-11-08, and ServicesSnapshots.cfg is UNMEASURED (the README's
+# 69.5 M may be generated, not distinct states): its floor is deliberately low, under the
+# 184,513 distinct states of its smaller liveness bound. Measure it (about 14 min) and raise it.
+# Format: CONFIG MINIMUM-DISTINCT-STATES
+CloudOwnership.cfg 6900
+CloudOwnership_concurrent_pass.cfg 5300000
+Grants.cfg 9300
+KitSwitch.cfg 10000
+Ownership.cfg 51
+Pins.cfg 560
+Placement.cfg 1200000
+Placement_detach_pass.cfg 2100000
+Placement_nested_pass.cfg 64000
+Placement_partial_pass.cfg 450000
+Process.cfg 2200000
+Process_caps_pass.cfg 9500000
+Process_kits_pass.cfg 8500000
+Process_kitvms_pass.cfg 7200000
+Process_limits_pass.cfg 240000
+Process_live_pass.cfg 920000
+Process_rate_pass.cfg 1700000
+Sbxenv.cfg 6300
+ServicesLanes.cfg 830
+ServicesLanes_live_pass.cfg 830
+ServicesReap.cfg 270
+ServicesSnapshots.cfg 100000
+ServicesSnapshots_live_pass.cfg 92000
+ServicesVm.cfg 3100
+Worker.cfg 550000
+Workspace.cfg 11000000
+Workspace_depth3_pass.cfg 110000000
+Workspace_lanes_pass.cfg 82000
+Workspace_live_pass.cfg 200000
+Workspace_restart_pass.cfg 10000

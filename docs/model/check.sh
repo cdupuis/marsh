@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Run TLC on every config. Positive configs (Module.cfg, Module_*_pass.cfg) must pass; each
 # negative control (Module_<Bug>.cfg) must fail with its expected invariant.
-# Exits nonzero on any mismatch. Runs TLC in Docker by default; TLC_RUNNER=java
+# Exits nonzero on any mismatch. A positive config must also reach at least the
+# number of distinct states state-floors.txt records for it (see there), so a
+# model edit that leaves a handful of reachable states cannot pass vacuously.
+# Runs TLC in Docker by default; TLC_RUNNER=java
 # runs a local `java` instead (CI). The TLA+ jar lives outside the repository
 # and is never committed.
+# TLC runs with -deadlock (deadlock checking off): the models bound their
+# environment with counters, so runs end where no action is enabled, which TLC
+# cannot tell from a stuck state. docs/model/README.md ("What a pass means")
+# lists which configs do reach such states.
 #
 #   check.sh [--quick | --huge | --no-huge] [--list] [--cores N] [--workers N] [CONFIG...]
 #
@@ -24,7 +31,7 @@
 #   --huge      only the huge configs   --no-huge   everything except them (CI shards)
 #   --list      print the selected configs, with workers, and exit
 #   --cores N   core budget (TLC_CORES; default min(CPUs of the runner, 8))
-#   TLC_CACHE=DIR  skip a config whose spec, config, jar and this script are byte-identical to
+#   TLC_CACHE=DIR  skip a config whose spec, config, floors, jar and this script are byte-identical to
 #               one that already gave its expected verdict (CI and make test keep DIR between
 #               runs; the release run `make regress` does not set it)
 #   --workers N TLC workers per config (TLC_WORKERS; default 1, 2 for hinted, half the
@@ -47,7 +54,7 @@ if [ "${1:-}" = --one ]; then
   # TLC_CACHE: a config whose spec, config, TLA+ tools jar and this script are
   # byte-identical to one that already gave its expected verdict is not re-run.
   if [ -n "${TLC_CACHE:-}" ]; then
-    key=$( { echo "$TLC_JAR_SHA"; cat "$module" "$cfg" "$SELF"; } | sha256)
+    key=$( { echo "$TLC_JAR_SHA"; cat "$module" "$cfg" "$SELF"; awk -v c="$cfg" '$1 == c' state-floors.txt; } | sha256)
     if [ -f "$TLC_CACHE/$key" ]; then
       printf '%s cached\n' "$(cat "$TLC_CACHE/$key")"; echo ok >"$OUT/$base.verdict"; exit 0
     fi
@@ -68,10 +75,23 @@ if [ "${1:-}" = --one ]; then
       -metadir "/tmp/tlc-$base" -config "$cfg" "$module" >"$log" 2>&1
   fi
   rc=$?; secs=$(( $(date +%s) - start ))
-  states=$(grep -Eo '[0-9,]+ distinct states found' "$log" | tail -1 | cut -d' ' -f1)
+  states=$(grep -Eo '(^|[^-0-9,])[0-9,]+ distinct states found' "$log" | tail -1 | sed 's/^[^0-9]//' | cut -d' ' -f1)
   if [ "$base" = "${base%%_*}" ] || [ "${base%_pass}" != "$base" ]; then
     expected="pass"
     if [ $rc -eq 0 ] && grep -q "No error has been found" "$log"; then verdict=ok; else verdict=FAIL; fi
+    # The floor: fewer distinct states than recorded means the model shrank.
+    # Anything but exactly one floor and one count of at most 15 digits fails.
+    floor=$(awk -v c="$cfg" '$1 == c { print $2 }' state-floors.txt)
+    count=$(echo "${states:-}" | tr -d ,)
+    if [ "$verdict" = ok ]; then
+      if [ -z "$floor" ] || [ -z "$count" ] || [ "${#floor}" -gt 15 ] || [ "${#count}" -gt 15 ]; then bad=1
+      else case "$floor$count" in *[!0-9]*) bad=1 ;; *) bad= ;; esac; fi
+      if [ -n "$bad" ]; then
+        verdict=FAIL; echo "check.sh: $cfg: floor '${floor}' or state count '${count}' is missing, repeated or not a number of at most 15 digits (state-floors.txt)" >>"$log"
+      elif [ "$count" -lt "$floor" ]; then
+        verdict=FAIL; echo "check.sh: $cfg reached $count distinct states, below the floor $floor in state-floors.txt" >>"$log"
+      fi
+    fi
   else
     expected=$(awk '/^(INVARIANTS|PROPERTIES)/{getline; print $1; exit}' "$cfg")
     if grep -q '^INVARIANTS' "$cfg"; then pat="Invariant $expected is violated"
@@ -103,6 +123,15 @@ while [ $# -gt 0 ]; do
   shift
 done
 case "$workers" in ''|auto) workers= ;; *[!0-9]*) echo "check.sh: --workers must be a number or auto" >&2; exit 2 ;; esac
+floors_seen=" "
+while read -r floor_cfg floor_min floor_rest || [ -n "$floor_cfg" ]; do # a bad line fails every run; `read` fails on an unterminated last line, which is still checked
+  case "$floor_cfg" in ''|'#'*) continue ;; esac
+  [ -f "$floor_cfg" ] || { echo "check.sh: state-floors.txt names $floor_cfg, which does not exist" >&2; exit 2; }
+  case "$floors_seen" in *" $floor_cfg "*) echo "check.sh: state-floors.txt has $floor_cfg twice" >&2; exit 2 ;; esac
+  floors_seen="$floors_seen$floor_cfg "
+  case "$floor_min" in ''|*[!0-9]*|0*|????????????????*) echo "check.sh: state-floors.txt: bad floor for $floor_cfg (1 to 15 digits, no leading zero)" >&2; exit 2 ;; esac
+  [ -z "$floor_rest" ] || { echo "check.sh: state-floors.txt: extra text on the line for $floor_cfg" >&2; exit 2; }
+done <state-floors.txt
 [ "$list" = 1 ] || [ -f "$JAR" ] || { echo "missing $JAR (set TLA2TOOLS_JAR)" >&2; exit 2; }
 [ -z "${TLC_CACHE:-}" ] || { TLC_JAR_SHA=$(sha256 <"$JAR"); export TLC_CACHE TLC_JAR_SHA; }
 

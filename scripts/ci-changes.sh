@@ -23,11 +23,12 @@ host=$code
 # Tooling tests exercise publisher, acceptance and release scripts without Rust.
 # docs/model/README.md is here too: tests/release/test_model_locations.py checks the
 # README's code-location table against the code, so a code change runs it
-# (through `code`) and so does an edit to the table.
-tools="^(scripts/|tests/|evals/|kits/|packaging/|docs/model/README\\.md\$|Makefile\$|\\.github/)|$code"
+# (through `code`) and so does an edit to the table; test_model_floors.py
+# tests check.sh's state floors, so an edit of check.sh or the floors runs it.
+tools="^(scripts/|tests/|evals/|kits/|packaging/|docs/model/(README\\.md|check\\.sh|state-floors\\.txt)\$|Makefile\$|\\.github/)|$code"
 # Markdown in docs/model is documentation, not an input to the model checker
 # (the `tools` lane checks its code-location table).
-model="^(docs/model/.*\\.(tla|cfg)\$|docs/model/check\\.sh\$|Makefile\$|\\.github/workflows/model\\.yml\$)|$ci"
+model="^(docs/model/.*\\.(tla|cfg)\$|docs/model/(check\\.sh|state-floors\\.txt)\$|Makefile\$|\\.github/workflows/model\\.yml\$)|$ci"
 renovate="^(\\.github/renovate|tests/release/renovate-policy\\.mjs\$)|$ci"
 
 has() { printf '%s\n' "$files" | grep -Eq "$1"; }

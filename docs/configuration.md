@@ -98,8 +98,10 @@ the limit, how to raise it, and when to retry
 that runs; it refuses the next launch over it.
 
 There is no limit on the same Kit calling itself: `claude` may hand work to
-`claude`, which hands work to `claude`. Depth and the launch rate stop a
-runaway.
+`claude`, which hands work to `claude`. Depth, fan-out and the launch rate
+bound how fast and how wide such a chain grows; they do not bound how many jobs
+it launches in total over the root's wall time, so watch a long unattended run
+([Known limitations](security.md#known-limitations)).
 
 #### Writable limit
 

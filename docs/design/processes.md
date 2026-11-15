@@ -294,6 +294,15 @@ itself, as the task tool's default (the caller's own agent) does.
 | Rate | `tree-launch-rate`, 60 launches per top-level tree in any rolling 60 s by default; refused child calls count up to 8 per window (`RateBound`, `noRate`) | `rate limit: 60 launches in the last minute; retry in Ns, or raise it with ...` |
 | Wall time | min(the Kit's own limit, `MARSH_JOB_WALL_SECONDS`, and the parent's remaining time); a child needs 1 s left at admission. The receipt's `lineage.deadline_unix_ms` is the effective deadline and `parent_deadline` says it is the parent's. The worker stops the child at it (`exit.cause` `limit:wall: parent deadline`); if the parent's own wall kill lands first, its end cancels the child with the same cause | `fixture refused: deadline: parent job 1a2b3c4d has 420 ms of wall time left (MARSH_JOB_WALL_SECONDS)` |
 
+**No cumulative per-tree budget (accepted).** The rate bounds launches per
+window, not per tree: a tree that stays within it can launch (at the default,
+60 per minute) for as long as its root lives, up to the root's wall time (24 h
+by default), and nothing reserves pool slots for other trees, so such a tree can
+hold the whole `daemon-jobs` pool and every other launch is refused with
+`capacity`. An earlier build had a total launch cap per tree and a same-Kit
+cap of 2; both are gone. The owner accepted this; Ctrl-C at the root caller ends a tree (section 8),
+and the limits above can be lowered (`marsh config limit`).
+
 **No TTY children in v1.** A job's child gets no PTY. A `ProcessRun` whose
 link has a terminal on stdin *or* stdout is refused with `marsh: interactive
 child jobs are not supported yet: NAME has a terminal on stdin or stdout;

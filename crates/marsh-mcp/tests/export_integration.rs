@@ -996,6 +996,30 @@ async fn a_kit_call_starts_the_daemon_without_the_gateways_environment() {
         seen.lines().any(|line| line.starts_with("MARSH_SBX=")),
         "{seen}"
     );
+
+    // The gateway's tuning reaches the daemon, its image overrides do not. A
+    // test cannot set its own environment, so the scenario runs again in a
+    // child process that has them.
+    if std::env::var_os("MARSH_KIT_GATEWAY_TEST_CHILD").is_some() {
+        assert!(
+            seen.lines().any(|line| line == "MARSH_VM_IDLE_SECONDS=60"),
+            "{seen}"
+        );
+        assert!(!seen.contains("MARSH_SHELL_IMAGE"), "{seen}");
+    } else {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_kit_call_starts_the_daemon_without_the_gateways_environment",
+                "--test-threads=1",
+            ])
+            .env("MARSH_KIT_GATEWAY_TEST_CHILD", "1")
+            .env("MARSH_VM_IDLE_SECONDS", "60")
+            .env("MARSH_SHELL_IMAGE", "evil.example/image")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the scenario with tuning set failed");
+    }
 }
 
 #[tokio::test]

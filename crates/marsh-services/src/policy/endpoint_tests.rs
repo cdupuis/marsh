@@ -642,6 +642,23 @@ impl VolumeEngine {
                     answer(s, 200, &format!("{{\"Volumes\":[{}]}}", bodies.join(",")));
                     true
                 }
+                ("POST", "/volumes/create")
+                    if String::from_utf8_lossy(&req.body).contains("\"slowbody\"") =>
+                {
+                    // A valid head, then the body only much later.
+                    let _ = s.write_all(
+                        b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n",
+                    );
+                    std::thread::sleep(Duration::from_millis(1500));
+                    let _ = s.write_all(b"{}");
+                    true
+                }
+                ("POST", "/volumes/create")
+                    if String::from_utf8_lossy(&req.body).contains("\"bigreply\"") =>
+                {
+                    answer(s, 201, &"x".repeat(4 << 20));
+                    true
+                }
                 ("POST", "/volumes/create") => {
                     let held = hold_create.swap(false, Ordering::SeqCst);
                     if held {
@@ -671,6 +688,11 @@ impl VolumeEngine {
                     true
                 }
                 ("DELETE", t) if t.starts_with("/volumes/") => {
+                    if name == "bigdel" {
+                        // An error answer with a large body (the owner keeps the volume).
+                        answer(s, 409, &"x".repeat(4 << 20));
+                        return true;
+                    }
                     if name == "drip" {
                         // A reply that trickles in, a byte at a time.
                         let _ = s.write_all(b"HTTP/1.1 500 X\r\nContent-Length: 1000\r\n\r\n");
@@ -1220,6 +1242,151 @@ fn a_connection_takes_the_volume_lock_again_after_a_volume_create() {
     c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let n = c.read(&mut buf).unwrap();
     assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 201"));
+}
+
+/// A create whose engine body is slow does not hold every workspace's volume
+/// lock past the call deadline: another workspace's create of another name goes
+/// through while the first is still waiting for its body.
+#[test]
+fn a_slow_engine_body_does_not_block_other_workspaces_past_the_deadline() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("slowbodyw4", false, engine.handler(), |cfg| {
+        cfg.up_progress = Duration::from_millis(250);
+    });
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    let started = Instant::now();
+    let slow = {
+        let sock = sock_a.clone();
+        std::thread::spawn(move || {
+            call(
+                &sock,
+                "POST",
+                "/volumes/create",
+                Some(r#"{"Name":"slowbody"}"#),
+            )
+            .0
+        })
+    };
+    std::thread::sleep(Duration::from_millis(80));
+    let (status, _) = call(
+        &sock_b,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"other"}"#),
+    );
+    assert_eq!(status, 201);
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(slow.join().unwrap(), 502);
+}
+
+/// A client that never reads its reply does not hold the volume lock: the
+/// engine's answer is in memory and recorded, and the lock is released before
+/// the reply is written to the client.
+#[test]
+fn a_client_that_does_not_read_its_reply_does_not_block_other_workspaces() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("noreadw4", false, engine.handler(), |_| {});
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    let mut stuck = UnixStream::connect(&sock_a).unwrap();
+    let body = r#"{"Name":"bigreply"}"#;
+    write!(
+        stuck,
+        "POST /volumes/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300)); // the reply is being written
+    let started = Instant::now();
+    let (status, _) = call(
+        &sock_b,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"other"}"#),
+    );
+    assert_eq!(status, 201);
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        h.svc.ledger.has_volume("lane-a", "bigreply"),
+        "recorded before the reply"
+    );
+    drop(stuck);
+}
+
+/// A reader that drains a few hundred bytes at a time (progress inside every
+/// write) cannot stretch the request write past the call deadline.
+#[test]
+fn a_trickling_reader_cannot_stretch_the_request_write_past_the_deadline() {
+    let h = H::new("trickleww4", false, no_custom(), |cfg| {
+        cfg.up_progress = Duration::from_millis(150);
+    });
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut buf = vec![0_u8; 512];
+        while let Ok(n) = server.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+    });
+    let body = vec![b'x'; 64 * 1024];
+    let started = Instant::now();
+    let result = h
+        .svc
+        .exchange(client, "POST", "/volumes/create", Some(&body));
+    let took = started.elapsed();
+    assert!(result.is_err());
+    assert!(took < Duration::from_millis(500), "{took:?}");
+    reader.join().unwrap();
+}
+
+/// The same for a delete: its answer is in memory and recorded, and the lock is
+/// released before a reply that its client does not read is written.
+#[test]
+fn a_client_that_does_not_read_a_delete_reply_does_not_block_other_workspaces() {
+    let engine = VolumeEngine::new();
+    engine.gate.store(true, Ordering::SeqCst);
+    let h = H::new("noreaddelw4", false, engine.handler(), |_| {});
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&lane_b(&h)));
+    assert_eq!(
+        call(
+            &sock_a,
+            "POST",
+            "/volumes/create",
+            Some(r#"{"Name":"bigdel"}"#)
+        )
+        .0,
+        201
+    );
+    let mut stuck = UnixStream::connect(&sock_a).unwrap();
+    stuck
+        .write_all(b"DELETE /volumes/bigdel HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    let (status, _) = call(
+        &sock_b,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"other"}"#),
+    );
+    assert_eq!(status, 201);
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(stuck);
 }
 
 fn raw_exchange(sock: &Path, request: &str, keep_reading_for: Duration) -> String {

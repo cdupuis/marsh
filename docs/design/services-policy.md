@@ -147,6 +147,12 @@ admitted earlier cannot publish its ownership after a later operation or fence,
 and an old delete cannot land after the name was given to another workspace
 (`a_delayed_delete_cannot_remove_a_volume_another_workspace_now_owns`,
 `a_volume_create_holds_the_name_from_admission_to_the_end_of_its_engine_call`).
+The lock is released as soon as the engine's answer is in memory and recorded
+(or the call failed and the fence is set), before the reply is written to the
+client, so a client that reads slowly or not at all blocks nobody
+(`a_client_that_does_not_read_its_reply_does_not_block_other_workspaces`,
+`a_client_that_does_not_read_a_delete_reply_does_not_block_other_workspaces`,
+`a_slow_engine_body_does_not_block_other_workspaces_past_the_deadline`).
 Both are made by the agent itself (`exchange`, one absolute `up_progress`
 deadline), not through the client's connection: a client that leaves does not
 cancel the engine call, ownership is recorded by its result, and a create the
@@ -186,7 +192,9 @@ has accepted. An engine error on a delete (409, 5xx) is an answer: the owner kee
 the volume and the reply is passed on. The reply to a delete is the engine's
 (status line, headers, body; keep-alive when the client asked for it). Every
 engine call the agent makes itself ends at one absolute deadline, `up_progress` (30 s)
-after it started: each write attempt (in pieces of 16 KiB), the response head, every
+after it started: the request write (nonblocking, waiting with `poll` for at most
+the time left: a blocking write renews its own timeout while the reader makes
+progress), the response head, every
 read of the body including chunk-size lines, trailers and the terminal chunk
 (`a_drip_fed_response_head_obeys_the_whole_call_deadline`,
 `a_drip_fed_chunked_reply_obeys_the_whole_call_deadline`,

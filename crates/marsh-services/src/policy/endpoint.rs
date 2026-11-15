@@ -600,23 +600,37 @@ impl Services {
             request.push_str("Content-Length: 0\r\n");
         }
         request.push_str("\r\n");
-        // Every write attempt waits only for what is left of the call.
+        // Nonblocking writes, waiting for the socket with `poll` for at most
+        // what is left of the call: a blocking write keeps renewing its own
+        // timeout while the reader makes progress, so it cannot honor a
+        // deadline.
+        s.set_nonblocking(true)?;
         for mut part in [request.as_bytes(), body.unwrap_or_default()] {
             while !part.is_empty() {
-                if std::time::Instant::now() >= deadline {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
                     return Err(io::ErrorKind::TimedOut.into());
                 }
-                s.set_write_timeout(Some(remaining()))?;
-                // Small writes: one large `write` renews the timeout while it
-                // makes progress, so the deadline is checked between pieces.
-                match s.write(&part[..part.len().min(16 * 1024)]) {
+                match s.write(part) {
                     Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                     Ok(n) => part = &part[n..],
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        let mut fds = [rustix::event::PollFd::new(
+                            &s,
+                            rustix::event::PollFlags::OUT,
+                        )];
+                        let wait = rustix::event::Timespec {
+                            tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
+                            tv_nsec: i64::from(left.subsec_nanos()),
+                        };
+                        rustix::event::poll(&mut fds, Some(&wait)).map_err(io::Error::from)?;
+                    }
                     Err(e) => return Err(e),
                 }
             }
         }
+        s.set_nonblocking(false)?;
         let mut conn = Conn::new(
             s,
             HttpLimits {
@@ -2001,7 +2015,7 @@ fn handle_request(scope: &Arc<Scope>, conn: &mut Conn, head: &Head) -> io::Resul
     // the lock every volume claim takes: nothing admitted earlier can publish
     // after a later operation or fence, and nobody can claim the name while an
     // operation on it is in flight.
-    let _volume_op =
+    let mut volume_op =
         matches!(m.kind, Kind::VolumeCreate | Kind::VolumeDelete).then(|| VolHold::take(svc));
     let mut adm = match admit(&m, head, body, scope.as_ref()) {
         Ok(a) => a,
@@ -2020,10 +2034,24 @@ fn handle_request(scope: &Arc<Scope>, conn: &mut Conn, head: &Head) -> io::Resul
         adm.upgrade = None;
     }
     if let Post::VolumeDelete { name } = adm.post.clone() {
-        return Ok(delete_volume(scope, conn, head, &adm, &name));
+        return Ok(delete_volume(
+            scope,
+            conn,
+            head,
+            &adm,
+            &name,
+            &mut volume_op,
+        ));
     }
     if let Post::VolumeCreate { name, .. } = adm.post.clone() {
-        return Ok(create_volume(scope, conn, head, &adm, name.as_deref()));
+        return Ok(create_volume(
+            scope,
+            conn,
+            head,
+            &adm,
+            name.as_deref(),
+            &mut volume_op,
+        ));
     }
     let result = forward(scope, conn, head, &mut adm, m.kind);
     match result {
@@ -2856,6 +2884,7 @@ fn delete_volume(
     head: &Head,
     adm: &Admitted,
     name: &str,
+    volume_op: &mut Option<VolHold<'_>>,
 ) -> bool {
     let svc = &scope.svc;
     let mut path = adm.path.clone();
@@ -2867,6 +2896,7 @@ fn delete_volume(
     let up = match svc.dial() {
         Ok(up) => up,
         Err(e) => {
+            drop(volume_op.take());
             reply(
                 &mut conn.stream,
                 502,
@@ -2884,6 +2914,9 @@ fn delete_volume(
             if matches!(resp.status, 200 | 204 | 404) {
                 post_actions(scope, &adm.post);
             }
+            // The answer is in memory and recorded: the reply to the client
+            // is relayed without holding the volume lock.
+            drop(volume_op.take());
             let out = if resp.framing == RespFraming::NoBody {
                 Out::Bodiless
             } else {
@@ -2896,6 +2929,7 @@ fn delete_volume(
         }
         Err(e) => {
             svc.fence_volume(name, &scope.auth.workspace);
+            drop(volume_op.take());
             svc.log(&format!("delete of volume {name} did not complete: {e}"));
             reply(
                 &mut conn.stream,
@@ -2921,6 +2955,7 @@ fn create_volume(
     head: &Head,
     adm: &Admitted,
     name: Option<&str>,
+    volume_op: &mut Option<VolHold<'_>>,
 ) -> bool {
     let svc = &scope.svc;
     let keep = !head.close;
@@ -2929,6 +2964,7 @@ fn create_volume(
         Err(e) => {
             // Nothing was sent: give back the reservation.
             undo_post(scope, &adm.post);
+            drop(volume_op.take());
             reply(
                 &mut conn.stream,
                 502,
@@ -2945,7 +2981,11 @@ fn create_volume(
     match svc.exchange(up, "POST", &adm.path, body) {
         Ok((resp, answer)) => {
             let mut out = answer.clone();
-            if let Err(r) = record(scope, &adm.post, resp.status, &answer, &mut out) {
+            let recorded = record(scope, &adm.post, resp.status, &answer, &mut out);
+            // Answered and recorded (or refused): the client's reply is
+            // written without holding the volume lock.
+            drop(volume_op.take());
+            if let Err(r) = recorded {
                 scope_log(&format!("not recorded: {}", r.msg));
                 reply(&mut conn.stream, r.status, &r.msg, false);
                 return keep;
@@ -2965,6 +3005,7 @@ fn create_volume(
             if let Some(name) = name {
                 svc.fence_volume(name, &scope.auth.workspace);
             }
+            drop(volume_op.take());
             svc.log(&format!("create of volume {name:?} did not complete: {e}"));
             reply(
                 &mut conn.stream,

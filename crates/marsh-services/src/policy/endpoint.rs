@@ -1140,9 +1140,15 @@ impl Env for Scope {
                 close: false,
             })?;
         if self.svc.ledger.quarantined() {
-            return Err(Refusal::forbid(
-                "marsh: the ownership records were corrupt, so which paths are protected (.git, .marsh) is unknown: project folders cannot be bound until an operator checks them and removes ledger.quarantine",
-            ));
+            return Err(Refusal::forbid(format!(
+                "marsh: the ownership records were corrupt, so which paths are protected (.git, .marsh) is unknown: project folders cannot be bound until an operator checks them and removes {}",
+                self.svc
+                    .cfg
+                    .paths
+                    .ledger
+                    .with_extension("quarantine")
+                    .display()
+            )));
         }
         self.svc.note_protected(&root);
         let known = self.svc.ledger.protected(&root.given.to_string_lossy());
@@ -1888,6 +1894,15 @@ fn handle_request(scope: &Arc<Scope>, conn: &mut Conn, head: &Head) -> io::Resul
         BodyPolicy::Stream => None,
     };
     let client_body = body.clone();
+    // A volume delete is checked (the caller owns the name), sent to the engine
+    // and recorded under the lock every volume claim takes: a delete that
+    // waited at the engine cannot land after the name was released and given to
+    // another workspace, and nobody can claim the name while it is in flight.
+    let _volume_delete = (m.kind == Kind::VolumeDelete).then(|| {
+        svc.vol_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
     let mut adm = match admit(&m, head, body, scope.as_ref()) {
         Ok(a) => a,
         Err(r) => {

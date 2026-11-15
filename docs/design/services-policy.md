@@ -140,13 +140,21 @@ recorded protected identities (`.git`, `.marsh`) cannot be trusted, so binding a
 project folder is refused (and restore marks pins failed) until an operator
 checks them and removes that file. The serving agent also holds `ledger.serve`
 for its lifetime, so a replacement that starts early waits, then fails, rather
-than answering from a stale view. A ledger that goes corrupt while the agent
+than answering from a stale view. A volume delete is checked, sent and recorded
+under the lock every volume claim takes (`vol_lock`), so an old delete cannot land
+after the name was given to another workspace
+(`a_delayed_delete_cannot_remove_a_volume_another_workspace_now_owns`). Container and
+network deletes are not serialized this way (they address the engine by the ID
+the ledger resolved; not changed or tested here). A ledger that goes corrupt while the agent
 runs is not set aside: the ledger degrades and refuses writes until restart.
 Enforced by the ledger tests `a_change_is_published_in_the_durable_order`,
 `a_corrupt_ledger_quarantines_until_an_operator_clears_it`,
 `only_one_agent_serves_a_ledger_at_a_time`, the endpoint tests
 `a_second_serving_agent_on_one_ledger_is_refused` and
-`a_corrupt_ledger_refuses_project_binds_but_not_other_creates`, and
+`a_corrupt_ledger_refuses_project_binds_but_not_other_creates`, the pin test
+`restore_recreates_no_pin_while_the_ledger_is_quarantined`,
+`a_failed_sync_is_not_acknowledged` (sync errors are honored; no test shows the
+real `fsync` is issued), and
 `two_ledgers_on_one_file_keep_each_others_records`,
 `racing_writers_never_tear_or_lose_the_ledger` and
 `an_unparseable_ledger_is_set_aside_not_deleted`.

@@ -571,10 +571,120 @@ fn a_corrupt_ledger_refuses_project_binds_but_not_other_creates() {
     );
     let (status, reply) = call(&sock, "POST", "/containers/create", Some(&body));
     assert_eq!(status, 403, "{reply}");
-    assert!(reply.contains("ledger.quarantine"), "{reply}");
+    assert!(
+        reply.contains(&h.dir.join("ledger.quarantine").display().to_string()),
+        "the full path of the note: {reply}"
+    );
     assert_eq!(h.engine.created.load(Ordering::SeqCst), 0);
     let (status, reply) = call(&sock, "POST", "/containers/create", Some(CREATE));
     assert_eq!(status, 201, "{reply}");
+}
+
+/// A DELETE admitted while lane A owned `data` must not reach the engine after
+/// lane A's ownership ended and lane B created its own `data`: each volume
+/// operation is checked, sent and recorded under one lock, so the later
+/// requests wait for the first (or are refused) instead of overtaking it.
+/// (An earlier DELETE held at the engine, a second DELETE that releases A's
+/// ownership, B's create; then the first is released.)
+#[test]
+fn a_delayed_delete_cannot_remove_a_volume_another_workspace_now_owns() {
+    let store: Arc<Mutex<std::collections::HashMap<String, String>>> = Arc::default();
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(AtomicBool::new(false));
+    let custom: Handler = {
+        let (store, deletes, gate) = (store.clone(), deletes.clone(), gate.clone());
+        Arc::new(move |req, s| {
+            let name = req.target.trim_start_matches("/volumes/").to_owned();
+            match (req.method.as_str(), req.target.as_str()) {
+                ("POST", "/volumes/create") => {
+                    let body = String::from_utf8_lossy(&req.body).into_owned();
+                    let named = body
+                        .split("\"Name\":\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or("")
+                        .to_owned();
+                    store.lock().unwrap().insert(named, body.clone());
+                    answer(s, 201, &body);
+                    true
+                }
+                ("GET", t) if t.starts_with("/volumes/") => {
+                    match store.lock().unwrap().get(&name).cloned() {
+                        Some(body) => answer(s, 200, &body),
+                        None => answer(s, 404, "{\"message\":\"no such volume\"}"),
+                    }
+                    true
+                }
+                ("DELETE", t) if t.starts_with("/volumes/") => {
+                    if deletes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        while !gate.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    let found = store.lock().unwrap().remove(&name).is_some();
+                    if found {
+                        let _ =
+                            s.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+                    } else {
+                        answer(s, 404, "{\"message\":\"no such volume\"}");
+                    }
+                    true
+                }
+                _ => false,
+            }
+        })
+    };
+    let h = H::new("staledelete", false, custom, |_| {});
+    let auth_b = Authority {
+        project_root: h.dir.clone(),
+        workspace: "lane-b".into(),
+        attempt: "att2".into(),
+    };
+    let (sock_a, sock_b) = (h.serve(&h.auth), h.serve(&auth_b));
+    let (status, body) = call(
+        &sock_a,
+        "POST",
+        "/volumes/create",
+        Some(r#"{"Name":"data"}"#),
+    );
+    assert_eq!(status, 201, "{body}");
+
+    let first = {
+        let sock = sock_a.clone();
+        std::thread::spawn(move || call(&sock, "DELETE", "/volumes/data", None).0)
+    };
+    assert!(wait_for(Duration::from_secs(5), || deletes
+        .load(Ordering::SeqCst)
+        == 1));
+    let second = {
+        let sock = sock_a.clone();
+        std::thread::spawn(move || call(&sock, "DELETE", "/volumes/data", None).0)
+    };
+    let create_b = {
+        let sock = sock_b.clone();
+        std::thread::spawn(move || {
+            call(&sock, "POST", "/volumes/create", Some(r#"{"Name":"data"}"#)).0
+        })
+    };
+    // Neither may overtake the first while it is still at the engine.
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(!second.is_finished(), "a second delete overtook the first");
+    assert!(
+        !create_b.is_finished(),
+        "another workspace claimed the name meanwhile"
+    );
+    gate.store(true, Ordering::SeqCst);
+    assert_eq!(first.join().unwrap(), 204);
+    assert_eq!(
+        second.join().unwrap(),
+        404,
+        "the name was no longer lane A's"
+    );
+    assert_eq!(create_b.join().unwrap(), 201);
+    // Lane B's volume exists, in the engine and in the ledger.
+    assert!(store.lock().unwrap().contains_key("data"));
+    assert!(h.svc.ledger.has_volume("lane-b", "data"));
+    assert!(!h.svc.ledger.has_volume("lane-a", "data"));
 }
 
 // --- freeze ordering ------------------------------------------------------------

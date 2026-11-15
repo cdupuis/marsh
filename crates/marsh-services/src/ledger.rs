@@ -999,6 +999,8 @@ fn step(_what: &'static str) {}
 
 #[cfg(test)]
 thread_local! {
+    /// Make the named sync fail (tests of what a failed sync acknowledges).
+    static FAIL_AT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     static STEPS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -1027,6 +1029,10 @@ fn write_durably(mut file: std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
 /// `fsync`, noted for the tests of the publishing order.
 fn sync(what: &'static str, file: &std::fs::File) -> std::io::Result<()> {
     step(what);
+    #[cfg(test)]
+    if FAIL_AT.with(std::cell::Cell::get) == Some(what) {
+        return Err(std::io::Error::other("injected sync failure"));
+    }
     file.sync_all()
 }
 
@@ -1538,5 +1544,27 @@ mod tests {
         drop(first);
         assert!(Ledger::open_exclusive(&path, wait).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A sync that fails is an error, never an acknowledged change: nothing is
+    /// adopted in memory and the ledger is degraded. (This checks that sync
+    /// errors are honored; there is no test that the real `fsync` is issued.)
+    #[test]
+    fn a_failed_sync_is_not_acknowledged() {
+        for failing in ["sync-file", "sync-dir"] {
+            let dir = scratch(failing);
+            let l = Ledger::open(&dir.join("ledger.json")).unwrap();
+            FAIL_AT.with(|f| f.set(Some(failing)));
+            let result = l.add_container("c1", rec("base", "one"));
+            FAIL_AT.with(|f| f.set(None));
+            assert!(result.is_err(), "{failing}");
+            assert!(l.degraded(), "{failing}");
+            assert_eq!(
+                l.find_container("base", "one"),
+                Lookup::Missing,
+                "{failing}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }

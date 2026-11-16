@@ -1736,7 +1736,7 @@ mod tests {
         assert_eq!(
             describe("claude", &["anthropic"], &none),
             "claude: claude-haiku-5-5 (small, haiku), claude-sonnet-5-5 (mid, sonnet), \
-             claude-opus-5-5 (large, opus), claude-fable-5-1 (large, fable)"
+             claude-fable-5-2 (large, fable), claude-opus-5-5 (large, opus)"
         );
         // A multi-provider agent lists only the vendors its Kit reaches, with
         // qualified ids, within the row cap.
@@ -1893,7 +1893,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             models,
-            ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
+            ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-fable-5-2"]
         );
     }
 

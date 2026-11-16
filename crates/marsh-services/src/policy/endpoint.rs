@@ -156,7 +156,7 @@ pub struct Services {
     /// held across one engine inspect (bounded by `up_request`'s 30 s progress
     /// timeout), which serializes tag claims while the engine hangs.
     tag_res: Mutex<TagRes>,
-    /// What `BuildKit` streams may have changed (`bk_watch`); locked after `tag_res`.
+    /// What `BuildKit` streams were reported to change (`bk_watch`); locked after `tag_res`.
     bk: Mutex<bk_watch::Bk>,
     /// Volume names with a delete of unknown outcome, and when it was sent.
     fenced: Mutex<HashMap<String, (String, std::time::Instant)>>,
@@ -1064,7 +1064,6 @@ impl Services {
             }
         }
         let _ = std::fs::remove_dir(self.cfg.paths.socket_root.join(scope));
-        self.lock_bk().forget(scope);
         // Its bind roots' descriptors close once no other workspace uses them.
         self.release_roots(scope);
         self.ledger.forget_scope(scope)
@@ -1085,8 +1084,7 @@ impl Services {
     /// it (`reserve_pull`), a claim of such a name replaces it, and the records
     /// of images the engine no longer has are dropped here before anything is
     /// sent. (A build over `/grpc` is the one writer not seen, and it can overwrite
-    /// a live record too; `bk_watch` puts a protected name back afterwards, but
-    /// not always; see docs.) Every release names the claim (`TagRec::claim`)
+    /// a live record too; `bk_watch` reports a protected name that moved; see docs.) Every release names the claim (`TagRec::claim`)
     /// it saw, so a newer claim of the same name by the scope is never retired by
     /// an older delete or by this one.
     ///
@@ -1290,7 +1288,6 @@ impl Scope {
             kind,
             images,
             claims,
-            accepted: AtomicBool::new(false),
         })
     }
 }
@@ -1383,8 +1380,6 @@ struct ScopeTagHold {
     /// A delete's own records as they were when it was reserved (name and
     /// claim): the engine's answer releases those and no newer claim.
     claims: Vec<(String, u64)>,
-    /// The engine answered 2xx: what the request did to its names stands.
-    accepted: AtomicBool,
 }
 
 impl std::fmt::Debug for ScopeTagHold {
@@ -1399,7 +1394,6 @@ impl std::fmt::Debug for ScopeTagHold {
 
 impl TagCommit for ScopeTagHold {
     fn commit(&self) {
-        self.accepted.store(true, Ordering::SeqCst);
         if self.kind == HoldKind::Delete {
             // The engine removed the names: the owner's records go with them, so
             // none outlives its tag (a name pulled later is the registry's).
@@ -1425,13 +1419,6 @@ impl TagCommit for ScopeTagHold {
 
 impl Drop for ScopeTagHold {
     fn drop(&mut self) {
-        // What the finished request left under the names a stream watches is
-        // what they legitimately are (read while the names are still held).
-        let seen = if self.accepted.load(Ordering::SeqCst) {
-            self.svc.bk_observe(&self.tags)
-        } else {
-            Vec::new()
-        };
         let mut res = self.svc.lock_tags();
         for tag in &self.tags {
             if let Some(held) = res.get_mut(tag)
@@ -1447,7 +1434,6 @@ impl Drop for ScopeTagHold {
                 res.remove(id);
             }
         }
-        self.svc.lock_bk().released(seen);
     }
 }
 

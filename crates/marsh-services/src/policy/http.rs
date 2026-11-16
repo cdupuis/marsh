@@ -727,6 +727,30 @@ pub fn status_text(code: u16) -> &'static str {
     }
 }
 
+/// The start of the body of every reply the filter makes itself, and of none
+/// the engine sends (`{"message":"marsh: <reason>"}`): what tells a lane drop
+/// that a 403, 429, 502 or any other status was the filter's, not the engine's.
+const REFUSAL_PREFIX: &str = "{\"message\":\"marsh: ";
+
+/// The body of a local refusal.
+#[must_use]
+pub fn refusal_body(reason: &str) -> String {
+    let msg = reason
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+    format!(
+        "{{\"message\":{}}}\n",
+        crate::policy::json::Json::Str(format!("marsh: {msg}")).to_string_json()
+    )
+}
+
+/// Whether a reply body is one the filter made (`refusal_body`).
+#[must_use]
+pub fn is_refusal_body(body: &str) -> bool {
+    body.starts_with(REFUSAL_PREFIX)
+}
+
 /// A local refusal. `{"message":"marsh: <reason>"}`.
 pub fn write_refusal<W: Write>(
     w: &mut W,
@@ -734,14 +758,7 @@ pub fn write_refusal<W: Write>(
     reason: &str,
     close: bool,
 ) -> io::Result<()> {
-    let msg = reason
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>();
-    let body = format!(
-        "{{\"message\":{}}}\n",
-        crate::policy::json::Json::Str(format!("marsh: {msg}")).to_string_json()
-    );
+    let body = refusal_body(reason);
     let head = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n",
         status_text(status),
@@ -881,6 +898,23 @@ fn pct_encode(s: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lane drop tells the filter's replies from the engine's by this body.
+    #[test]
+    fn a_refusal_body_is_what_the_cleanup_recognises() {
+        for status in [400, 403, 413, 429, 431, 500, 502, 503] {
+            let mut out = Vec::new();
+            write_refusal(&mut out, status, "too many \"connections\"", true).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            let body = text.split("\r\n\r\n").nth(1).unwrap();
+            assert!(is_refusal_body(body), "{status}: {body}");
+            assert_eq!(body, refusal_body("too many \"connections\""));
+        }
+        assert!(!is_refusal_body(
+            r#"{"message":"conflict: unable to delete"}"#
+        ));
+        assert!(!is_refusal_body(""));
+    }
 
     fn head(raw: &str) -> Result<Head, HttpError> {
         parse_request_head(raw.as_bytes(), &HttpLimits::default())

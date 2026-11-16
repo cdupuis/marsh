@@ -711,7 +711,21 @@ In plain words:
   image by its tag names (`docker rmi name1 name2`), which keeps `-f`. A tag named like the
   start of an image's ID counts as an ID. `docker compose down --rmi` is not affected (it
   never forces, and removes tagged images by name). If the services VM cannot write its records at the moment a tag is
-  made, the tag is left unowned and the next workspace to ask may take it.
+  made, the tag is left unowned and the next workspace to ask may take it. When a lane
+  is closed, cancelled or removed, the tags it created are removed from the engine
+  with its containers and volumes (untag only: an image another tag uses stays). If
+  the engine does not confirm that, the tag stays the lane's and refused to others,
+  and `marshd` repeats the cleanup every few seconds (it prints `dropping lane ...
+  left image tag ...; will retry`). If the engine keeps refusing (a 409, for the last
+  tag of an image another lane's container uses), `marshd` gives up after about a
+  minute and says so; the tag then stays in the engine and, on a pulled image, only
+  `marsh docker rm` removes it. Tags whose ownership records were lost (the ledger
+  was set aside as corrupt) are not removed with a lane and, on a pulled image,
+  cannot be moved or removed by any workspace; only `marsh docker rm` clears them.
+  A tag longer than 255 characters cannot be claimed (the delete route could not name it).
+  Because a normal `docker build -t` is not covered (above), a lane can build over a tag
+  another lane created; closing the first lane then removes that tag from the engine
+  (the second lane's image loses its name; nothing else is touched).
 - **Docker's built-in `bridge` network is refused.** Containers without a
   network join their workspace's own network, so a plain `docker run` in two
   lanes cannot reach each other. Containers in one stack reach each other by

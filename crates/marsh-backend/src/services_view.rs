@@ -359,7 +359,7 @@ fn parse_tag_events(body: &[u8]) -> Vec<Value> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -450,7 +450,7 @@ mod tests {
     /// A real relay (the daemon's side) against a stand-in agent that answers the
     /// docker channels like the real one: the tag events only on the status
     /// authority (the base workspace's reserved attempt), a refusal to anyone else.
-    fn relay_with_agent() -> Relay {
+    pub(crate) fn relay_with_agent() -> Relay {
         use marsh_services::engine::Generation;
         use marsh_services::frame::{
             AgentFrame, CHUNK_BYTES, HostFrame, Inbound, Outbound, PROTOCOL, WINDOW_CHUNKS,

@@ -104,6 +104,10 @@ fn an_existing_vm_that_is_not_provably_ours_is_never_touched() {
                 matches!(&error, SbxError::IncompatibleVm { detail, .. } if detail.contains("not a marsh marker")),
                 "{error}"
             );
+            assert_names_reset(
+                &error,
+                "cannot be reused: its worker marker is not a marsh marker; ",
+            );
         } else {
             assert!(matches!(error, SbxError::ForeignVm(_)), "{error}");
         }
@@ -183,6 +187,17 @@ fn another_kits_marker_on_an_owned_vm_names_the_failed_check() {
         matches!(&error, SbxError::IncompatibleVm { vm, detail } if vm == KIT && detail.contains("worker marker profile")),
         "{error}"
     );
+    assert_names_reset(&error, "cannot be reused: its worker marker profile is ");
+    assert_eq!(model.count("rm"), 0);
+
+    model.with_vm(KIT, |vm| {
+        vm.files.insert(
+            "/var/lib/marsh/worker.json".into(),
+            br#"{"schema":"marsh.worker/v1","profile":"x","basis":"another-basis"}"#.to_vec(),
+        );
+    });
+    let error = adapter.ensure_kit_vm(&kit.spec).unwrap_err();
+    assert_names_reset(&error, "cannot be reused: its worker marker has schema ");
     assert_eq!(model.count("rm"), 0);
 }
 

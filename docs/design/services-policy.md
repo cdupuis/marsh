@@ -285,7 +285,7 @@ Network create takes no options. `docker commit` may only name a repository unde
 schema (the `moby` exporter; local attributes only; no `push`), rebuilt before
 it is forwarded.
 
-**Image tags have an owner, for the REST routes only (DA1-02 is partly fixed).**
+**Image tags have an owner on the REST routes; a BuildKit stream that moves one is detected and reported, never undone (DA1-02 is partly fixed).**
 Every name a REST request would give an image is reserved first, in one spelling
 (`repo:tag`, the default registry and `library/` dropped; a `tag` parameter replaces
 a `:tag` in `repo`): `POST /images/<id>/tag`, each build `t`, each name of a
@@ -377,8 +377,9 @@ has is checked.
     ledger): a delete begun before the workspace claimed the same name again, or
     this cleanup, cannot retire the newer record.
     **Gap:** a build over `/grpc` (not filtered, see below) can put an image under
-    a name without any of these seeing it, and that name's record can be one that
-    went stale or a live one of another lane (lane A `docker tag x N`, lane B
+    a name without any of these seeing it. The detection below reports a protected
+    name that moved and changes nothing, so a record can still be a live one of another
+    lane (lane A `docker tag x N`, lane B
     `docker build -t N`): closing A would then untag B's image. The damage is a
     rebuildable tag, never a container, volume or data. Storing the source image ID
     at claim time and deleting only a name still on it was considered and not done:
@@ -444,13 +445,82 @@ has is checked.
     `a_late_confirmation_of_the_cleanup_reports_a_newer_claim`, `a_lost_engine_reply_is_not_counted_as_a_refusal`,
     `a_late_rmi_answer_keeps_the_same_workspaces_newer_claim`, `pulling_over_your_own_stale_record_releases_it`,
     `dropping_a_workspace_untags_its_tags_after_its_objects` (Linux).
-- **Not covered.** The default `docker build -t` and `docker buildx build -t` send no
+- **A BuildKit stream is detected and reported, never undone** (DA1-02, DA1-04;
+  `bk_watch.rs`). The default `docker build -t` and `docker buildx build -t` send no
   `POST /build`: they use `/grpc` and `/session` only (recorded e3 traffic,
-  `e3/corpus/cli.jsonl`), and the tag names are inside the opaque BuildKit solve.
-  Until `/grpc` is gated (DA1-04), a lane can still build over another workspace's
-  tag that way. A REST `/build` (the legacy builder, `DOCKER_BUILDKIT=0`, or a
-  hand-made call) is covered. A scope can also create a name nobody has yet and
-  build it first (the rule above).
+  `e3/corpus/cli.jsonl`), and the tag names are inside the opaque BuildKit solve,
+  which is not decoded (no HTTP/2 or protobuf reader). A REST `/build` (the legacy
+  builder, `DOCKER_BUILDKIT=0`, or a hand-made call) is covered by the rules above.
+  Without reading that traffic a tag that moved cannot be tied to the stream (it may
+  be the tag's owner's own build or request), so an earlier design that put the tag
+  back was dropped: a wrong restore, one that undoes a legitimate change of the owner,
+  is worse than the gap. The agent only reports:
+  1. **A stream begins** (`/grpc` or `/session` after the engine's 101, before any
+     byte is relayed). The stream's window opens first: it counts every REST request
+     that holds a name from then on, the names held at that moment, and the
+     workspaces that have a stream running. Then the agent lists the engine's images
+     as itself (`GET /images/json`, its only engine request) and notes the image ID
+     of every tag the stream's workspace may not move: tags the ledger records to
+     another workspace and unrecorded names on an image with a registry digest
+     (`postgres:16`), at most 256, recorded ones first (more is an "unable to check"
+     event). A tag recorded to the stream's workspace, and an unrecorded name on a
+     local image, are its to move. Any REST request during the list counts for every
+     tag, and streams that begin during it are all remembered until it is done (then
+     only owners of noted tags are kept, so a long stream cannot accumulate
+     workspaces). Image names the agent cannot make into a tag (over the 255 characters a tag may
+     have, as a long pulled name can, or not a name the filter accepts, such as an
+     IPv6 registry host) are not watched, and that is an "unable
+     to check" event, not a silent skip; a list that fails is one too, and the stream
+     runs (fail open). No lock is held across the list, but the tag table is locked briefly before
+     it (to read the held names and open the window, as one step): a claim of another
+     workspace that holds it across an engine inspect delays the start of a build by
+     up to the engine's progress timeout (30 s) for each claim ahead of it (claims queue
+     on the table), on top of the list's own time.
+  2. **A stream ends** (the relay's pump returns, whoever closed it). The names are
+     read again and each that has another image, or has gone, is reported once:
+     time, tag, owner (`None`: a pulled name), previous and current image ID, a
+     workspace, and **ambiguous** when the owner had a REST request on the name (any
+     workspace's, for a pulled name), or a stream of its own running at the start or
+     beginning during the window, or when that cannot be told (a request in the
+     engine at the start, or during the first list): the text then says "this may be
+     the owner's own change". Ambiguity errs towards true. The workspace is that of
+     the stream that ended and saw it, which with overlapping streams is not
+     necessarily the one that moved the tag ("workspace X's, or one that ran with
+     it"). With overlapping streams the report carries `overlapped` and says so; the same change
+     seen by streams that ran together is reported once; the
+     same change after the user put the tag back, by a later stream, is reported
+     again.
+  3. **The text is the recovery**: if the previous image still exists,
+     `docker tag <previous id> <name>` run in the owner's workspace puts it back (else
+     rebuild it); a pulled name: `docker pull <name>` fetches the registry's current
+     image, not necessarily the previous one. The text says the change is not undone.
+     Events are a line on the agent's standard error and an entry of
+     `Services::tag_events()` (the last 64). "Unable to check" is kept once per
+     workspace and cause. At the cap the list gives up, in this order, a later report of
+     a tag that has several (the first report of a tag is kept: it holds the owner's
+     original image), then "unable to check" (never the one just added), then the oldest
+     report; a tag's only report goes only when nothing else can. Nothing
+     expires: a report stays until the agent restarts, even after the owner put the tag
+     back, and a repeated "unable to check" for the same workspace and cause is never
+     shown again. Not persisted.
+  Not done: **the overwrite is detected after the stream, not prevented**: while the
+  build runs, and from its export until its stream ends, the other workspace's tag
+  points at the lane's image (a `docker run` of it then runs the lane's image), and
+  nothing puts it back by itself; the report comes when the stream ends and says only
+  "changed", with the ambiguity flag; a tag moved and moved back between the two
+  reads is not seen; a tag a `/grpc` build creates is not recorded to anyone, so
+  another workspace's build may take it, unseen (only tags created over REST, and
+  pulled names, are protected); a lane's own build of a name whose image is also a
+  pulled image's (a no-op `FROM alpine` build) counts as a pulled name and is
+  reported; a pulled name stops being watched once a local image holds it (the watch
+  looks at the registry digests of the image at the stream's start), so a second
+  overwrite of it is silent; a name created after a stream began is not watched by it;
+  a long-lived stream is checked only when it ends, and the two image lists a stream
+  takes (the first before the client gets the engine's 101, so a slow engine delays
+  a build's start) cost time and memory; the cache,
+  `buildx prune`/`du` and history stay as exposed as before (below). Tests: the
+  `bk_watch_tests` module of `endpoint_tests.rs`, each rule above removed once with a
+  test failing.
 - Names are not forced under `<workspace>/` (that would refuse `docker build -t app`
   and Compose's default names); the cost is that two workspaces cannot both build the
   same tag over REST, such as an `image:` plus `build:` stack.
@@ -581,7 +651,9 @@ witness and nothing else; `e3/witness.sh` runs the in-process rows
   recorded e3 traffic (`e3/corpus/cli.jsonl`) shows both use `/grpc` and `/session`
   and send no REST `/build`. Neither is done. This is also the piece DA1-02 (image
   tag ownership) needs: the tag names of a normal build are inside the same stream,
-  so gating `/grpc` is one piece of follow-up work for both. The behaviors above
+  so gating `/grpc` is one piece of follow-up work for both (until then a tag a
+  stream moved is detected and reported, see "A BuildKit stream is detected and
+  reported, never undone" above). The behaviors above
   are BuildKit's and were traced from its API, not run through the filter.
 - **A `/grpc` push is a residual** (DECISIONS 21): a BuildKit solve may export to
   a registry (`type=image,push=true`) inside the opaque gRPC stream, where the
@@ -604,6 +676,6 @@ witness and nothing else; `e3/witness.sh` runs the in-process rows
 - Images are shared by every scope of a project: any scope may run an image
   another created. Only the tag names are owned, and only on the REST routes
   (above); a BuildKit build over `/grpc`, which is what `docker build` and `docker
-  buildx build` use, can still name any tag.
+  buildx build` use, can still name any tag, and is detected afterwards (above).
 - Network and volume names are global in the engine; a name used by another
   scope is refused.

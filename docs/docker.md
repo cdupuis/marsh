@@ -696,10 +696,41 @@ In plain words:
   `postgres:16`, and `docker rmi` refuses to remove one (pulling it again is
   allowed). A build sent over Docker's REST API (the legacy
   builder, `DOCKER_BUILDKIT=0`) is checked the same way. **A normal `docker build -t` or `docker buildx
-  build -t` is not covered**: those talk to BuildKit over the stream described
+  build -t` is not prevented**: those talk to BuildKit over the stream described
   under [Builds and the cache](#builds-and-the-cache), which the filter does not
-  read, so a lane can still build an image under a tag the base runs. Do not rely
-  on tag ownership to keep lanes' images apart until that stream is filtered. Where
+  read, so a lane can still build an image under a tag the base runs (`docker
+  buildx build --load -t base-app:1 .` in a lane moved the base's `base-app:1`).
+  What marsh does instead is **detect it and report it, and never undo it**: when
+  a build's stream ends, the services agent looks again at the tags another workspace
+  created (and the names on pulled images such as `postgres:16`) and reports each one
+  whose image changed or went, on the services agent's standard error (the latest 64
+  are kept in its memory, and lost when the Docker VM restarts). The report names the
+  tag, its owner, the image it had and the one it has, and says what to run to put it
+  back: if the previous image still exists, `docker tag <previous image id> <name>` in
+  the owner's workspace (otherwise rebuild it); for a pulled name, `docker pull <name>`
+  fetches the registry's current image, not necessarily the previous one. With several
+  builds at once the report names a stream that ran with the one that moved the tag, and
+  says so. marsh cannot tell, without reading BuildKit's stream, whether the build moved the tag or its owner did, so it never changes a tag
+  itself; when the owner had a `tag`, a pull or a build of its own meanwhile, the
+  report says "this may be the owner's own change". **What stays open:** it is seen
+  when the build's stream ends, not stopped: from the moment the build moves the tag
+  until you put it back, the base's tag points at the lane's image, and a `docker run
+  base-app:1` in that time runs the lane's image. A tag moved and moved back inside one
+  stream is not seen. A tag a `docker build` in one lane creates is not recorded to that
+  lane (only tags made over the REST API and pulled names are), so another lane's build
+  can still take it without a trace. A build whose image is also a pulled image (a
+  `FROM alpine` with no change) makes its tag count as a pulled name, and a later build
+  of that tag in the same lane is reported. At most 256 protected tags are watched
+  per stream, and a stream whose image list could not be read runs unwatched, with an
+  "unable to check" report (so does an image name that cannot be watched: too long, or not a name the filter accepts). A pulled name stops
+  being watched once a local image holds it, and a name created after a build began is
+  not watched by that build. Each build costs two image lists, the first before the
+  build starts, and can wait for another workspace's tag claim that is in the engine
+  (up to 30 s for each claim ahead of it: they queue). Reports are kept in the agent's
+  memory until it restarts: none expires,
+  also not after you put the tag back, and a repeated "unable to check" for the same
+  workspace and cause is shown once. The BuildKit cache and history are as exposed as
+  before. Where
   it applies, the workspace that creates a tag may move it; a name stays free until
   an image has it (another workspace can create it first), and it is free again
   after `docker rmi`. Two lanes cannot both build `-t app` over the REST API; give

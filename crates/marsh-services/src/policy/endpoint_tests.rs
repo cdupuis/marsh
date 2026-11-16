@@ -4266,3 +4266,6 @@ fn a_drip_fed_chunked_reply_obeys_the_whole_call_deadline() {
         started.elapsed()
     );
 }
+
+#[path = "bk_watch_tests.rs"]
+mod bk_watch_tests;

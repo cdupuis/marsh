@@ -156,6 +156,8 @@ pub struct Services {
     /// held across one engine inspect (bounded by `up_request`'s 30 s progress
     /// timeout), which serializes tag claims while the engine hangs.
     tag_res: Mutex<TagRes>,
+    /// What `BuildKit` streams were reported to change (`bk_watch`); locked after `tag_res`.
+    bk: Mutex<bk_watch::Bk>,
     /// Volume names with a delete of unknown outcome, and when it was sent.
     fenced: Mutex<HashMap<String, (String, std::time::Instant)>>,
     /// The in-flight registry: one entry per create ATTEMPT (so a later
@@ -292,6 +294,7 @@ impl Services {
             gate: Gate::default(),
             vol_lock: Mutex::new(()),
             tag_res: Mutex::new(HashMap::new()),
+            bk: Mutex::default(),
             fenced: Mutex::default(),
             pending_creates: Mutex::default(),
             pin_gate: RwLock::new(()),
@@ -1081,7 +1084,7 @@ impl Services {
     /// it (`reserve_pull`), a claim of such a name replaces it, and the records
     /// of images the engine no longer has are dropped here before anything is
     /// sent. (A build over `/grpc` is the one writer not seen, and it can overwrite
-    /// a live record too; see docs.) Every release names the claim (`TagRec::claim`)
+    /// a live record too; `bk_watch` reports a protected name that moved; see docs.) Every release names the claim (`TagRec::claim`)
     /// it saw, so a newer claim of the same name by the scope is never retired by
     /// an older delete or by this one.
     ///
@@ -1264,6 +1267,7 @@ impl Scope {
         for tag in tags {
             res.entry(tag.clone()).or_default().add(ws, kind);
         }
+        self.svc.lock_bk().touch(tags);
         for (id, k) in &images {
             res.entry(id.clone()).or_default().add(ws, *k);
         }
@@ -2512,6 +2516,9 @@ fn forward(
     if adm.hijack.is_some() {
         let switched = (resp.status == 101 && adm.upgrade.is_some()) || is_raw_stream(&resp);
         if switched {
+            // Before the client can speak: nothing the engine does for the
+            // stream has happened yet.
+            let watch = matches!(kind, Kind::Grpc | Kind::Session).then(|| scope.bk_begin());
             let mut head_out = format!(
                 "HTTP/1.1 {} {}\r\n",
                 resp.status,
@@ -2548,6 +2555,9 @@ fn forward(
             let client = conn.stream.try_clone()?;
             let upstream = upc.stream.try_clone()?;
             pump(scope, client, upstream, &[], &client_left);
+            if let Some(watch) = watch {
+                watch.finish();
+            }
             return Ok(false);
         }
     }
@@ -3471,6 +3481,10 @@ fn pump_blind(
     let _ = u_w.shutdown(Shutdown::Write);
     let _ = t.join();
 }
+
+#[path = "bk_watch.rs"]
+mod bk_watch;
+pub use bk_watch::{TagEvent, TagEventKind};
 
 #[cfg(test)]
 #[path = "endpoint_tests.rs"]

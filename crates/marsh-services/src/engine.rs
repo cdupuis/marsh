@@ -151,7 +151,9 @@ impl EngineConfig {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FailureKind {
-    /// The Docker disk cannot hold the configured pool.
+    /// The Docker disk's free space is below what the configured pool and the
+    /// reserve need (`check_pool_fits`), and nothing else: the daemon removes a
+    /// VM its start just created on this kind alone.
     DiskTooSmall,
     /// The pool image is not the pool this VM created.
     PoolIdentity,
@@ -611,8 +613,7 @@ pub fn check_pool_fits(pool_bytes: u64, available: u64) -> Result<(), String> {
     if available < needed {
         return Err(format!(
             "marsh: the services disk has {} MiB free but a {} MiB pool needs {} MiB \
-             (including a {} MiB reserve); set a larger disk with `marsh config services-disk-size` \
-             (it applies to a new VM: remove this project's Docker VM with `marsh docker rm` first)",
+             (including a {} MiB reserve); set a larger disk with `marsh config services-disk-size`{POOL_FIT_REMOVE_ADVICE}",
             available >> 20,
             pool_bytes >> 20,
             needed >> 20,
@@ -620,6 +621,33 @@ pub fn check_pool_fits(pool_bytes: u64, available: u64) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The last sentence of [`check_pool_fits`]'s message: true for a VM that
+/// already exists, and not for one the daemon has just removed again.
+const POOL_FIT_REMOVE_ADVICE: &str =
+    " (it applies to a new VM: remove this project's Docker VM with `marsh docker rm` first)";
+
+/// `message` (a [`check_pool_fits`] refusal) without its advice to remove the
+/// project's Docker VM first, for a start whose new VM was removed again:
+/// nothing is left to remove.
+#[must_use]
+pub fn without_remove_advice(message: &str) -> String {
+    message
+        .strip_suffix(POOL_FIT_REMOVE_ADVICE)
+        .unwrap_or(message)
+        .to_owned()
+}
+
+/// `fallocate` of the pool failed after the space check passed. That is not
+/// the disk being too small for the pool (it can be a full host disk, or a
+/// filesystem that cannot allocate), so it is not `DiskTooSmall`: the daemon
+/// removes a new VM only for that kind.
+fn pool_allocation_failure(message: &str) -> Failure {
+    failure(
+        FailureKind::Setup,
+        format!("marsh: cannot allocate the pool (disk full?): {message}"),
+    )
 }
 
 fn ensure_pool_image(pool_bytes: u64, breaks: &Breaks) -> Result<(), Failure> {
@@ -659,10 +687,7 @@ fn ensure_pool_image(pool_bytes: u64, breaks: &Breaks) -> Result<(), Failure> {
             &["-l", &pool_bytes.to_string(), &temporary.to_string_lossy()],
         ) {
             let _ = fs::remove_file(&temporary);
-            return Err(failure(
-                FailureKind::DiskTooSmall,
-                format!("marsh: cannot allocate the pool (disk full?): {message}"),
-            ));
+            return Err(pool_allocation_failure(&message));
         }
     }
     let uuid = fs::read_to_string("/proc/sys/kernel/random/uuid")
@@ -1316,6 +1341,40 @@ mod tests {
         assert!(error.contains("marsh config services-disk-size"), "{error}");
         assert!(!error.contains("poolSize"), "{error}");
         assert!(check_pool_fits(4 << 30, 8 << 30).is_ok());
+    }
+
+    /// Only the space check is `DiskTooSmall`: a pool that cannot be allocated
+    /// after it passed is a setup failure, which never gets a new VM removed.
+    #[test]
+    fn a_failed_allocation_is_not_a_disk_too_small_failure() {
+        let failure = pool_allocation_failure("fallocate: No space left on device");
+        assert_eq!(failure.kind, FailureKind::Setup);
+        assert!(
+            failure.message.contains("cannot allocate the pool"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn the_remove_advice_can_be_taken_off_the_refusal_and_only_it() {
+        let error = check_pool_fits(20 << 30, 8 << 30).unwrap_err();
+        assert!(error.contains("marsh docker rm"), "{error}");
+        let trimmed = without_remove_advice(&error);
+        assert!(
+            !trimmed.contains("docker rm") && !trimmed.contains("remove"),
+            "{trimmed}"
+        );
+        assert!(
+            trimmed.ends_with("`marsh config services-disk-size`"),
+            "{trimmed}"
+        );
+        assert!(trimmed.contains("8192 MiB free"), "{trimmed}");
+        // Any other text is left as it is.
+        assert_eq!(
+            without_remove_advice("marsh: something else"),
+            "marsh: something else"
+        );
     }
 
     #[test]

@@ -26,7 +26,8 @@ use crate::StockSbx;
 use crate::vm_text::{CappedLines, DISPLAY_LINE_BYTES, plain_text};
 use marsh_runtime::{CommandOutput, CommandRunner, Invocation};
 use marsh_services::engine::{
-    ENGINE_CONTAINER, EngineEvent, Generation, MARSH_BINARY, POOL_DIR as ENGINE_POOL_DIR,
+    ENGINE_CONTAINER, EngineEvent, FailureKind, Generation, MARSH_BINARY,
+    POOL_DIR as ENGINE_POOL_DIR,
 };
 use marsh_services::firewall::{self, FirewallReport};
 use serde::Deserialize;
@@ -368,6 +369,8 @@ struct Shared {
     diagnostic: Mutex<Option<String>>,
     /// The firewall report of the `ready` that made this generation ready.
     firewall: Mutex<Option<FirewallReport>>,
+    /// The kind the engine gave its `failed` event, when it sent one.
+    failure_kind: Mutex<Option<FailureKind>>,
     relay_boot_engine: bool,
     /// Test break `engine-watch-unbounded`: reasons are kept as the VM wrote them.
     raw_reasons: bool,
@@ -473,6 +476,18 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
+    /// What kind of failure the engine reported (its `failed` event), if it
+    /// reported one. A lost stream, a timeout or a refusal by the daemon has
+    /// none. The engine runs in the VM, so this only says what it claimed.
+    #[must_use]
+    pub fn failure_kind(&self) -> Option<FailureKind> {
+        *self
+            .shared
+            .failure_kind
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[must_use]
     pub fn state(&self) -> EngineState {
         self.shared
@@ -754,6 +769,7 @@ impl ServicesEngine {
             stream: Mutex::new(None),
             diagnostic: Mutex::new(None),
             firewall: Mutex::new(None),
+            failure_kind: Mutex::new(None),
             relay_boot_engine: Breaks(&settings.breaks).active("relay-dial-boot-engine"),
             raw_reasons: Breaks(&settings.breaks).active("engine-watch-unbounded"),
         });
@@ -1395,7 +1411,11 @@ impl ServicesEngine {
                         }
                     }
                 }
-                Some(EngineEvent::Failed { message, .. }) => {
+                Some(EngineEvent::Failed { kind, message }) => {
+                    *shared
+                        .failure_kind
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(kind);
                     reported = Some(message);
                     break;
                 }

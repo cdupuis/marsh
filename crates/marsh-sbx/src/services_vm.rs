@@ -226,8 +226,36 @@ fn valid_disk_size(value: &str) -> bool {
         .is_some_and(|gib| (1..=4096).contains(&gib))
 }
 
+/// The share of a configured Docker disk that is usable once the VM's
+/// filesystem has taken its part, as a percentage: an approximation, set a
+/// little under what stock SBX 0.53 measured (25g gave 22930 MiB, 89.6%; 27g
+/// gave 24843 MiB, 89.9%) so the check refuses what cannot work and is not
+/// meant to promise what can. The engine's own check of the real free space
+/// stays the authority.
+const USABLE_DISK_PERCENT: u64 = 89;
+
+/// The part of a `gibibytes`-GiB Docker disk that is usable, in bytes
+/// ([`USABLE_DISK_PERCENT`]).
+fn usable_disk_bytes(gibibytes: u64) -> u128 {
+    u128::from(gibibytes) * (1 << 30) / 100 * u128::from(USABLE_DISK_PERCENT)
+}
+
+/// The smallest supported disk (1g to 4096g, whole GiB) that can hold
+/// `needed` bytes, by the same arithmetic the check uses; `None` when even
+/// the largest cannot.
+fn least_disk_gibibytes(needed: u128) -> Option<u64> {
+    (1..=4096).find(|&gibibytes| usable_disk_bytes(gibibytes) >= needed)
+}
+
+/// Whether a `gibibytes`-GiB disk holds a pool of `pool_bytes` and the reserve.
+fn disk_holds_pool(gibibytes: u64, pool_bytes: u64) -> bool {
+    usable_disk_bytes(gibibytes)
+        >= u128::from(marsh_services::engine::pool_needed_bytes(pool_bytes))
+}
+
 /// Refuse a new VM whose configured disk cannot hold the engine's pool plus
-/// its reserve: the engine would only fail at start, leaving the VM behind.
+/// its reserve once the filesystem's share is taken off: the engine would only
+/// fail at start, leaving the VM behind.
 fn check_disk_holds_pool(spec: &ServicesVmSpec) -> Result<(), SbxError> {
     let Some(pool_bytes) = spec.pool_bytes else {
         return Ok(());
@@ -237,13 +265,20 @@ fn check_disk_holds_pool(spec: &ServicesVmSpec) -> Result<(), SbxError> {
         .trim_end_matches(['g', 'G'])
         .parse::<u64>()
         .unwrap_or(0);
-    let needed = marsh_services::engine::pool_needed_bytes(pool_bytes);
-    if gibibytes.saturating_mul(1 << 30) >= needed {
+    if disk_holds_pool(gibibytes, pool_bytes) {
         return Ok(());
     }
+    let needed = marsh_services::engine::pool_needed_bytes(pool_bytes);
+    let advice = match least_disk_gibibytes(u128::from(needed)) {
+        Some(least) => format!(
+            "Set a larger disk with `marsh config services-disk-size` (at least {least}g), then run `marsh docker start` again"
+        ),
+        None => "No disk size marsh supports (up to 4096g) is large enough for that pool: lower MARSH_SERVICES_POOL_BYTES".to_owned(),
+    };
     Err(SbxError::HostGrantFence(format!(
-        "the Docker disk is set to {}, which is too small: Docker needs {} MiB for its pool plus a {} MiB reserve ({} MiB in all). Set a larger disk with `marsh config services-disk-size` (for example 40g), then run `marsh docker start` again",
+        "the Docker disk is set to {}, which is too small: about {} MiB of it is usable (the VM's filesystem keeps roughly a tenth) and Docker needs {} MiB for its pool plus a {} MiB reserve ({} MiB in all). {advice}",
         spec.disk_size,
+        usable_disk_bytes(gibibytes) >> 20,
         pool_bytes >> 20,
         marsh_services::engine::DISK_RESERVE_BYTES >> 20,
         needed >> 20,
@@ -1167,6 +1202,59 @@ impl StockSbx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    /// The disk size the message recommends passes the check, and the one
+    /// below it does not: for pools around every boundary, including a byte
+    /// over what a size gives, and the largest the override can name.
+    #[test]
+    fn the_least_size_is_the_least_size_that_passes() {
+        let mut pools = vec![GIB, 3 * GIB, 4 * GIB, 24 * GIB, 100 * GIB, 3000 * GIB];
+        for gibibytes in [5, 6, 28, 29, 100, 4096] {
+            // The pool that exactly fills a size, a byte less and a byte more.
+            let needed = usable_disk_bytes(gibibytes);
+            let pool = u64::try_from(needed).unwrap().saturating_sub(512 << 20);
+            pools.extend([pool.saturating_sub(1), pool, pool + 1]);
+        }
+        // The case the review found: a byte over what 28g gives.
+        pools.push(26_220_775_279);
+        for pool in pools {
+            let needed = u128::from(marsh_services::engine::pool_needed_bytes(pool));
+            match least_disk_gibibytes(needed) {
+                Some(least) => {
+                    assert!(
+                        disk_holds_pool(least, pool),
+                        "{pool}: {least}g does not pass"
+                    );
+                    assert!(
+                        least == 1 || !disk_holds_pool(least - 1, pool),
+                        "{pool}: {}g passes already",
+                        least - 1
+                    );
+                }
+                None => assert!(!disk_holds_pool(4096, pool), "{pool}"),
+            }
+        }
+        // A byte more than 28g gives needs 29g, not 28g again.
+        let pool = u64::try_from(usable_disk_bytes(28)).unwrap() - (512 << 20);
+        assert!(disk_holds_pool(28, pool) && !disk_holds_pool(28, pool + 1));
+        assert_eq!(
+            least_disk_gibibytes(u128::from(marsh_services::engine::pool_needed_bytes(
+                pool + 1
+            ))),
+            Some(29)
+        );
+    }
+
+    /// The largest pool the override can name does not overflow anything: no
+    /// disk is big enough, and nothing panics.
+    #[test]
+    fn the_largest_pool_overflows_nothing() {
+        let needed = u128::from(marsh_services::engine::pool_needed_bytes(u64::MAX));
+        assert_eq!(least_disk_gibibytes(needed), None);
+        assert!(!disk_holds_pool(4096, u64::MAX));
+    }
 
     #[test]
     fn break_names_are_unique_and_off_in_a_build_without_the_feature() {

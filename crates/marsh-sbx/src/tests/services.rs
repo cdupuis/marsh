@@ -315,7 +315,8 @@ fn assert_pool_refusal(error: &SbxError, size: &str) {
     assert!(
         text.contains(&format!("the Docker disk is set to {size}"))
             && text.contains("24576 MiB for its pool plus a 512 MiB reserve (25088 MiB in all)")
-            && text.contains("marsh config services-disk-size"),
+            && text.contains("marsh config services-disk-size")
+            && text.contains("at least 28g"),
         "{text}"
     );
     assert!(
@@ -333,9 +334,9 @@ fn pooled(spec: ServicesVmSpec, pool: Option<u64>) -> ServicesVmSpec {
 
 const POOL: u64 = 24 << 30;
 
-/// A new VM whose configured disk cannot hold the engine's pool and reserve is
-/// refused before a name is recorded or any stock call is made; a disk that
-/// can hold it, or no pool to hold, creates.
+/// A new VM whose configured disk cannot hold the engine's pool and reserve
+/// (after the filesystem's share) is refused before a name is recorded or any
+/// stock call is made; a disk that can hold it, or no pool to hold, creates.
 #[test]
 fn a_disk_too_small_for_the_pool_is_refused_before_a_vm_is_created() {
     let model = StockModel::new();
@@ -343,7 +344,9 @@ fn a_disk_too_small_for_the_pool_is_refused_before_a_vm_is_created() {
     let shell = ShellFixture::new();
     let project = directory(shell.dir.path(), "project");
 
-    for size in ["5g", "24g"] {
+    // 25g to 27g are refused too: the engine measured 22930 MiB free on a 25g
+    // disk and 24843 MiB on 27g, short of the 25088 MiB it needs.
+    for size in ["5g", "24g", "25g", "26g", "27g"] {
         let refused = adapter
             .ensure_services_vm(&pooled(spec(&shell, &project, size), Some(POOL)))
             .unwrap_err();
@@ -352,8 +355,8 @@ fn a_disk_too_small_for_the_pool_is_refused_before_a_vm_is_created() {
         assert_eq!(adapter.recorded_services_vm(&project), None);
     }
 
-    // 25g holds the pool and the reserve; a 5g disk holds a small test pool.
-    for (size, pool) in [("25g", Some(POOL)), ("5g", Some(4_u64 << 30)), ("5g", None)] {
+    // 28g works (measured); a 6g disk holds a small test pool; no pool, no check.
+    for (size, pool) in [("28g", Some(POOL)), ("6g", Some(4_u64 << 30)), ("5g", None)] {
         let model = StockModel::new();
         let adapter = model.adapter();
         let _ = adapter.ensure_services_vm(&pooled(spec(&shell, &project, size), pool));
@@ -415,4 +418,39 @@ fn a_vm_created_again_beside_a_foreign_one_is_checked_against_the_pool() {
     assert_eq!(model.count("create"), 0);
     assert_eq!(model.vm(&name).unwrap().id, IMPOSTOR);
     assert_eq!(adapter.recorded_services_vm(&project), Some(name));
+}
+
+/// The size a refusal recommends is one that passes, also for a pool the
+/// override sets a byte over what a size gives; and a pool no disk can hold
+/// says so instead of overflowing.
+#[test]
+fn the_recommended_disk_size_passes_and_the_largest_pool_is_refused_plainly() {
+    let shell = ShellFixture::new();
+    let project = directory(shell.dir.path(), "project");
+    // A byte over what 28g gives: 29g is needed.
+    let pool = 26_220_775_279_u64;
+    let model = StockModel::new();
+    let refused = model
+        .adapter()
+        .ensure_services_vm(&pooled(spec(&shell, &project, "28g"), Some(pool)))
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("at least 29g"), "{refused}");
+    let model = StockModel::new();
+    let _ = model
+        .adapter()
+        .ensure_services_vm(&pooled(spec(&shell, &project, "29g"), Some(pool)));
+    assert_eq!(model.count("create"), 1, "the recommended size creates");
+    // Nothing can hold the largest pool, and that is said.
+    let model = StockModel::new();
+    let refused = model
+        .adapter()
+        .ensure_services_vm(&pooled(spec(&shell, &project, "4096g"), Some(u64::MAX)))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("4096g") && refused.contains("MARSH_SERVICES_POOL_BYTES"),
+        "{refused}"
+    );
+    assert!(model.calls().is_empty());
 }

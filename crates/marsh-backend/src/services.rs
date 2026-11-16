@@ -486,18 +486,35 @@ impl StockDaemonBackend {
         Ok(canonical)
     }
 
-    /// The project `rm` acts on: the exact folder of an owned VM whose folder
-    /// is gone, else the usual canonical existing directory (so any existing
-    /// folder is accepted as it is for every other request).
+    /// The project `rm` acts on: the exact folder of a project this daemon
+    /// knows (an owned VM, or a setting recorded for it) whose folder is gone,
+    /// else the usual canonical existing directory (so any existing folder is
+    /// accepted as it is for every other request). A gone folder nothing is
+    /// recorded for is refused in plain words.
     fn remove_target(
         &self,
         root: &Path,
         owned: &[(String, String)],
     ) -> Result<PathBuf, DaemonError> {
-        match missing_project_root(root, owned) {
-            Some(gone) => Ok(gone),
-            None => self.services_root(root),
+        let mut recorded = owned.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
+        if let Ok(settings) = self.services_settings() {
+            recorded.extend(settings.projects);
+            recorded.extend(settings.off_projects);
         }
+        if let Some(gone) = missing_project_root(root, &recorded) {
+            return Ok(gone);
+        }
+        if matches!(
+            fs::symlink_metadata(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            return Err(DaemonError::Refused(format!(
+                "marsh: no Docker VM or setting is recorded for {}: its folder is gone, so it \
+                 may be removed already, or spelled differently from `marsh docker status`",
+                root.display()
+            )));
+        }
+        self.services_root(root)
     }
 
     fn services_spec(&self, root: &Path, settings: &Settings) -> ServicesVmSpec {
@@ -851,10 +868,30 @@ impl StockDaemonBackend {
                 root.display()
             );
         }
+        // A folder that is gone and has no VM left is nothing but a stale
+        // entry: its setting goes, and status stops listing it.
+        let folder_gone = matches!(
+            fs::symlink_metadata(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        if folder_gone && let Err(error) = forget_project_settings(&self.config.daemon_home, root) {
+            eprintln!(
+                "marshd: forgetting the Docker setting of {}: {error}",
+                root.display()
+            );
+        }
         let settings = self.services_settings()?;
         let mut document = self.services_project_json(root, &settings, true);
         document["schema"] = json!(SCHEMA);
         document["removed"] = json!(removed);
+        if folder_gone {
+            // The document above tracked the project afresh.
+            self.services
+                .projects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(root);
+        }
         Ok(document)
     }
 
@@ -1573,19 +1610,66 @@ impl StockDaemonBackend {
     }
 }
 
-/// The folder of a services VM this daemon owns whose project is gone from the
-/// Mac (moved or deleted), so `rm --project` can still reach it. Only an exact
-/// recorded key qualifies, and only when the folder is really absent: a folder
-/// that exists, or that cannot be checked, takes the normal path.
-fn missing_project_root(root: &Path, owned: &[(String, String)]) -> Option<PathBuf> {
+/// The folder of a project this daemon knows (a recorded key: an owned
+/// services VM, or a setting) that is gone from the Mac (moved or deleted), so
+/// `rm --project` can still reach it. Only an exact recorded key qualifies, and
+/// only when the folder is really absent: a folder that exists, or that cannot
+/// be checked, takes the normal path.
+fn missing_project_root(root: &Path, recorded: &[String]) -> Option<PathBuf> {
     let key = root.to_str()?;
-    if !owned.iter().any(|(_, recorded)| recorded == key) {
+    if !recorded.iter().any(|recorded| recorded == key) {
         return None;
     }
     match fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(root.to_owned()),
         _ => None,
     }
+}
+
+/// Take `root` out of the project lists of `config.json` (`services_projects`,
+/// `docker_projects_off`), as `marsh config docker` writes them. Returns
+/// whether anything was listed. Written beside the file and renamed over it.
+fn forget_project_settings(scope_root: &Path, root: &Path) -> std::io::Result<bool> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = scope_root.join("config.json");
+    let Some(key) = root.to_str() else {
+        return Ok(false);
+    };
+    let mut document = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Map<String, Value>>(&bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut listed = false;
+    for name in ["services_projects", "docker_projects_off"] {
+        if let Some(Value::Array(roots)) = document.get_mut(name) {
+            let before = roots.len();
+            roots.retain(|entry| entry.as_str() != Some(key));
+            listed |= roots.len() != before;
+        }
+    }
+    if !listed {
+        return Ok(false);
+    }
+    let mut encoded = serde_json::to_vec_pretty(&document)?;
+    encoded.push(b'\n');
+    let temporary = scope_root.join(format!(".config.json.marshd-{}", std::process::id()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map(|()| true)
 }
 
 /// What the project's services containers can reach right now, in one line.
@@ -1937,10 +2021,7 @@ mod tests {
         let present = dir.path().join("present");
         fs::create_dir(&present).unwrap();
         let key = |path: &Path| path.to_str().unwrap().to_owned();
-        let owned = vec![
-            ("marsh-svc-a".to_owned(), key(&gone)),
-            ("marsh-svc-b".to_owned(), key(&present)),
-        ];
+        let owned = vec![key(&gone), key(&present)];
         assert_eq!(missing_project_root(&gone, &owned), Some(gone.clone()));
         // The folder exists: the normal path (canonical, a directory) applies.
         assert_eq!(missing_project_root(&present, &owned), None);
@@ -1958,7 +2039,7 @@ mod tests {
         let file = dir.path().join("file");
         fs::write(&file, "").unwrap();
         let below = file.join("project");
-        let owned = vec![("marsh-svc-c".to_owned(), key(&below))];
+        let owned = vec![key(&below)];
         assert_eq!(missing_project_root(&below, &owned), None);
     }
 
@@ -1986,6 +2067,95 @@ mod tests {
                 .remove_target(&present.join("..").join("moved"), &owned)
                 .is_err()
         );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn config_list(home: &Path, key: &str) -> Vec<String> {
+        let document: Value =
+            serde_json::from_slice(&fs::read(home.join("config.json")).unwrap()).unwrap();
+        document[key]
+            .as_array()
+            .map(|all| {
+                all.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `rm --project FOLDER` for a folder that is gone and has no Docker VM
+    /// (it was removed already, or never started one): it succeeds saying
+    /// nothing was there, forgets the project's setting and its status entry,
+    /// and leaves every other setting alone. A folder nothing is recorded for
+    /// is refused with a clear message, and so is a gone folder once forgotten.
+    #[test]
+    fn rm_of_a_gone_project_without_a_vm_forgets_its_setting_and_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let base = fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let (gone_on, gone_off, here, stranger) = (
+            base.join("moved-on"),
+            base.join("moved-off"),
+            base.join("here"),
+            base.join("never-seen"),
+        );
+        fs::create_dir(&here).unwrap();
+        let key = |path: &Path| path.to_str().unwrap().to_owned();
+        fs::write(
+            home.path().join("config.json"),
+            json!({
+                "docker_default_on": false,
+                "services_projects": [key(&gone_on), key(&here)],
+                "docker_projects_off": [key(&gone_off)],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let remove = |root: &Path| {
+            backend.services_request(ServicesRequest::Remove {
+                root: root.to_owned(),
+            })
+        };
+        let status = || {
+            backend
+                .services_request(ServicesRequest::Status { root: here.clone() })
+                .unwrap()
+        };
+        let listed = |status: &Value, root: &Path| {
+            status["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|project| project["root"] == key(root))
+        };
+
+        // The ordinary case first: a folder that exists keeps its setting.
+        assert_eq!(remove(&here).unwrap()["removed"], false);
+        assert!(config_list(home.path(), "services_projects").contains(&key(&here)));
+
+        assert_eq!(remove(&gone_on).unwrap()["removed"], false);
+        assert_eq!(remove(&gone_off).unwrap()["removed"], false);
+        assert_eq!(config_list(home.path(), "services_projects"), [key(&here)]);
+        assert_eq!(
+            config_list(home.path(), "docker_projects_off"),
+            Vec::<String>::new()
+        );
+        let after = status();
+        assert!(
+            !listed(&after, &gone_on) && !listed(&after, &gone_off),
+            "{after}"
+        );
+        assert_eq!(after["enabled_projects"], json!([key(&here)]));
+
+        for unknown in [&gone_on, &stranger] {
+            let message = remove(unknown).unwrap_err().to_string();
+            assert!(
+                message.contains("no Docker VM or setting is recorded"),
+                "{message}"
+            );
+            assert!(!message.contains("os error"), "{message}");
+        }
         fs::remove_dir_all(&base).unwrap();
     }
 

@@ -593,13 +593,21 @@ fn available_bytes(directory: &str) -> Result<u64, String> {
     Ok(blocks.saturating_mul(size))
 }
 
+/// What a Docker disk must offer for a pool of `pool_bytes`: the pool and the
+/// reserve. The one place the rule lives (the engine's check and the daemon's
+/// check before a VM is created both use it).
+#[must_use]
+pub fn pool_needed_bytes(pool_bytes: u64) -> u64 {
+    pool_bytes.saturating_add(DISK_RESERVE_BYTES)
+}
+
 /// Decide whether the Docker disk can hold a new pool, before allocating
 /// anything.
 ///
 /// # Errors
 /// A `marsh:` message naming the sizes when it cannot.
 pub fn check_pool_fits(pool_bytes: u64, available: u64) -> Result<(), String> {
-    let needed = pool_bytes.saturating_add(DISK_RESERVE_BYTES);
+    let needed = pool_needed_bytes(pool_bytes);
     if available < needed {
         return Err(format!(
             "marsh: the services disk has {} MiB free but a {} MiB pool needs {} MiB \

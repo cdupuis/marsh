@@ -237,15 +237,17 @@ fn check_disk_holds_pool(spec: &ServicesVmSpec) -> Result<(), SbxError> {
         .trim_end_matches(['g', 'G'])
         .parse::<u64>()
         .unwrap_or(0);
-    marsh_services::engine::check_pool_fits(pool_bytes, gibibytes.saturating_mul(1 << 30)).map_err(
-        |why| {
-            SbxError::HostGrantFence(format!(
-                "the Docker disk is set to {}: {}",
-                spec.disk_size,
-                why.trim_start_matches("marsh: ")
-            ))
-        },
-    )
+    let needed = marsh_services::engine::pool_needed_bytes(pool_bytes);
+    if gibibytes.saturating_mul(1 << 30) >= needed {
+        return Ok(());
+    }
+    Err(SbxError::HostGrantFence(format!(
+        "the Docker disk is set to {}, which is too small: Docker needs {} MiB for its pool plus a {} MiB reserve ({} MiB in all). Set a larger disk with `marsh config services-disk-size` (for example 40g), then run `marsh docker start` again",
+        spec.disk_size,
+        pool_bytes >> 20,
+        marsh_services::engine::DISK_RESERVE_BYTES >> 20,
+        needed >> 20,
+    )))
 }
 
 impl StockSbx {

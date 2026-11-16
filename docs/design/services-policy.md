@@ -467,8 +467,13 @@ has is checked.
      local image, are its to move. Any REST request during the list counts for every
      tag, and streams that begin during it are all remembered until it is done (then
      only owners of noted tags are kept, so a long stream cannot accumulate
-     workspaces). A list that fails is an "unable to check" event; the stream runs
-     (fail open). No lock is held across the list.
+     workspaces). Image names the agent cannot make into a tag (over the 255 characters a
+     tag may have, as a long pulled name can) are not watched, and that is an "unable
+     to check" event, not a silent skip; a list that fails is one too, and the stream
+     runs (fail open). No lock is held across the list, but the tag table is locked briefly before
+     it (to read the held names and open the window, as one step): a claim of another
+     workspace that holds it across an engine inspect delays the start of a build by
+     up to the engine's progress timeout (30 s), on top of the list's own time.
   2. **A stream ends** (the relay's pump returns, whoever closed it). The names are
      read again and each that has another image, or has gone, is reported once:
      time, tag, owner (`None`: a pulled name), previous and current image ID, a
@@ -479,7 +484,8 @@ has is checked.
      the owner's own change". Ambiguity errs towards true. The workspace is that of
      the stream that ended and saw it, which with overlapping streams is not
      necessarily the one that moved the tag ("workspace X's, or one that ran with
-     it"). The same change seen by streams that ran together is reported once; the
+     it"). With overlapping streams the report carries `overlapped` and says so; the same change
+     seen by streams that ran together is reported once; the
      same change after the user put the tag back, by a later stream, is reported
      again.
   3. **The text is the recovery**: if the previous image still exists,
@@ -489,8 +495,10 @@ has is checked.
      Events are a line on the agent's standard error and an entry of
      `Services::tag_events()` (the last 64). "Unable to check" is kept once per
      workspace and cause, and at the cap those go first, then later reports of a tag:
-     the oldest report of a tag is kept, it holds the owner's original image. Not
-     persisted: an agent restart forgets them.
+     the oldest report of a tag is kept, it holds the owner's original image. Nothing
+     expires: a report stays until the agent restarts, even after the owner put the tag
+     back, and a repeated "unable to check" for the same workspace and cause is never
+     shown again. Not persisted.
   Not done: **the overwrite is detected after the stream, not prevented**: while the
   build runs, and from its export until its stream ends, the other workspace's tag
   points at the lane's image (a `docker run` of it then runs the lane's image), and

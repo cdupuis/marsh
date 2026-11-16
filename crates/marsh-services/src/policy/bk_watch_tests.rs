@@ -866,3 +866,159 @@ fn workspaces_met_during_the_first_list_are_trimmed_afterwards() {
     w.end(&cz, "lane-z");
     w.end(&cb, B);
 }
+
+/// A request that reserves a name between the stream's look at the held names and
+/// its window (the reviewer's interleaving) is not missed: the tag table stays
+/// locked until the window exists, so the request waits, then finds the window.
+#[test]
+fn a_request_between_the_held_names_and_the_window_makes_the_report_ambiguous() {
+    let (gate, release) = {
+        let r = Arc::new(AtomicBool::new(false));
+        (r.clone(), r)
+    };
+    let w = World::with("bk-atomic", |e| {
+        let g = gate.clone();
+        Arc::new(move |req: &Req, s: &mut UnixStream| {
+            if req.target.starts_with("/images/src/tag") {
+                let until = Instant::now() + Duration::from_secs(5);
+                while !g.load(Ordering::SeqCst) && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            e(req, s)
+        })
+    });
+    let (a, b) = (lane(&w.h, A), lane(&w.h, "lane-pause"));
+    let (reached, resume) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    *super::super::bk_watch::PAUSE.lock().unwrap() =
+        Some(("lane-pause".into(), reached.clone(), resume.clone()));
+    let opening = std::thread::spawn(move || open_stream(&b, "/grpc"));
+    assert!(wait_for(Duration::from_secs(5), || reached.load(Ordering::SeqCst)));
+    let tagging = std::thread::spawn(move || tag_as(&a, "src", "base-app"));
+    std::thread::sleep(Duration::from_millis(300));
+    resume.store(true, Ordering::SeqCst);
+    let c = opening.join().unwrap();
+    assert!(wait_for(Duration::from_secs(5), || w
+        .h
+        .engine
+        .saw("POST", "/images/src/tag")
+        == 1));
+    release.store(true, Ordering::SeqCst);
+    assert_eq!(tagging.join().unwrap(), 201);
+    w.end(&c, "lane-pause");
+    *super::super::bk_watch::PAUSE.lock().unwrap() = None;
+    assert_eq!(
+        w.reports(),
+        [rep("base-app:1", "sha256:a1", "sha256:src", true)]
+    );
+}
+
+/// While a stream reads its first list, streams that begin are not remembered by
+/// name (only that one began, which makes its reports ambiguous).
+#[test]
+fn streams_beginning_during_the_first_list_are_not_remembered_by_name() {
+    let w = World::new("bk-pending");
+    let b = lane(&w.h, B);
+    w.st.lock().unwrap().list_delay = Some(Duration::from_millis(800));
+    let opening = std::thread::spawn(move || open_stream(&b, "/grpc"));
+    assert!(wait_for(Duration::from_secs(5), || w
+        .h
+        .engine
+        .saw("GET", "/images/json")
+        == 1));
+    for i in 0..20 {
+        let ws = format!("gone{i}");
+        let s = lane(&w.h, &ws);
+        let c = open_stream(&s, "/grpc");
+        w.h.svc.forget_scope(&ws).unwrap();
+        w.end(&c, &ws);
+    }
+    assert_eq!(w.h.svc.bk_others(), 0);
+    let c = opening.join().unwrap();
+    w.build("base-app:1", "sha256:lane");
+    w.end(&c, B);
+    assert_eq!(
+        w.reports(),
+        [rep("base-app:1", "sha256:a1", "sha256:lane", true)]
+    );
+}
+
+/// A name too long for a tag is said to be unwatched, never skipped in silence; an
+/// untagged image (`<none>:<none>`) is not a name.
+#[test]
+fn a_name_too_long_to_watch_is_reported_and_an_untagged_image_is_not() {
+    let w = World::new("bk-longname");
+    w.st.lock()
+        .unwrap()
+        .add("<none>:<none>", "sha256:dangling", false);
+    let b = lane(&w.h, B);
+    let c = open_stream(&b, "/grpc");
+    w.end(&c, B);
+    w.quiet();
+    let long = format!("{}:{}", "r".repeat(200), "t".repeat(100));
+    w.st.lock().unwrap().add(&long, "sha256:long", true);
+    let c = open_stream(&b, "/grpc");
+    w.end(&c, B);
+    assert_eq!(w.unchecked(), 1);
+    assert!(w.h.svc.tag_events()[0].detail.contains("too long to watch"));
+}
+
+/// At the cap "unable to check" is the first to go, as the docs say (not the oldest
+/// report).
+#[test]
+fn unable_to_check_goes_first_at_the_cap() {
+    let w = World::new("bk-cap-unchecked");
+    let b = lane(&w.h, B);
+    for i in 0..64 {
+        let tag = format!("t{i:02}:1");
+        w.build(&tag, &format!("sha256:t{i:02}"));
+        w.h.svc.ledger.set_tag(A, &tag).unwrap();
+    }
+    let c = open_stream(&b, "/grpc");
+    for i in 0..63 {
+        w.build(&format!("t{i:02}:1"), "sha256:lane");
+    }
+    w.end(&c, B);
+    w.st.lock().unwrap().fail_list = true;
+    let c = open_stream(&b, "/grpc");
+    w.end(&c, B);
+    w.st.lock().unwrap().fail_list = false;
+    assert_eq!((w.unchecked(), w.reports().len()), (1, 63));
+    let c = open_stream(&b, "/grpc");
+    w.build("t63:1", "sha256:lane");
+    w.end(&c, B);
+    assert_eq!((w.unchecked(), w.reports().len()), (0, 64));
+    assert_eq!(w.reports()[0].0, "t00:1");
+}
+
+/// Reports say when several builds ran at once (the workspace named may not be the
+/// one that moved the tag), in a field and in the text.
+#[test]
+fn a_report_says_when_builds_overlapped() {
+    let w = World::new("bk-overlap");
+    let b = lane(&w.h, B);
+    let cb = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.end(&cb, B);
+    let alone = w.h.svc.tag_events().pop().unwrap();
+    assert!(
+        !alone.overlapped && !alone.detail.contains("Several builds"),
+        "{alone:?}"
+    );
+
+    let w = World::new("bk-overlap2");
+    let (b, c3) = (lane(&w.h, B), lane(&w.h, "lane-c"));
+    let cb = open_stream(&b, "/grpc");
+    let cc = open_stream(&c3, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.end(&cc, "lane-c");
+    w.end(&cb, B);
+    let together = w.h.svc.tag_events().pop().unwrap();
+    assert!(
+        together.overlapped && together.detail.contains("Several builds ran at once"),
+        "{together:?}"
+    );
+}

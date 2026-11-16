@@ -709,8 +709,8 @@ In plain words:
   back: if the previous image still exists, `docker tag <previous image id> <name>` in
   the owner's workspace (otherwise rebuild it); for a pulled name, `docker pull <name>`
   fetches the registry's current image, not necessarily the previous one. With several
-  builds at once the report names a stream that ran with the one that moved the tag. marsh cannot tell, without reading BuildKit's
-  stream, whether the build moved the tag or its owner did, so it never changes a tag
+  builds at once the report names a stream that ran with the one that moved the tag, and
+  says so. marsh cannot tell, without reading BuildKit's stream, whether the build moved the tag or its owner did, so it never changes a tag
   itself; when the owner had a `tag`, a pull or a build of its own meanwhile, the
   report says "this may be the owner's own change". **What stays open:** it is seen
   when the build's stream ends, not stopped: from the moment the build moves the tag
@@ -722,10 +722,14 @@ In plain words:
   `FROM alpine` with no change) makes its tag count as a pulled name, and a later build
   of that tag in the same lane is reported. At most 256 protected tags are watched
   per stream, and a stream whose image list could not be read runs unwatched, with an
-  "unable to check" report. A pulled name stops being watched once a local image holds
-  it, and a name created after a build began is not watched by that build. Each build
-  costs two image lists, and the first is read before the build starts. The BuildKit
-  cache and history are as exposed as before. Where
+  "unable to check" report (so does an image name too long to watch). A pulled name stops
+  being watched once a local image holds it, and a name created after a build began is
+  not watched by that build. Each build costs two image lists, the first before the
+  build starts, and can wait for another workspace's tag claim that is in the engine
+  (up to 30 s). Reports are kept in the agent's memory until it restarts: none expires,
+  also not after you put the tag back, and a repeated "unable to check" for the same
+  workspace and cause is shown once. The BuildKit cache and history are as exposed as
+  before. Where
   it applies, the workspace that creates a tag may move it; a name stays free until
   an image has it (another workspace can create it first), and it is free again
   after `docker rmi`. Two lanes cannot both build `-t app` over the REST API; give

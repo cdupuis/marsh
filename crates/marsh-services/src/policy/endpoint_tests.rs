@@ -5,7 +5,7 @@
 //! the break mode that reintroduces its defect and requires the test to fail
 //! (`E3_TEST_BREAKS`, read only by the unit-test build, see `breaks.rs`).
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{Authority, Config, Services};
+use crate::engine_api::Untag;
 use crate::ledger::{ContainerRec, PinRec, now};
 
 const NET_ID: &str = "7777777777777777777777777777777777777777777777777777777777777777";
@@ -289,7 +290,7 @@ const SWITCH: &[u8] = b"HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.d
 fn attach(h: &H, sock: &Path) -> UnixStream {
     h.own_container(C1, &[]);
     let mut c = UnixStream::connect(sock).unwrap();
-    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     write!(
         c,
         "POST /containers/{C1}/attach?stream=1&stdin=1&stdout=1 HTTP/1.1\r\nHost: d\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Length: 0\r\n\r\n"
@@ -327,8 +328,15 @@ fn engine_attach(
 
 /// A hijacked stream that carries nothing either way is closed at the idle
 /// limit. (`hijack-deadlines-off`: it stays open for ever.)
+///
+/// The read is bounded by the configured limit plus a generous slack, and the
+/// fake engine keeps its side open for longer than that: only the endpoint's
+/// idle deadline can end the read with a close, and without it the read times
+/// out and the test fails.
 #[test]
 fn a_silent_hijacked_stream_is_closed_at_the_idle_limit() {
+    const IDLE: Duration = Duration::from_millis(400);
+    const SLACK: Duration = Duration::from_secs(10);
     let rel = Arc::new(AtomicBool::new(false));
     let r2 = rel.clone();
     let h = H::new(
@@ -336,7 +344,7 @@ fn a_silent_hijacked_stream_is_closed_at_the_idle_limit() {
         false,
         engine_attach(
             |s, rel| {
-                let end = Instant::now() + Duration::from_secs(20);
+                let end = Instant::now() + IDLE + SLACK + Duration::from_secs(30);
                 while !rel.load(Ordering::SeqCst) && Instant::now() < end {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -344,19 +352,19 @@ fn a_silent_hijacked_stream_is_closed_at_the_idle_limit() {
             },
             rel,
         ),
-        |c| c.hijack_idle = Duration::from_millis(400),
+        |c| c.hijack_idle = IDLE,
     );
     let sock = h.serve(&h.auth);
     let mut c = attach(&h, &sock);
-    c.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+    c.set_read_timeout(Some(IDLE + SLACK)).unwrap();
     let mut b = [0u8; 16];
     let r = c.read(&mut b);
     r2.store(true, Ordering::SeqCst);
-    assert!(matches!(r, Ok(0)), "the idle stream was not closed: {r:?}");
-    assert!(wait_for(Duration::from_secs(2), || h
-        .svc
-        .open_connections()
-        == 0));
+    assert!(
+        matches!(r, Ok(0)),
+        "the idle stream was not closed within {IDLE:?} + {SLACK:?}: {r:?}"
+    );
+    assert!(wait_for(SLACK, || h.svc.open_connections() == 0));
 }
 
 /// A client that vanishes frees its slot although the engine side is silent.
@@ -481,7 +489,7 @@ fn the_project_cap_counts_every_workspace_root() {
         .open_connections()
         == 2));
     let mut c3 = UnixStream::connect(&socks[2]).unwrap();
-    c3.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    c3.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut b = [0u8; 12];
     let n = c3.read(&mut b).unwrap_or(0);
     assert_eq!(
@@ -497,7 +505,10 @@ fn the_project_cap_counts_every_workspace_root() {
     c4.set_read_timeout(Some(Duration::from_millis(500)))
         .unwrap();
     let r = c4.read(&mut b);
-    assert!(r.is_err(), "a separate project was refused: {r:?}");
+    assert!(
+        matches!(&r, Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
+        "a separate project was refused: {r:?}"
+    );
 }
 
 // --- ledger persistence at the endpoint ---------------------------------------
@@ -1223,8 +1234,42 @@ fn a_hung_volume_create_is_bounded_and_fences_the_name() {
     engine.create_release.store(true, Ordering::SeqCst);
 }
 
+/// One reply read whole from a kept-alive connection: the head up to the blank
+/// line, then exactly `Content-Length` body bytes. The endpoint writes a head
+/// and a body in separate writes, so a single `read` may return only the head.
+fn read_reply(c: &mut UnixStream) -> (String, Vec<u8>) {
+    let mut head = Vec::new();
+    let mut b = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert_eq!(
+            c.read(&mut b).unwrap(),
+            1,
+            "closed in a reply head: {head:?}"
+        );
+        head.push(b[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    let len = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+    let mut body = vec![0_u8; len];
+    c.read_exact(&mut body).unwrap();
+    (head, body)
+}
+
 /// The lock a volume create holds for its whole request is released with it: a
 /// later request on the same connection (the same thread) takes it again.
+///
+/// The first reply is read whole, so nothing of it is left to be mistaken for
+/// the second. The wait for the lock can only be observed as silence, so it
+/// is bounded in time; but a request that got past the lock shows at once in
+/// the engine's log, and the silence is checked to be a timeout, not a close.
+/// Slowness can therefore only let a bug go unseen, never fail a correct run.
 #[test]
 fn a_connection_takes_the_volume_lock_again_after_a_volume_create() {
     let engine = VolumeEngine::new();
@@ -1232,7 +1277,7 @@ fn a_connection_takes_the_volume_lock_again_after_a_volume_create() {
     let h = H::new("lockflag", false, engine.handler(), |_| {});
     let sock = h.serve(&h.auth);
     let mut c = UnixStream::connect(&sock).unwrap();
-    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     let body = r#"{"Name":"data"}"#;
     write!(
         c,
@@ -1240,9 +1285,12 @@ fn a_connection_takes_the_volume_lock_again_after_a_volume_create() {
         body.len()
     )
     .unwrap();
-    let mut buf = vec![0_u8; 4096];
-    let n = c.read(&mut buf).unwrap();
-    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 201"));
+    let (first, _) = read_reply(&mut c);
+    assert!(first.starts_with("HTTP/1.1 201"), "{first}");
+    assert!(
+        !first.to_ascii_lowercase().contains("connection: close"),
+        "the connection was not kept: {first}"
+    );
     // Another thread holds the volume lock; the next request on this
     // connection (a container with a named volume) must wait for it.
     let held = h.svc.vol_lock.lock().unwrap();
@@ -1253,16 +1301,23 @@ fn a_connection_takes_the_volume_lock_again_after_a_volume_create() {
         create.len()
     )
     .unwrap();
-    c.set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let mut buf = [0_u8; 1];
+    let silent = c.read(&mut buf);
     assert!(
-        c.read(&mut buf).is_err(),
-        "the request did not wait for the volume lock"
+        matches!(&silent, Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
+        "the request did not wait for the volume lock: {silent:?}"
+    );
+    assert_eq!(
+        h.engine.saw("POST", "/containers/create"),
+        0,
+        "the request got past the volume lock"
     );
     drop(held);
-    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let n = c.read(&mut buf).unwrap();
-    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 201"));
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let (second, _) = read_reply(&mut c);
+    assert!(second.starts_with("HTTP/1.1 201"), "{second}");
+    assert_eq!(h.engine.saw("POST", "/containers/create"), 1);
 }
 
 /// A create whose engine body is slow does not hold every workspace's volume
@@ -1888,7 +1943,7 @@ fn the_delete_reply_is_the_engines_and_keeps_a_keep_alive_connection() {
         if round == 0 {
             // Keep-alive: a second request goes down the same connection.
             let mut c = UnixStream::connect(&sock).unwrap();
-            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
             c.write_all(b"DELETE /volumes/data HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
             let mut buf = vec![0_u8; 4096];
@@ -1910,7 +1965,7 @@ fn the_delete_reply_is_the_engines_and_keeps_a_keep_alive_connection() {
             let reply = raw_exchange(
                 &sock,
                 "DELETE /volumes/data HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                Duration::from_secs(5),
+                Duration::from_secs(30),
             );
             assert!(reply.starts_with("HTTP/1.1 204 No Content\r\n"), "{reply}");
             assert!(reply.contains("Connection: close"), "{reply}");
@@ -2370,10 +2425,16 @@ fn a_late_bind_does_not_bring_back_a_forgotten_root() {
         c.write_all(bind_create(&root).as_bytes()).unwrap();
         let _ = c.read_to_end(&mut Vec::new());
         drop(c);
-        assert!(wait_for(Duration::from_secs(5), || h
-            .svc
-            .open_connections()
-            == 0));
+        // The connection's teardown drops its count first and releases the
+        // roots after: wait for the roots themselves, not for the count.
+        assert!(
+            wait_for(Duration::from_secs(30), || {
+                let (roots, _, _, workspaces) = h.svc.tracked();
+                h.svc.open_connections() == 0 && roots == 0 && workspaces == 0
+            }),
+            "workspace {index}: forgotten roots came back: {:?}",
+            h.svc.tracked()
+        );
     }
     assert_eq!(h.svc.tracked().0, 0, "forgotten roots came back");
     assert_eq!(h.svc.tracked().3, 0, "ended workspaces kept a count");
@@ -2401,7 +2462,7 @@ fn image_engine_with(start: &[&str], slow: Duration) -> (Handler, Arc<Mutex<Vec<
                 .and_then(|p| p.strip_suffix("/json"))
         {
             let alias = aliases.lock().unwrap().clone();
-            if name == "postgres:16" || alias.iter().any(|a| a == name) {
+            if name == "postgres:16" || alias.iter().any(|a| a == name && has(a)) {
                 let all: Vec<String> = std::iter::once("postgres:16".to_owned())
                     .chain(alias.into_iter().filter(|a| has(a)))
                     .map(|t| format!("\"{t}\""))
@@ -2753,14 +2814,609 @@ fn a_full_tag_table_drops_records_of_missing_images_only() {
     assert_eq!(tag_call(&lane_a, "keep", "1"), 403);
 }
 
-/// A dropped workspace's tag records go with it.
+const NONE: [&str; 0] = [];
+
 #[test]
-fn forgetting_a_workspace_drops_its_tag_records() {
-    let h = H::new("tag-forget", false, image_engine(), |_| {});
+fn a_lost_engine_reply_is_not_counted_as_a_refusal() {
+    use crate::engine_api::untag_outcome;
+    use crate::policy::endpoint::MAX_UNTAG_REFUSALS;
+    use crate::relay::{DockerEndpoint, Filtered};
+    let (inner, names) = image_engine_with(&[], Duration::ZERO);
+    let custom: Handler = Arc::new(move |req, s| {
+        if req.method == "DELETE" {
+            // The engine accepted the request, but the connection ends without
+            // an answer. It may or may not have performed the delete.
+            return true;
+        }
+        inner(req, s)
+    });
+    let h = H::new("review-unknown-wire", false, custom, |_| {});
     let lane_a = h.serve(&h.auth);
-    assert_eq!(tag_call(&lane_a, "app", "1"), 201);
+    assert_eq!(tag_as(&lane_a, "postgres:16", "app"), 201);
+    let engine = crate::engine_api::Engine::new(lane_a);
+    let endpoint = Filtered::new(h.svc.clone());
+    let mut statuses = Vec::new();
+    for _ in 0..MAX_UNTAG_REFUSALS {
+        let _ = endpoint.untag_scope("lane-a", &mut |name| {
+            let status = untag_outcome(&engine.call("DELETE", &format!("/images/{name}"), None));
+            statuses.push(status);
+            status
+        });
+    }
+    assert!(names.lock().unwrap().iter().any(|t| t == "app:1"));
+    assert_eq!(
+        h.svc.ledger.scope_tags("lane-a"),
+        ["app:1"],
+        "unknown outcomes freed the record; statuses delivered by the filter: {statuses:?}"
+    );
+    assert_eq!(h.svc.ledger.tag_owner("app:1").unwrap().untag_refused, 0);
+}
+
+/// A delete's late answer must not retire a newer claim by the same workspace.
+#[test]
+fn a_late_rmi_answer_keeps_the_same_workspaces_newer_claim() {
+    let (inner, names) = image_engine_with(&[], Duration::ZERO);
+    let removed = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let removed_engine = removed.clone();
+    let release_engine = release.clone();
+    let engine_names = names.clone();
+    let custom: Handler = Arc::new(move |req, s| {
+        if req.method == "DELETE" && req.target == "/images/app:1" {
+            engine_names.lock().unwrap().retain(|t| t != "app:1");
+            removed_engine.store(true, Ordering::SeqCst);
+            let until = Instant::now() + Duration::from_secs(5);
+            while !release_engine.load(Ordering::SeqCst) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            answer(s, 200, "[]");
+            return true;
+        }
+        inner(req, s)
+    });
+    let h = H::new("review-late-rmi", false, custom, |_| {});
+    let lane_a = h.serve(&h.auth);
+    assert_eq!(tag_as(&lane_a, "postgres:16", "app"), 201);
+    std::thread::scope(|sc| {
+        let deleting_socket = lane_a.clone();
+        let deleting = sc.spawn(move || call(&deleting_socket, "DELETE", "/images/app:1", None).0);
+        assert!(wait_for(Duration::from_secs(5), || removed.load(Ordering::SeqCst)));
+        assert_eq!(tag_as(&lane_a, "postgres:16", "app"), 201);
+        assert_eq!(h.svc.ledger.scope_tags("lane-a"), ["app:1"]);
+        release.store(true, Ordering::SeqCst);
+        assert_eq!(deleting.join().unwrap(), 200);
+    });
+    assert!(names.lock().unwrap().iter().any(|t| t == "app:1"));
+    let recorded = h.svc.ledger.scope_tags("lane-a");
+    assert_eq!(drop_tags(&h, &lane_a, "lane-a"), NONE);
+    assert!(
+        !names.lock().unwrap().iter().any(|t| t == "app:1"),
+        "closing the workspace orphaned its newly claimed alias; record after late rmi: {recorded:?}"
+    );
+}
+
+/// What `Restorer::drop_workspace` does for tags: the unforced delete by name
+/// through the filtered endpoint, as the workspace.
+fn drop_tags(h: &H, sock: &Path, scope: &str) -> Vec<String> {
+    h.svc.untag_scope(scope, |name| {
+        let (status, body) = call(sock, "DELETE", &format!("/images/{name}"), None);
+        Untag::from_reply(status, &body)
+    })
+}
+
+fn tag_as(sock: &Path, src: &str, repo: &str) -> u16 {
+    call(
+        sock,
+        "POST",
+        &format!("/images/{src}/tag?repo={repo}&tag=1"),
+        None,
+    )
+    .0
+}
+
+/// F2: closing a lane untags what it created, even an extra alias of a pulled
+/// image (which no one can move or remove once the record is gone), and not
+/// the image's other names. Another workspace can then take the name.
+#[test]
+fn closing_a_workspace_untags_its_own_tags_and_frees_the_names() {
+    let (custom, names) = image_engine_with(&["built:1"], Duration::ZERO);
+    let h = H::new("tag-close", false, custom, |_| {});
+    let lane_a = h.serve(&h.auth);
+    let lane_b = lane(&h, "lane-b");
+    assert_eq!(tag_as(&lane_a, "postgres:16", "p1-app"), 201);
+    h.svc.ledger.set_tag("lane-a", "built:1").unwrap();
+    assert_eq!(tag_as(&lane_b, "postgres:16", "p1-app"), 403);
+
+    assert_eq!(drop_tags(&h, &lane_a, "lane-a"), NONE);
     h.svc.forget_scope("lane-a").unwrap();
-    assert!(h.svc.ledger.tag_owner("app:1").is_none());
+
+    let left = names.lock().unwrap().clone();
+    assert_eq!(left, ["postgres:16"], "only the lane's own tags go");
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+    let deletes: Vec<String> = h
+        .engine
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == "DELETE")
+        .map(|r| r.target.clone())
+        .collect();
+    assert_eq!(deletes, ["/images/built:1", "/images/p1-app:1"]);
+    assert_eq!(tag_as(&lane_b, "postgres:16", "p1-app"), 201);
+    assert_eq!(
+        h.svc.ledger.tag_owner("p1-app:1").map(|r| r.scope),
+        Some("lane-b".into())
+    );
+}
+
+/// A tag another workspace owns now is not the closing workspace's: nothing is
+/// sent for it, and a delete that does name it is refused by the filter.
+#[test]
+fn closing_a_workspace_leaves_a_tag_another_workspace_took() {
+    let (custom, names) = image_engine_with(&[], Duration::ZERO);
+    let h = H::new("tag-moved", false, custom, |_| {});
+    let lane_a = h.serve(&h.auth);
+    let lane_b = lane(&h, "lane-b");
+    h.svc.ledger.set_tag("lane-a", "app:1").unwrap();
+    // The image is gone, so the name is free: lane-b takes it over.
+    assert_eq!(tag_as(&lane_b, "postgres:16", "app"), 201);
+    assert_eq!(
+        h.svc.ledger.tag_owner("app:1").map(|r| r.scope),
+        Some("lane-b".into())
+    );
+    let mut asked = Vec::new();
+    let stuck = h.svc.untag_scope("lane-a", |name| {
+        asked.push(name.to_owned());
+        Untag::Unknown
+    });
+    assert_eq!(stuck, NONE);
+    assert_eq!(
+        asked, NONE,
+        "asked to remove a tag that is not the closing workspace's"
+    );
+    assert_eq!(h.engine.saw("DELETE", "/images/"), 0);
+    assert!(names.lock().unwrap().iter().any(|t| t == "app:1"));
+    // A delete of it by the closing workspace (a stale list) is refused, and
+    // the record stays lane-b's.
+    h.svc.ledger.set_tag("lane-a", "other:1").unwrap();
+    assert_eq!(call(&lane_a, "DELETE", "/images/app:1", None).0, 403);
+    assert_eq!(
+        h.svc.ledger.tag_owner("app:1").map(|r| r.scope),
+        Some("lane-b".into())
+    );
+    assert!(!h.svc.ledger.release_tag("lane-a", "app:1", 0).unwrap());
+}
+
+/// An engine failure, or no answer, keeps the record: the name stays the
+/// closing workspace's (refused to others) until a repeated drop untags it.
+#[test]
+fn a_failed_untag_keeps_the_claim_until_it_is_confirmed() {
+    let fail = Arc::new(AtomicBool::new(true));
+    let inner = image_engine_with(&["built:1"], Duration::ZERO).0;
+    let gate = fail.clone();
+    let custom: Handler = Arc::new(move |req, s| {
+        if req.method == "DELETE" && gate.load(Ordering::SeqCst) {
+            answer(s, 500, "{}");
+            return true;
+        }
+        inner(req, s)
+    });
+    let h = H::new("tag-fail", false, custom, |_| {});
+    let lane_a = h.serve(&h.auth);
+    let lane_b = lane(&h, "lane-b");
+    h.svc.ledger.set_tag("lane-a", "built:1").unwrap();
+
+    assert_eq!(drop_tags(&h, &lane_a, "lane-a"), ["built:1"]);
+    assert_eq!(
+        h.svc.untag_scope("lane-a", |_| Untag::Unknown),
+        ["built:1"],
+        "no answer is not a confirmation"
+    );
+    h.svc.forget_scope("lane-a").unwrap();
+    assert_eq!(
+        h.svc.ledger.tag_owner("built:1").map(|r| r.scope),
+        Some("lane-a".into()),
+        "forgetting the scope freed a tag the engine still has"
+    );
+    assert_eq!(tag_as(&lane_b, "postgres:16", "built"), 403);
+
+    fail.store(false, Ordering::SeqCst);
+    assert_eq!(drop_tags(&h, &lane_a, "lane-a"), NONE);
+    assert!(h.svc.ledger.tag_owner("built:1").is_none());
+    assert_eq!(tag_as(&lane_b, "postgres:16", "built"), 201);
+}
+
+/// The cleanup deletes a name only while it is still what the workspace tagged.
+/// A name the workspace removed itself, and another workspace then pulled, is the
+/// registry's tag and stays: with a record left behind by the workspace's own
+/// `docker rmi`, or by an untag whose answer was lost.
+fn repulled_name(unknown_untag: bool) {
+    let (inner, names) = image_engine_with(&[], Duration::ZERO);
+    let pulled_names = names.clone();
+    let custom: Handler = Arc::new(move |req, s| {
+        if req.method == "POST" && req.target == "/images/create?fromImage=app&tag=1" {
+            pulled_names.lock().unwrap().push("app:1".into());
+            answer(s, 200, "{}");
+            return true;
+        }
+        inner(req, s)
+    });
+    let h = H::new("tag-repull", false, custom, |_| {});
+    let lane_a = h.serve(&h.auth);
+    let lane_b = lane(&h, "lane-b");
+    assert_eq!(tag_as(&lane_a, "postgres:16", "app"), 201);
+    if unknown_untag {
+        let stuck = h.svc.untag_scope("lane-a", |name| {
+            // The engine applied the delete; the answer never came back.
+            names.lock().unwrap().retain(|t| t != name);
+            Untag::Unknown
+        });
+        assert_eq!(stuck, ["app:1"]);
+        h.svc.forget_scope("lane-a").unwrap();
+    } else {
+        assert_eq!(call(&lane_a, "DELETE", "/images/app:1", None).0, 200);
+    }
+    assert!(!names.lock().unwrap().iter().any(|t| t == "app:1"));
+    let pull = "/images/create?fromImage=app&tag=1";
+    assert_eq!(call(&lane_b, "POST", pull, None).0, 200);
+    assert!(names.lock().unwrap().iter().any(|t| t == "app:1"));
+    assert_eq!(drop_tags(&h, &lane_a, "lane-a"), NONE);
+    assert!(
+        names.lock().unwrap().iter().any(|t| t == "app:1"),
+        "closing lane-a removed the tag lane-b pulled"
+    );
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+}
+
+#[test]
+fn closing_a_workspace_leaves_a_name_another_workspace_pulled_after_its_rmi() {
+    repulled_name(false);
+}
+
+#[test]
+fn a_retry_leaves_a_name_pulled_after_an_untag_of_unknown_outcome() {
+    repulled_name(true);
+}
+
+/// The cleanup releases the claim it saw: if the workspace claims the name again
+/// while the delete runs, the confirmation is of the old claim and the newer
+/// record stays (and is reported, so the next drop untags it).
+#[test]
+fn a_confirmation_does_not_release_a_newer_claim_of_the_name() {
+    let (custom, _) = image_engine_with(&["x:1"], Duration::ZERO);
+    let h = H::new("tag-newer", false, custom, |_| {});
+    h.svc.ledger.set_tag("lane-a", "x:1").unwrap();
+    let stuck = h.svc.untag_scope("lane-a", |name| {
+        h.svc.ledger.set_tag("lane-a", name).unwrap();
+        Untag::Confirmed
+    });
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), ["x:1"]);
+    assert_eq!(
+        stuck,
+        ["x:1"],
+        "the newer claim is reported, so it is retried"
+    );
+    assert_eq!(h.svc.untag_scope("lane-a", |_| Untag::Confirmed), NONE);
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+    h.svc.ledger.set_tag("lane-a", "x:1").unwrap();
+    // A refusal of the old claim is not counted against the new one either.
+    let stuck = h.svc.untag_scope("lane-a", |name| {
+        h.svc.ledger.set_tag("lane-a", name).unwrap();
+        Untag::Refused(409)
+    });
+    assert_eq!(stuck, ["x:1"]);
+    assert_eq!(h.svc.ledger.tag_owner("x:1").unwrap().untag_refused, 0);
+}
+
+/// A tag the workspace claimed again while the cleanup's delete of the old one
+/// was in flight (a leftover client of the closing lane) is still its own: the
+/// drop reports it, so the daemon retries until a later round has untagged it.
+#[test]
+fn a_late_confirmation_of_the_cleanup_reports_a_newer_claim() {
+    let (inner, names) = image_engine_with(&[], Duration::ZERO);
+    let removed = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let removed_engine = removed.clone();
+    let release_engine = release.clone();
+    let engine_names = names.clone();
+    let custom: Handler = Arc::new(move |req, s| {
+        if req.method == "DELETE" && req.target == "/images/app:1" {
+            engine_names.lock().unwrap().retain(|t| t != "app:1");
+            removed_engine.store(true, Ordering::SeqCst);
+            let until = Instant::now() + Duration::from_secs(5);
+            while !release_engine.load(Ordering::SeqCst) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            answer(s, 200, "[]");
+            return true;
+        }
+        inner(req, s)
+    });
+    let h = H::new("review-drop-newer", false, custom, |_| {});
+    let lane_a = h.serve(&h.auth);
+    assert_eq!(tag_as(&lane_a, "postgres:16", "app"), 201);
+    let left = std::thread::scope(|sc| {
+        let dropping = sc.spawn(|| drop_tags(&h, &lane_a, "lane-a"));
+        assert!(wait_for(Duration::from_secs(5), || removed.load(Ordering::SeqCst)));
+        assert_eq!(tag_as(&lane_a, "postgres:16", "app"), 201);
+        release.store(true, Ordering::SeqCst);
+        dropping.join().unwrap()
+    });
+    assert!(names.lock().unwrap().iter().any(|t| t == "app:1"));
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), ["app:1"]);
+    assert_eq!(
+        left,
+        ["app:1"],
+        "without left the daemon ends its cleanup journal"
+    );
+}
+
+/// The filter's own replies (a full connection cap, its holds, a refused route)
+/// are never the engine's word: they are not counted, however many come, and the
+/// record is kept while its tag is in the engine.
+#[test]
+fn a_busy_project_cap_is_not_counted_as_an_engine_refusal() {
+    use crate::policy::endpoint::MAX_UNTAG_REFUSALS;
+    let (inner, names) = image_engine_with(&[], Duration::ZERO);
+    let h = H::new("tag-429", false, inner, |c| c.max_conns_project = 3);
+    let lane_a = h.serve(&h.auth);
+    assert_eq!(tag_as(&lane_a, "postgres:16", "app"), 201);
+    let auth = |ws: &str| Authority {
+        project_root: h.dir.clone(),
+        workspace: ws.into(),
+        attempt: "att1".into(),
+    };
+    let idle: Vec<UnixStream> = ["w1", "w2", "w3"]
+        .iter()
+        .map(|ws| UnixStream::connect(h.serve(&auth(ws))).unwrap())
+        .collect();
+    assert!(wait_for(Duration::from_secs(2), || h
+        .svc
+        .open_connections()
+        == 3));
+    let engine = crate::engine_api::Engine::new(lane_a);
+    assert!(
+        engine.call("GET", "/_ping", None).is_err(),
+        "the cap is full"
+    );
+    for _ in 0..MAX_UNTAG_REFUSALS * 2 {
+        let left = h.svc.untag_scope("lane-a", |name| {
+            let path = format!("/images/{name}");
+            crate::engine_api::untag_outcome(&engine.call("DELETE", &path, None))
+        });
+        assert_eq!(left, ["app:1"]);
+    }
+    assert!(names.lock().unwrap().iter().any(|t| t == "app:1"));
+    assert_eq!(h.svc.ledger.tag_owner("app:1").unwrap().untag_refused, 0);
+    drop(idle);
+}
+
+/// A pull of an absent name releases the stale record of the PULLING workspace
+/// too: its own record over a gone image would otherwise make closing it untag
+/// the name it pulled.
+#[test]
+fn pulling_over_your_own_stale_record_releases_it() {
+    let (inner, names) = image_engine_with(&[], Duration::ZERO);
+    let pulled = names.clone();
+    let custom: Handler = Arc::new(move |req, s| {
+        if req.method == "POST" && req.target == "/images/create?fromImage=app&tag=1" {
+            pulled.lock().unwrap().push("app:1".into());
+            answer(s, 200, "{}");
+            return true;
+        }
+        inner(req, s)
+    });
+    let h = H::new("tag-own-stale", false, custom, |_| {});
+    let lane_a = h.serve(&h.auth);
+    h.svc.ledger.set_tag("lane-a", "app:1").unwrap();
+    let pull = "/images/create?fromImage=app&tag=1";
+    assert_eq!(call(&lane_a, "POST", pull, None).0, 200);
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+    assert_eq!(drop_tags(&h, &lane_a, "lane-a"), NONE);
+    assert!(names.lock().unwrap().iter().any(|t| t == "app:1"));
+    // While the image is there a pull over one's own live record keeps it.
+    h.svc.ledger.set_tag("lane-a", "app:1").unwrap();
+    assert_eq!(call(&lane_a, "POST", pull, None).0, 200);
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), ["app:1"]);
+}
+
+/// A workspace's own `docker rmi` of its tag releases the record at once, so no
+/// stale record outlives the name (even before any other request or reconcile).
+#[test]
+fn deleting_your_own_tag_releases_its_record() {
+    let h = H::new("tag-rmi-release", false, image_engine(), |_| {});
+    let lane_a = h.serve(&h.auth);
+    assert_eq!(tag_as(&lane_a, "postgres:16", "app"), 201);
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), ["app:1"]);
+    assert_eq!(call(&lane_a, "DELETE", "/images/app:1", None).0, 200);
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+}
+
+/// The cleanup starts by dropping the records of images the engine no longer
+/// has (a prune, a delete by ID): nothing is asked of the engine for them.
+#[test]
+fn the_cleanup_starts_by_dropping_records_of_missing_images() {
+    let h = H::new("tag-evict-first", false, image_engine(), |_| {});
+    h.svc.ledger.set_tag("lane-a", "gone:1").unwrap();
+    let mut asked = Vec::new();
+    let stuck = h.svc.untag_scope("lane-a", |name| {
+        asked.push(name.to_owned());
+        Untag::Confirmed
+    });
+    assert_eq!(stuck, NONE);
+    assert_eq!(asked, NONE);
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+}
+
+/// A tag the route cannot name (255 characters, as for `DELETE /images/<name>`)
+/// is refused when it is claimed, so no record can exist that no cleanup could
+/// ever release.
+#[test]
+fn a_tag_longer_than_the_delete_route_allows_is_not_claimed() {
+    let h = H::new("tag-long", false, image_engine(), |_| {});
+    let lane_a = h.serve(&h.auth);
+    let claim = |repo_len: usize| {
+        let repo = "a".repeat(repo_len);
+        let target = format!("/images/postgres:16/tag?repo={repo}&tag=0123456789");
+        (
+            call(&lane_a, "POST", &target, None).0,
+            format!("{repo}:0123456789"),
+        )
+    };
+    // `repo:0123456789` is 245 + 1 + 10 = 256 characters: one too many.
+    assert_eq!(claim(245).0, 403);
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+    assert_eq!(claim(250).0, 403);
+    // 244 + 1 + 10 = 255 is the longest the route names, and it is deletable.
+    let (status, name) = claim(244);
+    assert_eq!(status, 201);
+    assert_eq!(name.len(), 255);
+    assert_eq!(
+        h.svc.ledger.scope_tags("lane-a"),
+        std::slice::from_ref(&name)
+    );
+    assert_eq!(
+        call(&lane_a, "DELETE", &format!("/images/{name}"), None).0,
+        200
+    );
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+}
+
+/// Only a 2xx or a 404 confirms the untag; a refusal, a conflict, an engine
+/// error and no answer keep the record. A record someone else took over in the
+/// meantime is not reported.
+#[test]
+fn only_a_2xx_or_a_404_confirms_an_untag() {
+    let (custom, _) = image_engine_with(&["x:1"], Duration::ZERO);
+    let h = H::new("tag-statuses", false, custom, |_| {});
+    for (status, confirmed) in [
+        (Untag::Confirmed, true),
+        (Untag::Refused(403), false),
+        (Untag::Refused(409), false),
+        (Untag::Refused(500), false),
+        (Untag::Unknown, false),
+    ] {
+        h.svc.ledger.set_tag("lane-a", "x:1").unwrap();
+        let stuck = h.svc.untag_scope("lane-a", |_| status);
+        assert_eq!(stuck.is_empty(), confirmed, "{status:?}");
+        assert_eq!(
+            h.svc.ledger.scope_tags("lane-a").is_empty(),
+            confirmed,
+            "{status:?}"
+        );
+    }
+    h.svc.ledger.set_tag("lane-a", "x:1").unwrap();
+    let stuck = h.svc.untag_scope("lane-a", |name| {
+        h.svc.ledger.set_tag("lane-b", name).unwrap();
+        Untag::Refused(403)
+    });
+    assert_eq!(
+        stuck, NONE,
+        "a tag lane-b took over is not lane-a's to report"
+    );
+}
+
+/// A refusal that never changes (a 409: the last tag of an image a container
+/// uses) is not retried for ever: after `MAX_UNTAG_REFUSALS` answers the record
+/// is released and the last report says what stays and how to remove it; the
+/// next drop is clean. An unknown outcome is never counted.
+#[test]
+fn a_permanent_refusal_is_given_up_with_a_message() {
+    use crate::policy::endpoint::MAX_UNTAG_REFUSALS;
+    assert_eq!(
+        MAX_UNTAG_REFUSALS, 12,
+        "about a minute at the daemon's retry"
+    );
+    let (custom, _) = image_engine_with(&["x:1"], Duration::ZERO);
+    let h = H::new("tag-giveup", false, custom, |_| {});
+    h.svc.ledger.set_tag("lane-a", "x:1").unwrap();
+    // Neither an unknown outcome nor the filter's lost-reply 502 is counted.
+    for _ in 0..30 {
+        assert_eq!(h.svc.untag_scope("lane-a", |_| Untag::Unknown), ["x:1"]);
+        let lost = Untag::from_reply(502, "");
+        assert_eq!(h.svc.untag_scope("lane-a", |_| lost), ["x:1"]);
+    }
+    assert_eq!(h.svc.ledger.tag_owner("x:1").unwrap().untag_refused, 0);
+    for round in 1..=11 {
+        assert_eq!(
+            h.svc.untag_scope("lane-a", |_| Untag::Refused(409)),
+            ["x:1"],
+            "round {round}"
+        );
+    }
+    let last = h.svc.untag_scope("lane-a", |_| Untag::Refused(409));
+    assert_eq!(last.len(), 1);
+    assert!(last[0].starts_with("x:1 ("), "{last:?}");
+    assert!(last[0].contains("409") && last[0].contains("12 times"));
+    assert!(last[0].contains("marsh docker rm"));
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+    assert_eq!(h.svc.untag_scope("lane-a", |_| Untag::Refused(409)), NONE);
+}
+
+/// The production wiring: the relay's endpoint forwards the cleanup to the
+/// services (a no-op there would leave every lane's tags in the engine).
+#[test]
+fn the_relays_endpoint_runs_the_cleanup() {
+    use crate::relay::{DockerEndpoint, Filtered};
+    let (custom, names) = image_engine_with(&["built:1"], Duration::ZERO);
+    let h = H::new("tag-relay", false, custom, |_| {});
+    let lane_a = h.serve(&h.auth);
+    h.svc.ledger.set_tag("lane-a", "built:1").unwrap();
+    let endpoint = Filtered::new(h.svc.clone());
+    let stuck = endpoint.untag_scope("lane-a", &mut |name| {
+        let (status, body) = call(&lane_a, "DELETE", &format!("/images/{name}"), None);
+        Untag::from_reply(status, &body)
+    });
+    assert_eq!(stuck, NONE);
+    assert!(!names.lock().unwrap().iter().any(|t| t == "built:1"));
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+    h.svc.ledger.set_tag("lane-a", "postgres:16").unwrap();
+    assert_eq!(
+        endpoint.untag_scope("lane-a", &mut |_| Untag::Unknown),
+        ["postgres:16"]
+    );
+}
+
+/// While the engine untags a name another workspace cannot take it, and can
+/// right after. The record keeps the name (it is the closing workspace's until
+/// the engine answers); the delete's own hold, which covers a name no record
+/// covers, is pinned by `a_delete_holds_its_name_until_the_engine_finishes`.
+#[test]
+fn a_claim_during_the_untag_is_refused() {
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = release.clone();
+    let inner = image_engine_with(&["built:1"], Duration::ZERO).0;
+    let custom: Handler = Arc::new(move |req, s| {
+        if req.method == "DELETE" {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !gate.load(Ordering::SeqCst) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        inner(req, s)
+    });
+    let h = H::new("tag-during", false, custom, |_| {});
+    let lane_a = h.serve(&h.auth);
+    let lane_b = lane(&h, "lane-b");
+    h.svc.ledger.set_tag("lane-a", "built:1").unwrap();
+    std::thread::scope(|sc| {
+        let svc = h.svc.clone();
+        let closing = sc.spawn(move || {
+            svc.untag_scope("lane-a", |name| {
+                let (status, body) = call(&lane_a, "DELETE", &format!("/images/{name}"), None);
+                Untag::from_reply(status, &body)
+            })
+        });
+        assert!(wait_for(Duration::from_secs(5), || h
+            .engine
+            .saw("DELETE", "/images/built:1")
+            > 0));
+        assert_eq!(tag_as(&lane_b, "postgres:16", "built"), 403);
+        release.store(true, Ordering::SeqCst);
+        assert_eq!(closing.join().unwrap(), NONE);
+    });
+    assert_eq!(tag_as(&lane_b, "postgres:16", "built"), 201);
 }
 
 // --- review round 2 ---------------------------------------------------------

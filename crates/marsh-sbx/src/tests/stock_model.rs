@@ -22,7 +22,7 @@ pub(super) struct Call {
 }
 
 impl Call {
-    fn new(invocation: &Invocation) -> Self {
+    pub(super) fn new(invocation: &Invocation) -> Self {
         let text = |value: &OsStr| value.to_string_lossy().into_owned();
         Self {
             program: invocation.program.clone(),

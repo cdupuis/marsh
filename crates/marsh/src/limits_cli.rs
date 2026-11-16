@@ -181,30 +181,33 @@ pub fn set_command(scope_root: &Path, name: &str, value: &str) -> Result<i32, (S
         )
     };
     let path = scope_root.join(crate::shell_choice::CONFIG_FILE);
-    let mut document = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
-            .map_err(|error| (format!("invalid {}: {error}", path.display()), 1))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(error) => return Err((format!("cannot read {}: {error}", path.display()), 1)),
-    };
-    let mut values = document
-        .get_mut(limits::CONFIG_KEY)
-        .and_then(serde_json::Value::as_object_mut)
-        .map(std::mem::take)
-        .unwrap_or_default();
-    match &parsed {
-        Some(parsed) => {
-            values.insert(
-                spec.name.into(),
-                serde_json::to_value(parsed).map_err(|error| (error.to_string(), 1))?,
-            );
+    // Read, change and write the limits in one locked transaction.
+    marsh_daemon::config_file::update(scope_root, |document| {
+        let mut values = document
+            .get_mut(limits::CONFIG_KEY)
+            .and_then(serde_json::Value::as_object_mut)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        match &parsed {
+            Some(parsed) => {
+                values.insert(
+                    spec.name.into(),
+                    serde_json::to_value(parsed).map_err(|error| error.to_string())?,
+                );
+            }
+            None => {
+                values.remove(spec.name);
+            }
         }
-        None => {
-            values.remove(spec.name);
+        document.insert(limits::CONFIG_KEY.into(), values.into());
+        Ok(())
+    })
+    .map_err(|error| match error {
+        marsh_daemon::config_file::ConfigError::Rejected(message) => (message, 1),
+        marsh_daemon::config_file::ConfigError::Io(error) => {
+            (format!("cannot write {}: {error}", path.display()), 1)
         }
-    }
-    crate::shell_choice::write_config(scope_root, limits::CONFIG_KEY, values.into())
-        .map_err(|error| (format!("cannot write {}: {error}", path.display()), 1))?;
+    })?;
     let listing = listing(scope_root).map_err(|message| (message, 1))?;
     let Some(entry) = listing.limits.iter().find(|entry| entry.name == spec.name) else {
         return Ok(0);
@@ -279,6 +282,40 @@ mod tests {
             entry(&listing, "job-children").value,
             limits::LimitValue::Count(16)
         );
+    }
+
+    /// The whole `limits` object is read after the lock is held: a limit another
+    /// writer sets while this one waits is kept, not overwritten.
+    #[test]
+    fn a_limit_reads_the_limits_object_under_the_lock() {
+        let root = scope();
+        std::fs::write(
+            root.path().join("config.json"),
+            r#"{"limits": {"tree-launch-rate": "120/2m"}}"#,
+        )
+        .unwrap();
+        let lock = std::fs::File::create(root.path().join("config.json.lock")).unwrap();
+        let held =
+            nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap();
+        let writer = {
+            let path = root.path().to_owned();
+            std::thread::spawn(move || set_command(&path, "job-children", "32"))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Another writer's limit, set while this one waits.
+        std::fs::write(
+            root.path().join("config.json"),
+            r#"{"limits": {"tree-launch-rate": "120/2m", "daemon-jobs": 8}}"#,
+        )
+        .unwrap();
+        drop(held);
+        assert_eq!(writer.join().unwrap(), Ok(0));
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(document["limits"]["job-children"], 32);
+        assert_eq!(document["limits"]["daemon-jobs"], 8);
+        assert_eq!(document["limits"]["tree-launch-rate"], "120/2m");
     }
 
     #[test]

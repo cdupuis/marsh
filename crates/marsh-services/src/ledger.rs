@@ -73,6 +73,14 @@ pub struct VolRec {
 pub struct TagRec {
     pub scope: String,
     pub created: u64,
+    /// How many times the engine refused to untag it when its scope was dropped.
+    #[serde(default)]
+    pub untag_refused: u32,
+    /// Which claim this is: a serial from the ledger, higher for every
+    /// `set_tag`. A release names the claim it saw, so a delete that was begun
+    /// before a newer claim of the same name by the same scope cannot retire it.
+    #[serde(default)]
+    pub claim: u64,
 }
 
 /// Most tag records kept. At the cap, records whose image is gone are dropped
@@ -143,6 +151,9 @@ struct State {
     /// Older ledgers have none.
     #[serde(default)]
     tags: BTreeMap<String, TagRec>,
+    /// The last `TagRec::claim` handed out.
+    #[serde(default)]
+    tag_claims: u64,
     /// Exec ID -> (sequence, container). Not persisted: an exec outlives
     /// neither its container nor the agent's connections, and a ledger that
     /// kept every `docker exec` would grow and slow every write without bound.
@@ -526,16 +537,15 @@ impl Ledger {
 
     /// A dropped workspace's records that exist for the scope itself: its
     /// substituted sockets and its default network entry. Objects are removed
-    /// through the engine (and leave the ledger by their own removal).
+    /// through the engine (and leave the ledger by their own removal). Image
+    /// tag records stay: they go one by one, once the engine confirmed the
+    /// untag (`release_tag`), so a tag that is still there keeps its owner.
     pub fn forget_scope(&self, scope: &str) -> LedgerResult<()> {
         self.mutate(|s| {
             let before = (s.sockets.len(), s.scope_networks.len());
             s.sockets.retain(|_, rec| rec.scope != scope);
             s.scope_networks.remove(scope);
-            let tags = s.tags.len();
-            s.tags.retain(|_, rec| rec.scope != scope);
-            let changed =
-                before != (s.sockets.len(), s.scope_networks.len()) || tags != s.tags.len();
+            let changed = before != (s.sockets.len(), s.scope_networks.len());
             ((), changed)
         })
     }
@@ -744,6 +754,49 @@ impl Ledger {
         self.with(|s| s.tags.len())
     }
 
+    /// The tags `scope` is recorded as the creator of, in name order.
+    #[must_use]
+    pub fn scope_tags(&self, scope: &str) -> Vec<String> {
+        self.with(|s| {
+            let mut names: Vec<String> = s
+                .tags
+                .iter()
+                .filter(|(_, rec)| rec.scope == scope)
+                .map(|(name, _)| name.clone())
+                .collect();
+            names.sort();
+            names
+        })
+    }
+
+    /// Forget `scope`'s record of a tag, but only the claim (`TagRec::claim`) the
+    /// caller saw: a record another scope has taken over, or that the scope has
+    /// claimed again since, stays. Returns whether a record went.
+    pub fn release_tag(&self, scope: &str, name: &str, claim: u64) -> LedgerResult<bool> {
+        self.mutate(|s| {
+            let mine = s
+                .tags
+                .get(name)
+                .is_some_and(|rec| rec.scope == scope && rec.claim == claim);
+            if mine {
+                s.tags.remove(name);
+            }
+            (mine, mine)
+        })
+    }
+
+    /// Count one refusal by the engine to untag `scope`'s claim of a tag;
+    /// returns the count (0 when the record is no longer that claim).
+    pub fn note_untag_refused(&self, scope: &str, name: &str, claim: u64) -> LedgerResult<u32> {
+        self.mutate(|s| match s.tags.get_mut(name) {
+            Some(rec) if rec.scope == scope && rec.claim == claim => {
+                rec.untag_refused += 1;
+                (rec.untag_refused, true)
+            }
+            _ => (0, false),
+        })
+    }
+
     /// Keep only the tag records `keep` accepts; returns how many went.
     pub fn retain_tags(&self, keep: impl Fn(&str, &TagRec) -> bool) -> LedgerResult<usize> {
         self.mutate(|s| {
@@ -761,11 +814,14 @@ impl Ledger {
             if s.tags.len() >= MAX_TAGS && !s.tags.contains_key(name) {
                 return (false, false);
             }
+            s.tag_claims += 1;
             s.tags.insert(
                 name.to_string(),
                 TagRec {
                     scope: scope.to_string(),
                     created: now(),
+                    untag_refused: 0,
+                    claim: s.tag_claims,
                 },
             );
             (true, true)
@@ -1231,6 +1287,8 @@ mod tests {
         let rec = |scope: &str| TagRec {
             scope: scope.into(),
             created: 0,
+            untag_refused: 0,
+            claim: 0,
         };
         for (what, held, image, want) in [
             ("nobody, no image", None, TagImage::Absent, TagClaim::New),
@@ -1277,13 +1335,31 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_scope_and_stale_records_free_the_tag_table() {
+    fn released_and_stale_records_free_the_tag_table() {
         let l = Ledger::in_memory();
         for n in 0..MAX_TAGS {
             assert!(l.set_tag("dead", &format!("dead:{n}")).unwrap());
         }
         assert!(!l.set_tag("live", "new:1").unwrap(), "full");
+        // Forgetting the scope keeps its tag records: they go one by one, once
+        // the engine confirmed the untag, and only while still the scope's.
         l.forget_scope("dead").unwrap();
+        assert_eq!(l.tag_count(), MAX_TAGS);
+        assert_eq!(l.scope_tags("dead").len(), MAX_TAGS);
+        let claim = l.tag_owner("dead:0").unwrap().claim;
+        assert!(
+            !l.release_tag("live", "dead:0", claim).unwrap(),
+            "not its record"
+        );
+        assert!(
+            !l.release_tag("dead", "dead:0", claim + 1).unwrap(),
+            "not that claim"
+        );
+        assert_eq!(l.tag_count(), MAX_TAGS);
+        for name in l.scope_tags("dead") {
+            let claim = l.tag_owner(&name).unwrap().claim;
+            assert!(l.release_tag("dead", &name, claim).unwrap());
+        }
         assert_eq!(l.tag_count(), 0);
         assert!(l.set_tag("live", "keep:1").unwrap());
         assert!(l.set_tag("live", "gone:1").unwrap());
@@ -1294,6 +1370,38 @@ mod tests {
         assert!(l.tag_owner("gone:1").is_none());
         assert_eq!(l.tag_owner("keep:1").map(|r| r.scope), Some("live".into()));
         assert_eq!(l.tag_owner("keep:2").map(|r| r.scope), Some("other".into()));
+    }
+
+    /// Ledgers written before the refusal count and claim serial still load;
+    /// a refusal is counted for the claim it was made for, and a release names
+    /// the claim it saw.
+    #[test]
+    fn a_tag_record_without_a_refusal_count_loads() {
+        let rec: TagRec = serde_json::from_str(r#"{"scope":"a","created":7}"#).unwrap();
+        assert_eq!(
+            (rec.scope.as_str(), rec.untag_refused, rec.claim),
+            ("a", 0, 0)
+        );
+        let l = Ledger::in_memory();
+        l.set_tag("a", "app:1").unwrap();
+        let first = l.tag_owner("app:1").unwrap().claim;
+        assert_eq!(l.note_untag_refused("a", "app:1", first).unwrap(), 1);
+        assert_eq!(l.note_untag_refused("a", "app:1", first).unwrap(), 2);
+        assert_eq!(
+            l.note_untag_refused("b", "app:1", first).unwrap(),
+            0,
+            "not its record"
+        );
+        l.set_tag("a", "app:1").unwrap();
+        let second = l.tag_owner("app:1").unwrap().claim;
+        assert!(second > first, "every claim has a newer serial");
+        assert_eq!(l.note_untag_refused("a", "app:1", first).unwrap(), 0);
+        assert!(
+            !l.release_tag("a", "app:1", first).unwrap(),
+            "an older claim"
+        );
+        assert_eq!(l.note_untag_refused("a", "app:1", second).unwrap(), 1);
+        assert!(l.release_tag("a", "app:1", second).unwrap());
     }
 
     #[test]

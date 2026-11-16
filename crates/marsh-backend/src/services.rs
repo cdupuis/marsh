@@ -486,18 +486,39 @@ impl StockDaemonBackend {
         Ok(canonical)
     }
 
-    /// The project `rm` acts on: the exact folder of an owned VM whose folder
-    /// is gone, else the usual canonical existing directory (so any existing
-    /// folder is accepted as it is for every other request).
+    /// The project `rm` acts on: the exact folder of a project this daemon
+    /// knows (an owned VM, or a setting recorded for it) whose folder is gone,
+    /// else the usual canonical existing directory (so any existing folder is
+    /// accepted as it is for every other request). A gone folder nothing is
+    /// recorded for is refused in plain words.
     fn remove_target(
         &self,
         root: &Path,
         owned: &[(String, String)],
     ) -> Result<PathBuf, DaemonError> {
-        match missing_project_root(root, owned) {
-            Some(gone) => Ok(gone),
-            None => self.services_root(root),
+        let mut recorded = owned.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
+        let settings = self.services_settings();
+        if let Ok(settings) = &settings {
+            recorded.extend(settings.projects.iter().cloned());
+            recorded.extend(settings.off_projects.iter().cloned());
         }
+        if let Some(gone) = missing_project_root(root, &recorded) {
+            return Ok(gone);
+        }
+        if matches!(
+            fs::symlink_metadata(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            // With the settings unreadable nothing can be said about the
+            // folder: report that, not "nothing is recorded".
+            settings?;
+            return Err(DaemonError::Refused(format!(
+                "marsh: no Docker VM or setting is recorded for {}: its folder is gone, so it \
+                 may be removed already, or spelled differently from `marsh docker status`",
+                root.display()
+            )));
+        }
+        self.services_root(root)
     }
 
     fn services_spec(&self, root: &Path, settings: &Settings) -> ServicesVmSpec {
@@ -506,6 +527,11 @@ impl StockDaemonBackend {
             image: self.config.shell.image.clone(),
             shell_binary: self.config.shell.shell_binary.clone(),
             disk_size: settings.disk_size.clone(),
+            pool_bytes: self
+                .services
+                .relays
+                .as_ref()
+                .and_then(|relays| relays.pool_bytes()),
         }
     }
 
@@ -851,10 +877,39 @@ impl StockDaemonBackend {
                 root.display()
             );
         }
+        // A folder that is gone and has no VM left is nothing but a stale
+        // entry: its setting goes, and status stops listing it.
+        let folder_gone = matches!(
+            fs::symlink_metadata(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        let mut forgot_setting = false;
+        if folder_gone {
+            // A setting that stays would keep the folder listed: the request
+            // fails, and running it again (the folder is still recorded) tries
+            // again; the VM, if any, is already removed.
+            forgot_setting = forget_project_settings(&self.config.daemon_home, root).map_err(
+                |error| {
+                    DaemonError::Refused(format!(
+                        "marsh: could not forget the Docker setting of {}: {error}; its Docker VM is gone, so run the same command again once that is fixed",
+                        root.display()
+                    ))
+                },
+            )?;
+        }
         let settings = self.services_settings()?;
         let mut document = self.services_project_json(root, &settings, true);
         document["schema"] = json!(SCHEMA);
         document["removed"] = json!(removed);
+        document["forgot_setting"] = json!(forgot_setting);
+        if folder_gone {
+            // The document above tracked the project afresh.
+            self.services
+                .projects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(root);
+        }
         Ok(document)
     }
 
@@ -1573,19 +1628,44 @@ impl StockDaemonBackend {
     }
 }
 
-/// The folder of a services VM this daemon owns whose project is gone from the
-/// Mac (moved or deleted), so `rm --project` can still reach it. Only an exact
-/// recorded key qualifies, and only when the folder is really absent: a folder
-/// that exists, or that cannot be checked, takes the normal path.
-fn missing_project_root(root: &Path, owned: &[(String, String)]) -> Option<PathBuf> {
+/// The folder of a project this daemon knows (a recorded key: an owned
+/// services VM, or a setting) that is gone from the Mac (moved or deleted), so
+/// `rm --project` can still reach it. Only an exact recorded key qualifies, and
+/// only when the folder is really absent: a folder that exists, or that cannot
+/// be checked, takes the normal path.
+fn missing_project_root(root: &Path, recorded: &[String]) -> Option<PathBuf> {
     let key = root.to_str()?;
-    if !owned.iter().any(|(_, recorded)| recorded == key) {
+    if !recorded.iter().any(|recorded| recorded == key) {
         return None;
     }
     match fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(root.to_owned()),
         _ => None,
     }
+}
+
+/// Take `root` out of the project lists of `config.json` (`services_projects`,
+/// `docker_projects_off`), as `marsh config docker` writes them. Returns
+/// whether anything was listed. The change goes through the same locked
+/// transaction as every `marsh config` setter (`marsh_daemon::config_file`).
+fn forget_project_settings(
+    scope_root: &Path,
+    root: &Path,
+) -> Result<bool, marsh_daemon::config_file::ConfigError> {
+    let Some(key) = root.to_str() else {
+        return Ok(false);
+    };
+    marsh_daemon::config_file::update(scope_root, |document| {
+        let mut listed = false;
+        for name in ["services_projects", "docker_projects_off"] {
+            if let Some(Value::Array(roots)) = document.get_mut(name) {
+                let before = roots.len();
+                roots.retain(|entry| entry.as_str() != Some(key));
+                listed |= roots.len() != before;
+            }
+        }
+        Ok(listed)
+    })
 }
 
 /// What the project's services containers can reach right now, in one line.
@@ -1937,10 +2017,7 @@ mod tests {
         let present = dir.path().join("present");
         fs::create_dir(&present).unwrap();
         let key = |path: &Path| path.to_str().unwrap().to_owned();
-        let owned = vec![
-            ("marsh-svc-a".to_owned(), key(&gone)),
-            ("marsh-svc-b".to_owned(), key(&present)),
-        ];
+        let owned = vec![key(&gone), key(&present)];
         assert_eq!(missing_project_root(&gone, &owned), Some(gone.clone()));
         // The folder exists: the normal path (canonical, a directory) applies.
         assert_eq!(missing_project_root(&present, &owned), None);
@@ -1958,7 +2035,7 @@ mod tests {
         let file = dir.path().join("file");
         fs::write(&file, "").unwrap();
         let below = file.join("project");
-        let owned = vec![("marsh-svc-c".to_owned(), key(&below))];
+        let owned = vec![key(&below)];
         assert_eq!(missing_project_root(&below, &owned), None);
     }
 
@@ -1987,6 +2064,444 @@ mod tests {
                 .is_err()
         );
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `marsh docker start` with a Docker disk too small for the pool is
+    /// refused before any stock call (the runner here fails every call), with
+    /// the engine's hint, and leaves no VM record and no failure behind.
+    #[test]
+    fn start_with_a_too_small_disk_is_refused_before_any_vm_exists() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new())
+            .with_services_artifacts(home.path().join("artifacts"));
+        let project = fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        fs::write(
+            home.path().join("config.json"),
+            json!({"services_disk_size": "5g"}).to_string(),
+        )
+        .unwrap();
+        let message = backend
+            .services_request(ServicesRequest::Start {
+                root: project.clone(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("the Docker disk is set to 5g")
+                && message.contains("marsh config services-disk-size"),
+            "{message}"
+        );
+        assert!(
+            backend
+                .sbx
+                .owned_services_vms()
+                .iter()
+                .all(|(_, key)| key != project.to_str().unwrap())
+        );
+        fs::remove_dir_all(&project).unwrap();
+    }
+
+    fn config_list(home: &Path, key: &str) -> Vec<String> {
+        let document: Value =
+            serde_json::from_slice(&fs::read(home.join("config.json")).unwrap()).unwrap();
+        document[key]
+            .as_array()
+            .map(|all| {
+                all.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A daemon home and a base folder for the `rm --project` tests below:
+    /// `here` exists; the others never do.
+    struct RmFixture {
+        home: tempfile::TempDir,
+        backend: StockDaemonBackend,
+        base: PathBuf,
+    }
+
+    impl RmFixture {
+        fn new(config: &Value) -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+            let base = fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+            fs::create_dir(base.join("here")).unwrap();
+            fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+            Self {
+                home,
+                backend,
+                base,
+            }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.base.join(name)
+        }
+
+        fn key(&self, name: &str) -> String {
+            self.path(name).to_str().unwrap().to_owned()
+        }
+
+        fn remove(&self, name: &str) -> Result<Value, DaemonError> {
+            self.backend.services_request(ServicesRequest::Remove {
+                root: self.path(name),
+            })
+        }
+
+        fn status(&self) -> Value {
+            self.backend
+                .services_request(ServicesRequest::Status {
+                    root: self.path("here"),
+                })
+                .unwrap()
+        }
+
+        fn list(&self, key: &str) -> Vec<String> {
+            config_list(self.home.path(), key)
+        }
+    }
+
+    impl Drop for RmFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// `rm --project FOLDER` for a gone folder that only has a setting (no VM
+    /// was ever made, or it was removed already) succeeds, says nothing was
+    /// removed and that the setting was forgotten, on either list.
+    #[test]
+    fn rm_of_a_gone_project_with_only_a_setting_forgets_the_setting() {
+        let fixture = RmFixture::new(&json!({"docker_default_on": false}));
+        let on = fixture.key("moved-on");
+        let off = fixture.key("moved-off");
+        fs::write(
+            fixture.home.path().join("config.json"),
+            json!({"services_projects": [on], "docker_projects_off": [off]}).to_string(),
+        )
+        .unwrap();
+        for name in ["moved-on", "moved-off"] {
+            let document = fixture.remove(name).unwrap();
+            assert_eq!(document["removed"], false, "{name}");
+            assert_eq!(document["forgot_setting"], true, "{name}");
+        }
+        assert_eq!(fixture.list("services_projects"), Vec::<String>::new());
+        assert_eq!(fixture.list("docker_projects_off"), Vec::<String>::new());
+    }
+
+    /// Only the removed gone project's setting goes: an existing folder's
+    /// setting, and every other key and entry, stay.
+    #[test]
+    fn rm_forgets_nothing_but_the_gone_projects_setting() {
+        let fixture = RmFixture::new(&json!({}));
+        let (gone, here, other) = (
+            fixture.key("moved"),
+            fixture.key("here"),
+            fixture.key("other-gone"),
+        );
+        fs::write(
+            fixture.home.path().join("config.json"),
+            json!({
+                "shell": "zsh",
+                "services_projects": [gone, here, other],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // An existing folder keeps its setting (and says it forgot none).
+        let document = fixture.remove("here").unwrap();
+        assert_eq!(document["forgot_setting"], false);
+        assert!(fixture.list("services_projects").contains(&here));
+        fixture.remove("moved").unwrap();
+        assert_eq!(fixture.list("services_projects"), [here, other]);
+        let document: Value =
+            serde_json::from_slice(&fs::read(fixture.home.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(document["shell"], "zsh");
+    }
+
+    /// After the rm, `status` no longer lists the folder, in its rows or in
+    /// the projects Docker is on for.
+    #[test]
+    fn status_stops_listing_a_removed_gone_project() {
+        let fixture = RmFixture::new(&json!({"docker_default_on": false}));
+        let gone = fixture.key("moved");
+        fs::write(
+            fixture.home.path().join("config.json"),
+            json!({"docker_default_on": false, "services_projects": [gone]}).to_string(),
+        )
+        .unwrap();
+        fixture.remove("moved").unwrap();
+        let status = fixture.status();
+        let rows = status["projects"].as_array().unwrap();
+        assert!(rows.iter().all(|row| row["root"] != gone), "{status}");
+        assert_eq!(status["enabled_projects"], json!([]));
+    }
+
+    /// A gone folder nothing is recorded for, or one already forgotten, is
+    /// refused in plain words, not with the OS error.
+    #[test]
+    fn rm_of_an_unrecorded_gone_folder_is_refused_plainly() {
+        let fixture = RmFixture::new(&json!({}));
+        let moved = fixture.key("moved");
+        fs::write(
+            fixture.home.path().join("config.json"),
+            json!({"services_projects": [moved]}).to_string(),
+        )
+        .unwrap();
+        fixture.remove("moved").unwrap();
+        for name in ["moved", "never-seen"] {
+            let message = fixture.remove(name).unwrap_err().to_string();
+            assert!(
+                message.contains("no Docker VM or setting is recorded"),
+                "{name}: {message}"
+            );
+            assert!(!message.contains("os error"), "{name}: {message}");
+        }
+    }
+
+    /// An unreadable `config.json` is reported as that, not as "nothing is
+    /// recorded" for a folder whose setting may be in it.
+    #[test]
+    fn rm_of_a_gone_folder_reports_an_unreadable_config() {
+        let fixture = RmFixture::new(&json!({}));
+        fs::write(fixture.home.path().join("config.json"), "{ not json").unwrap();
+        let message = fixture.remove("moved").unwrap_err().to_string();
+        assert!(
+            message.contains("invalid") && message.contains("config.json"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("no Docker VM or setting is recorded"),
+            "{message}"
+        );
+    }
+
+    /// Removals of different gone projects at once (their project locks differ)
+    /// all succeed and none of their settings is brought back by another's
+    /// write.
+    #[test]
+    fn concurrent_rm_of_gone_projects_loses_no_forget() {
+        let fixture = RmFixture::new(&json!({}));
+        let names = (0..12).map(|n| format!("moved-{n}")).collect::<Vec<_>>();
+        let keys = names
+            .iter()
+            .map(|name| fixture.key(name))
+            .collect::<Vec<_>>();
+        // A large unrelated value widens each write, so unlocked ones overlap.
+        fs::write(
+            fixture.home.path().join("config.json"),
+            json!({"services_projects": keys, "pad": "x".repeat(1 << 20)}).to_string(),
+        )
+        .unwrap();
+        let results = std::thread::scope(|scope| {
+            let workers = names
+                .iter()
+                .map(|name| scope.spawn(|| fixture.remove(name)))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (name, result) in names.iter().zip(&results) {
+            assert!(result.is_ok(), "{name}: {result:?}");
+        }
+        assert_eq!(
+            fixture.list("services_projects"),
+            Vec::<String>::new(),
+            "a forget was lost"
+        );
+        let leftovers = fs::read_dir(fixture.home.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".config.json")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    /// A stock that lists no VMs at all (and answers every call with success).
+    struct EmptyStock;
+
+    impl marsh_runtime::CommandRunner for EmptyStock {
+        fn run(
+            &self,
+            invocation: &marsh_runtime::Invocation,
+        ) -> std::io::Result<marsh_runtime::CommandOutput> {
+            self.run_bounded(invocation, Duration::ZERO)
+        }
+
+        fn run_bounded(
+            &self,
+            _invocation: &marsh_runtime::Invocation,
+            _timeout: Duration,
+        ) -> std::io::Result<marsh_runtime::CommandOutput> {
+            Ok(marsh_runtime::CommandOutput {
+                exit_code: Some(0),
+                stdout: br#"{"sandboxes": []}"#.to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+
+        fn spawn_attached(
+            &self,
+            _invocation: &marsh_runtime::Invocation,
+        ) -> std::io::Result<marsh_runtime::Attachment> {
+            Err(std::io::Error::other("unexpected stock SBX attachment"))
+        }
+    }
+
+    /// A gone project the daemon has an ownership record for, whose VM stock no
+    /// longer lists, and no setting in `config.json`: `rm --project` has
+    /// nothing to forget. It must not need the config lock for that, so it
+    /// still succeeds where the lock cannot be made (a home that cannot be
+    /// written, a lock path that cannot be opened).
+    fn rm_with_nothing_to_forget(break_lock: impl FnOnce(&Path)) -> Result<Value, DaemonError> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let control = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let gone = base.join("moved");
+        // The ownership map lives in its own folder, so the home can break.
+        let map = control.path().join("vm-ownership.json");
+        let stock = || {
+            marsh_sbx::StockSbx::new("sbx", Arc::new(EmptyStock))
+                .with_vm_ownership(map.clone())
+                .unwrap()
+        };
+        let name = stock()
+            .vm_name(marsh_sbx::VmPurpose::Services, gone.to_str().unwrap())
+            .unwrap();
+        let mut document: Value = serde_json::from_slice(&fs::read(&map).unwrap()).unwrap();
+        document["vms"][&name]["uuid"] = json!("00000000-0000-4000-8000-000000000001");
+        fs::write(&map, document.to_string()).unwrap();
+        let backend = crate::tests::backend_with_stock(home.path(), BTreeMap::new(), stock());
+        assert_eq!(backend.sbx.owned_services_vms().len(), 1);
+        fs::write(home.path().join("config.json"), "{}").unwrap();
+        break_lock(home.path());
+        let result = backend.services_request(ServicesRequest::Remove { root: gone });
+        let _ = fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(&base);
+        result
+    }
+
+    #[test]
+    fn rm_with_nothing_to_forget_needs_no_writable_home() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let document = rm_with_nothing_to_forget(|home| {
+            fs::set_permissions(home, fs::Permissions::from_mode(0o500)).unwrap();
+        })
+        .unwrap();
+        assert_eq!(document["forgot_setting"], false);
+    }
+
+    #[test]
+    fn rm_with_nothing_to_forget_needs_no_usable_lock_file() {
+        let document = rm_with_nothing_to_forget(|home| {
+            // A link where the lock file goes: it cannot be opened.
+            std::os::unix::fs::symlink("nowhere", home.join("config.json.lock")).unwrap();
+        })
+        .unwrap();
+        assert_eq!(document["forgot_setting"], false);
+    }
+
+    /// When there is a setting to forget and the lock cannot be made, the
+    /// error names the lock file and the cause, and does not promise that a
+    /// retry will do.
+    #[test]
+    fn rm_that_must_write_and_cannot_lock_names_the_lock_file() {
+        let fixture = RmFixture::new(&json!({}));
+        let moved = fixture.key("moved");
+        fs::write(
+            fixture.home.path().join("config.json"),
+            json!({"services_projects": [moved]}).to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("nowhere", fixture.home.path().join("config.json.lock"))
+            .unwrap();
+        let message = fixture.remove("moved").unwrap_err().to_string();
+        assert!(
+            message.contains("config.json.lock") && message.contains("symbolic links"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("try again") && !message.contains("retry"),
+            "{message}"
+        );
+        assert_eq!(fixture.list("services_projects"), [moved]);
+    }
+
+    /// The daemon's forget takes the lock `marsh config` takes: with another
+    /// writer holding it, `rm` waits and forgets only after it lets go, and the
+    /// writer's own update is not lost.
+    #[test]
+    fn rm_waits_for_the_shared_config_lock_and_keeps_the_other_writers_update() {
+        let fixture = RmFixture::new(&json!({}));
+        let moved = fixture.key("moved");
+        fs::write(
+            fixture.home.path().join("config.json"),
+            json!({"services_projects": [moved], "shell": "marsh"}).to_string(),
+        )
+        .unwrap();
+        let lock = fs::File::create(fixture.home.path().join("config.json.lock")).unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        std::thread::scope(|scope| {
+            let removal = scope.spawn(|| fixture.remove("moved"));
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!removal.is_finished(), "rm did not wait for the lock");
+            // The other writer's update, then it lets go.
+            let mut document: Value =
+                serde_json::from_slice(&fs::read(fixture.home.path().join("config.json")).unwrap())
+                    .unwrap();
+            document["shell"] = json!("zsh");
+            fs::write(
+                fixture.home.path().join("config.json"),
+                document.to_string(),
+            )
+            .unwrap();
+            drop(lock);
+            removal.join().unwrap().unwrap();
+        });
+        let document: Value =
+            serde_json::from_slice(&fs::read(fixture.home.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(document["shell"], "zsh");
+        assert_eq!(fixture.list("services_projects"), Vec::<String>::new());
+    }
+
+    /// A setting that cannot be forgotten fails the request, naming it, and
+    /// leaves the setting so running the command again can finish the job.
+    #[test]
+    fn rm_fails_when_the_setting_cannot_be_forgotten_and_can_be_retried() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = RmFixture::new(&json!({}));
+        let moved = fixture.key("moved");
+        fs::write(
+            fixture.home.path().join("config.json"),
+            json!({"services_projects": [moved]}).to_string(),
+        )
+        .unwrap();
+        let home = fixture.home.path();
+        // No new file can be made beside config.json.
+        fs::set_permissions(home, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = fixture.remove("moved");
+        fs::set_permissions(home, fs::Permissions::from_mode(0o700)).unwrap();
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("could not forget the Docker setting"),
+            "{message}"
+        );
+        assert_eq!(fixture.list("services_projects"), [moved]);
+        assert_eq!(fixture.remove("moved").unwrap()["forgot_setting"], true);
+        assert_eq!(fixture.list("services_projects"), Vec::<String>::new());
     }
 
     /// The project a services request names must be a canonical, existing

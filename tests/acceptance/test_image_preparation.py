@@ -55,7 +55,7 @@ elif args[:2]==['template','load']:
  if '/' not in name:name='docker.io/library/'+name
  elif name.startswith('library/'):name='docker.io/'+name
  repository,tag=name.rsplit(':',1)
- row={'repository':repository,'tag':tag,'id':sha(manifest)[7:19],'full_id':sha(manifest)}
+ row={'repository':repository,'tag':tag,'id':sha(manifest) if (root/'full-digest-id').exists() else sha(manifest)[7:19],'full_id':sha(manifest)}
  (root/'template.json').write_text(json.dumps(row))
  all_images=json.loads((root/'templates.json').read_text()) if (root/'templates.json').exists() else {}
  all_images[name]=row;(root/'templates.json').write_text(json.dumps(all_images))
@@ -246,6 +246,15 @@ class ImageCallerTests(unittest.TestCase):
         proof = json.loads(self.output.with_name('shell-image.build.json').read_text())
         local = proof['local_image']
         self.assertEqual(local['template']['id'], local['archive']['platform_manifest_digest'][7:19])
+        self.assertEqual(proof['reference'], self.output.read_text().strip())
+
+    def test_full_digest_template_id_from_sbx_0_53_imports_the_exact_template(self):
+        (self.root/'full-digest-id').write_text('')
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        proof = json.loads(self.output.with_name('shell-image.build.json').read_text())
+        local = proof['local_image']
+        self.assertEqual(local['template']['id'], local['archive']['platform_manifest_digest'])
         self.assertEqual(proof['reference'], self.output.read_text().strip())
 
     def test_foreign_wrong_extra_and_missing_archive_tags_fail_before_sdk_with_bounded_evidence(self):

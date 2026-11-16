@@ -98,6 +98,10 @@ pub mod breaks {
     }
 }
 
+/// What to tell the user about a services VM marsh refuses to reuse. Mirrors
+/// `marsh docker rm` in `docs/man/marsh.1.md`: it deletes the VM's Docker
+/// data, so say so; the project folder on the Mac is not touched.
+const DOCKER_RM_ACTION: &str = "run `marsh docker rm` in the project folder to remove it (this deletes the project's Docker containers, volumes, images and saved Docker data; your project files are kept)";
 /// The per-sandbox Docker disk size variable stock SBX reads on `create`.
 const DISK_SIZE_VARIABLE: &str = "DOCKER_SANDBOXES_DOCKER_SIZE";
 /// A fresh VM's Docker filesystem must be at least this share of the size
@@ -134,6 +138,10 @@ pub struct ServicesVmSpec {
     /// Docker disk size for a new VM, for example `40g`. Existing VMs keep
     /// the size they were created with.
     pub disk_size: String,
+    /// The engine's Docker pool, which a new VM's disk must hold with the
+    /// engine's reserve (`marsh_services::engine::check_pool_fits`). `None`
+    /// skips the check (the engine's own check still runs at engine start).
+    pub pool_bytes: Option<u64>,
 }
 
 /// Readiness generation: the VM's boot id plus this daemon's counter, which
@@ -218,6 +226,30 @@ fn valid_disk_size(value: &str) -> bool {
         .is_some_and(|gib| (1..=4096).contains(&gib))
 }
 
+/// Refuse a new VM whose configured disk cannot hold the engine's pool plus
+/// its reserve: the engine would only fail at start, leaving the VM behind.
+fn check_disk_holds_pool(spec: &ServicesVmSpec) -> Result<(), SbxError> {
+    let Some(pool_bytes) = spec.pool_bytes else {
+        return Ok(());
+    };
+    let gibibytes = spec
+        .disk_size
+        .trim_end_matches(['g', 'G'])
+        .parse::<u64>()
+        .unwrap_or(0);
+    let needed = marsh_services::engine::pool_needed_bytes(pool_bytes);
+    if gibibytes.saturating_mul(1 << 30) >= needed {
+        return Ok(());
+    }
+    Err(SbxError::HostGrantFence(format!(
+        "the Docker disk is set to {}, which is too small: Docker needs {} MiB for its pool plus a {} MiB reserve ({} MiB in all). Set a larger disk with `marsh config services-disk-size` (for example 40g), then run `marsh docker start` again",
+        spec.disk_size,
+        pool_bytes >> 20,
+        marsh_services::engine::DISK_RESERVE_BYTES >> 20,
+        needed >> 20,
+    )))
+}
+
 impl StockSbx {
     fn services_key(project: &Path) -> Result<String, SbxError> {
         if !safe_absolute(project) {
@@ -270,6 +302,11 @@ impl StockSbx {
             )));
         }
         let key = Self::services_key(&spec.project)?;
+        // A project with no VM yet gets one now: refuse a disk that cannot
+        // hold the pool before a name is recorded or a VM exists.
+        if self.ownership.lookup(VmPurpose::Services, &key).is_none() {
+            check_disk_holds_pool(spec)?;
+        }
         let name = self.ownership.assign(VmPurpose::Services, &key)?;
         validate_name(&name)?;
         let init_lock = self.services_init_lock(&name);
@@ -333,6 +370,7 @@ impl StockSbx {
                 // Our recorded VM is gone and a VM that is not ours now holds
                 // its name: never exec into, adopt or remove it. This project
                 // takes a new random name.
+                check_disk_holds_pool(spec)?;
                 self.drop_stale_services_record(&name)?;
                 name = self.ownership.assign(VmPurpose::Services, key)?;
                 self.create_services_vm(spec, &name)?;
@@ -343,6 +381,7 @@ impl StockSbx {
                 false
             }
             VmClass::Absent => {
+                check_disk_holds_pool(spec)?;
                 self.create_services_vm(spec, &name)?;
                 true
             }
@@ -479,8 +518,11 @@ impl StockSbx {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let hint = if stderr.contains("cannot restore mount") {
                 "; the project folder is gone from the Mac: restore it, or remove the VM with `marsh docker rm --project FOLDER` (`marsh docker status` lists the folder)"
+                    .to_owned()
             } else {
-                ""
+                format!(
+                    "; check that `sbx ls` works and try again (`marsh docker stop`, then the command); only as a last resort, {DOCKER_RM_ACTION}"
+                )
             };
             return Err(SbxError::UnreadableVm {
                 vm: vm.to_owned(),
@@ -495,14 +537,14 @@ impl StockSbx {
         if actual.schema != "marsh.worker/v1" || actual.basis != KIT_VM_BASIS {
             return Err(SbxError::IncompatibleVm {
                 vm: vm.to_owned(),
-                detail: "its marker is not a marsh marker".into(),
+                detail: format!("its marker is not a marsh marker; {DOCKER_RM_ACTION}"),
             });
         }
         if actual.profile != profile {
             return Err(SbxError::IncompatibleVm {
                 vm: vm.to_owned(),
                 detail: format!(
-                    "its marker profile is {:?}, expected {profile:?}",
+                    "its marker profile is {:?}, expected {profile:?}; {DOCKER_RM_ACTION}",
                     actual.profile
                 ),
             });

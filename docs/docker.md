@@ -69,7 +69,12 @@ containers and its Docker VM at once and keeps the data.
 
 The Docker disk of a new Docker VM is 40 GiB. Change it with
 `marsh config services-disk-size SIZE` (`1g` to `4096g`); it applies to VMs
-created afterwards.
+created afterwards. Docker needs a 24 GiB pool and a 512 MiB reserve on that
+disk, so a size below `25g` is refused when marsh would create the VM, before
+any VM exists; the message gives the sizes and says to set a larger disk, and
+nothing is left to remove. A Docker VM that already exists keeps the disk it
+was made with and is never refused for the setting. (A disk just above 25g can still be too small once the filesystem has
+taken its share; the engine then says so at start.)
 
 ## Use Docker from a job or the shell
 
@@ -371,9 +376,18 @@ marsh docker rm --yes
 the project, so turning Docker off never strands a VM. A project folder that was
 moved or deleted still has its Docker VM and disk: `marsh docker status` marks it
 as gone, and `marsh docker rm --project /old/path` (from any folder) removes
-it. For a folder that is gone it only accepts the exact folder of a Docker VM
-marsh made (a folder on a drive that is not mounted looks gone too, so mount
-it first); for a folder that exists it acts like `marsh docker rm` run there.
+it. For a folder that is gone it only accepts the exact folder marsh has a
+Docker VM or a Docker setting recorded for (a folder on a drive that is not
+mounted looks gone too, so mount it first); for a folder that exists it acts
+like `marsh docker rm` run there. Once a gone folder's VM is removed, `rm`
+also forgets its setting, so `marsh docker status` and `marsh config docker ls`
+stop listing it; a gone folder that only has a setting (no VM was ever made)
+is forgotten the same way, and `rm` says there was no Docker VM to remove and
+that it forgot the setting. `rm --project` asks for confirmation only when the
+project has a Docker VM. If the setting cannot be forgotten (the config file is
+unreadable or cannot be written), `rm` fails and says so; the VM is already
+gone, and running the same command again finishes the job. Running it again for a folder marsh no longer has anything recorded for is
+refused with a message saying so.
 
 ## Checkpoints and Branch from here
 
@@ -705,7 +719,21 @@ In plain words:
   image by its tag names (`docker rmi name1 name2`), which keeps `-f`. A tag named like the
   start of an image's ID counts as an ID. `docker compose down --rmi` is not affected (it
   never forces, and removes tagged images by name). If the services VM cannot write its records at the moment a tag is
-  made, the tag is left unowned and the next workspace to ask may take it.
+  made, the tag is left unowned and the next workspace to ask may take it. When a lane
+  is closed, cancelled or removed, the tags it created are removed from the engine
+  with its containers and volumes (untag only: an image another tag uses stays). If
+  the engine does not confirm that, the tag stays the lane's and refused to others,
+  and `marshd` repeats the cleanup every few seconds (it prints `dropping lane ...
+  left image tag ...; will retry`). If the engine keeps refusing (a 409, for the last
+  tag of an image another lane's container uses), `marshd` gives up after about a
+  minute and says so; the tag then stays in the engine and, on a pulled image, only
+  `marsh docker rm` removes it. Tags whose ownership records were lost (the ledger
+  was set aside as corrupt) are not removed with a lane and, on a pulled image,
+  cannot be moved or removed by any workspace; only `marsh docker rm` clears them.
+  A tag longer than 255 characters cannot be claimed (the delete route could not name it).
+  Because a normal `docker build -t` is not covered (above), a lane can build over a tag
+  another lane created; closing the first lane then removes that tag from the engine
+  (the second lane's image loses its name; nothing else is touched).
 - **Docker's built-in `bridge` network is refused.** Containers without a
   network join their workspace's own network, so a plain `docker run` in two
   lanes cannot reach each other. Containers in one stack reach each other by

@@ -737,6 +737,53 @@ fn an_owned_shell_vm_without_its_own_marker_still_fails_closed() {
     assert_eq!(model.count("rm"), 0);
 }
 
+/// A half-built shell VM (its preparation was interrupted before the marker
+/// was written), one marked by another name and one stock SBX cannot exec in
+/// are all refused, and the refusal says `marsh reset` recovers it.
+#[test]
+fn a_refused_owned_shell_vm_says_how_to_recover() {
+    let shell = ShellFixture::new();
+    let model = StockModel::new();
+    let adapter = model.adapter();
+    model.seed_owned(&adapter, SHELL);
+    let error = adapter.ensure_shell_vm(&shell.spec).unwrap_err();
+    assert_names_reset(&error, "cannot be reused: it has no marsh worker marker; ");
+
+    let other = serde_json::json!({
+        "schema": "marsh.worker/v1",
+        "profile": format!("shell:marsh-s-other:{}", shell.spec.image.as_str()),
+        "basis": KIT_VM_BASIS,
+    });
+    model.with_vm(SHELL, |vm| {
+        vm.files.insert(
+            "/var/lib/marsh/worker.json".into(),
+            serde_json::to_vec(&other).unwrap(),
+        )
+    });
+    let error = adapter.ensure_shell_vm(&shell.spec).unwrap_err();
+    assert_names_reset(&error, "cannot be reused: its worker marker profile is ");
+
+    model.with_vm(SHELL, |vm| {
+        vm.files
+            .insert("/var/lib/marsh/worker.json".into(), b"junk".to_vec())
+    });
+    let error = adapter.ensure_shell_vm(&shell.spec).unwrap_err();
+    assert_names_reset(
+        &error,
+        "cannot be reused: its worker marker is not a marsh marker; ",
+    );
+
+    let down = ExecDown::adapter(&model);
+    model.seed_owned(&down, SHELL);
+    let error = down.ensure_shell_vm(&shell.spec).unwrap_err();
+    assert!(matches!(error, SbxError::UnreadableVm { .. }), "{error}");
+    assert_names_reset(
+        &error,
+        "could not be read (stock SBX could not start or exec in it): Error: sandbox failed to start: boom; check that `sbx ls` works and try again; if it keeps happening, ",
+    );
+    assert_eq!(model.count("rm"), 0);
+}
+
 /// Review of B-03/B9: `reset_shell_vm` passes a day-long deadline, and its
 /// wait for the VM's fence must still end at the fence cap.
 #[test]

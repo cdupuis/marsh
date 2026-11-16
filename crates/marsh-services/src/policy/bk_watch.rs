@@ -89,7 +89,8 @@ pub(super) struct Bk {
     next_stream: u64,
     /// Streams running (until their check is done): id to workspace and start.
     active: HashMap<u64, (String, u64)>,
-    /// Per workspace, the epoch its latest stream ended.
+    /// Per workspace, the epoch its latest stream ended, kept only while a
+    /// stream that began before it still runs.
     last_end: HashMap<String, u64>,
     legit: HashMap<String, Legit>,
     watching: HashMap<String, Watching>,
@@ -313,11 +314,22 @@ impl Watch {
         clean: bool,
     ) -> Vec<Finding> {
         let mut found = Vec::new();
+        // Names known as pulled ones: a stream's overwrite turns one into what
+        // looks like an unrecorded local name, and a later stream must still
+        // watch it against the image that was pulled.
+        let known: std::collections::HashSet<String> = self
+            .svc
+            .lock_bk()
+            .legit
+            .iter()
+            .filter(|(_, l)| l.owner.is_none())
+            .map(|(tag, _)| tag.clone())
+            .collect();
         for (tag, image, pulled) in images {
             let owner = match self.svc.ledger.tag_owner(&tag) {
                 Some(rec) if rec.scope == self.ws => continue,
                 Some(rec) => Some((rec.scope, rec.claim)),
-                None if pulled => None,
+                None if pulled || known.contains(&tag) => None,
                 None => continue,
             };
             // A request holds the name now: its engine call may not be done.
@@ -382,6 +394,11 @@ impl Watch {
         bk.active.remove(&self.id);
         let end = bk.tick();
         bk.last_end.insert(self.ws.clone(), end);
+        // An end is only needed by a stream that began before it.
+        match bk.active.values().map(|(_, start)| *start).min() {
+            Some(oldest) => bk.last_end.retain(|_, at| *at > oldest),
+            None => bk.last_end.clear(),
+        }
         for w in &self.tags {
             if let Some(t) = bk.watching.get_mut(&w.tag) {
                 t.refs -= 1;

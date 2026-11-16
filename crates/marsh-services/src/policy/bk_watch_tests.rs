@@ -707,10 +707,19 @@ fn a_stream_leaves_no_state_behind() {
     let c = open_stream(&b, "/grpc");
     assert_eq!(w.h.svc.bk_sizes(), [1, 2, 2, 0]);
     w.end(&c, B);
-    // Entries stay (legitimate images), the running and watched ones go.
-    assert_eq!(w.h.svc.bk_sizes(), [0, 2, 0, 1]);
+    // Entries stay (legitimate images); the running and watched ones go, and
+    // so does the end of a stream no running stream began before.
+    assert_eq!(w.h.svc.bk_sizes(), [0, 2, 0, 0]);
+    // The end of a stream is kept while an older one runs, and forgotten
+    // with its workspace.
+    let c3 = lane(&w.h, "lane-c");
+    let older = open_stream(&c3, "/grpc");
+    let c = open_stream(&b, "/grpc");
+    w.end(&c, B);
+    assert_eq!(w.h.svc.bk_sizes()[3], 1);
     w.h.svc.forget_scope(B).unwrap();
     assert_eq!(w.h.svc.bk_sizes()[3], 0);
+    w.end(&older, "lane-c");
     w.h.svc.forget_scope(A).unwrap();
     assert_eq!(w.h.svc.bk_sizes()[1], 1);
 
@@ -769,6 +778,85 @@ fn a_pull_during_another_stream_makes_the_recorded_image_stale() {
         [ev(B, "postgres:16", TagEventKind::NotRestored)]
     );
     w.end(&cc, "lane-c");
+}
+
+/// A pulled name that a stream overwrote stays watched by a stream that begins
+/// later (it is known as a pulled name, though it no longer looks like one), so
+/// that stream's own overwrite is put back too.
+#[test]
+fn a_late_stream_still_watches_an_overwritten_pulled_name() {
+    let w = World::new("bk-pulledlate");
+    let b = lane(&w.h, B);
+    let cb = open_stream(&b, "/grpc");
+    w.build("postgres:16", "sha256:first-overwrite");
+    let cc = open_stream(&b, "/session");
+    w.close(&cb);
+    assert!(wait_for(Duration::from_secs(5), || w.events().len() == 1));
+    assert_eq!(w.tag("postgres:16").as_deref(), Some("sha256:pg"));
+    w.build("postgres:16", "sha256:second-overwrite");
+    w.end(&cc, B);
+    assert_eq!(w.tag("postgres:16").as_deref(), Some("sha256:pg"));
+    assert_eq!(w.events().len(), 2);
+}
+
+/// A stream that finishes after its workspace was forgotten, and one that
+/// finishes before, leave no per-workspace state behind.
+#[test]
+fn a_stream_finishing_after_its_workspace_was_forgotten_keeps_nothing() {
+    let w = World::new("bk-forgot");
+    for i in 0..8 {
+        let ws = format!("gone{i}");
+        let b = lane(&w.h, &ws);
+        let c = open_stream(&b, "/grpc");
+        w.h.svc.forget_scope(&ws).unwrap();
+        w.end(&c, &ws);
+    }
+    assert_eq!(w.h.svc.bk_sizes()[0], 0);
+    assert_eq!(w.h.svc.bk_sizes()[2], 0);
+    assert_eq!(
+        w.h.svc.bk_sizes()[3],
+        0,
+        "forgotten workspace entries survived"
+    );
+}
+
+/// The first list of images is read under the tag lock: a REST request that
+/// would change a name waits for it.
+#[test]
+fn the_initial_image_list_holds_the_tag_lock() {
+    let listed = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let seen = listed.clone();
+    let gate = release.clone();
+    let w = World::with("bk-listlock", |e| {
+        Arc::new(move |req: &Req, s: &mut UnixStream| {
+            if req.target == "/images/json" && !seen.swap(true, Ordering::SeqCst) {
+                let until = Instant::now() + Duration::from_secs(5);
+                while !gate.load(Ordering::SeqCst) && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            e(req, s)
+        })
+    });
+    let (a, b) = (lane(&w.h, A), lane(&w.h, B));
+    let opening = std::thread::spawn(move || open_stream(&b, "/grpc"));
+    assert!(wait_for(Duration::from_secs(5), || listed.load(Ordering::SeqCst)));
+    let (send, receive) = std::sync::mpsc::channel();
+    let tagger = std::thread::spawn(move || {
+        send.send(tag_as(&a, "src", "base-app")).unwrap();
+    });
+    let early = receive.recv_timeout(Duration::from_millis(300));
+    release.store(true, Ordering::SeqCst);
+    let c = opening.join().unwrap();
+    tagger.join().unwrap();
+    w.end(&c, B);
+    assert!(
+        early.is_err(),
+        "REST tag ran during initial image list: {early:?}"
+    );
+    assert_eq!(receive.recv_timeout(Duration::from_secs(5)), Ok(201));
+    assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:src"));
 }
 
 /// The base workspace's status read gets the agent's own answer on the filtered

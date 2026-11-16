@@ -467,7 +467,11 @@ has is checked.
      lists the images. Every tag its workspace may not move is watched, at most 256,
      recorded ones first (more is an event, "not fully checked"): tags the ledger
      records to another workspace, and unrecorded names on an image with a registry
-     digest (`postgres:16`). A name a REST request holds at that moment is not
+     digest (`postgres:16`) **or that have a legitimate image on record as such** (an
+     overwritten pulled name no longer has a digest, and must stay watched). Only a
+     name the agent has seen under a clean stream is known; one overwritten before
+     any such stream (or before an agent restart) looks like an unrecorded local
+     name and is not protected. A name a REST request holds at that moment is not
      watched. The tag's image for this stream is the recorded one **even when the tag
      differs now** (an overlapping stream has moved it, and that is not the tag's
      state); with no record, and others running (or the table full), it is the image
@@ -493,6 +497,11 @@ has is checked.
        gone) is "not restored".
      The stream counts as running until this is done, and any event is raised after
      the tag lock is released (a blocked stderr cannot stall claims).
+     A stream's end is remembered only while a stream that began before it still
+     runs, so the per-workspace history cannot grow; forgetting a workspace drops its
+     records and that history at once. A stream still running is not dropped (it
+     keeps counting as running until it ends, which keeps new baselines honest), and
+     events are kept (bounded, display only, never used to decide).
   4. An event is a line on the agent's standard error (`marsh-services: BuildKit
      stream of workspace ...`; the workspace is the one whose stream saw it, which
      with overlapping streams need not be the one that moved the tag) and an entry

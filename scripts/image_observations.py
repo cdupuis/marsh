@@ -134,6 +134,12 @@ class LocalImageImportError(ValueError):
         self.observations = observations
 
 
+def template_id_matches(listed, digest) -> bool:
+    """Stock SBX lists a loaded template's id as the first 12 hex digits of its platform
+    manifest digest (older builds) or as the full `sha256:` digest (v0.53.0 and later)."""
+    return isinstance(listed, str) and listed in (digest[7:19], digest[7:], digest)
+
+
 def import_local_image(docker, sbx, temporary_tag, directory: Path, kind: str) -> tuple[str, dict]:
     records = []
     trail = {"phase": "save-built-image", "temporary_tag": temporary_tag,
@@ -187,7 +193,7 @@ def import_local_image(docker, sbx, temporary_tag, directory: Path, kind: str) -
         rows = [row for row in inventory if isinstance(row, dict)
                 and row.get("repository") == repository and row.get("tag") == tag]
         records[-1]["stdout"] = json.dumps({"images": [{key: row.get(key) for key in ("repository", "tag", "id")} for row in rows[:4]]})
-        if len(rows) != 1 or rows[0].get("id") != imported["platform_manifest_digest"][7:19]:
+        if len(rows) != 1 or not template_id_matches(rows[0].get("id"), imported["platform_manifest_digest"]):
             raise ValueError("stock template listing differs from the produced/imported image")
         trail["phase"] = "sdk-full-image-identity"
         observation = inspect_image(named)
@@ -272,7 +278,7 @@ def verify_local_image_proof(proof: dict, reference: str, kind: str) -> None:
         raise ValueError("local producer lacks a full SDK image identity observation")
     template = image.get("template", {})
     if (template.get("repository") != repository or template.get("tag") != expected_tag
-            or template.get("id") != digest[7:19]
+            or not template_id_matches(template.get("id"), digest)
             or image.get("runtime_reference") != repository + ":" + expected_tag
             or archive.get("repository_tags") != [repository + ":" + expected_tag]):
         raise ValueError("local template identity/proof mismatch")

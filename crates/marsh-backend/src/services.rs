@@ -2288,6 +2288,117 @@ mod tests {
         assert_eq!(leftovers, 0);
     }
 
+    /// A stock that lists no VMs at all (and answers every call with success).
+    struct EmptyStock;
+
+    impl marsh_runtime::CommandRunner for EmptyStock {
+        fn run(
+            &self,
+            invocation: &marsh_runtime::Invocation,
+        ) -> std::io::Result<marsh_runtime::CommandOutput> {
+            self.run_bounded(invocation, Duration::ZERO)
+        }
+
+        fn run_bounded(
+            &self,
+            _invocation: &marsh_runtime::Invocation,
+            _timeout: Duration,
+        ) -> std::io::Result<marsh_runtime::CommandOutput> {
+            Ok(marsh_runtime::CommandOutput {
+                exit_code: Some(0),
+                stdout: br#"{"sandboxes": []}"#.to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+
+        fn spawn_attached(
+            &self,
+            _invocation: &marsh_runtime::Invocation,
+        ) -> std::io::Result<marsh_runtime::Attachment> {
+            Err(std::io::Error::other("unexpected stock SBX attachment"))
+        }
+    }
+
+    /// A gone project the daemon has an ownership record for, whose VM stock no
+    /// longer lists, and no setting in `config.json`: `rm --project` has
+    /// nothing to forget. It must not need the config lock for that, so it
+    /// still succeeds where the lock cannot be made (a home that cannot be
+    /// written, a lock path that cannot be opened).
+    fn rm_with_nothing_to_forget(break_lock: impl FnOnce(&Path)) -> Result<Value, DaemonError> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let control = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        let gone = base.join("moved");
+        // The ownership map lives in its own folder, so the home can break.
+        let map = control.path().join("vm-ownership.json");
+        let stock = || {
+            marsh_sbx::StockSbx::new("sbx", Arc::new(EmptyStock))
+                .with_vm_ownership(map.clone())
+                .unwrap()
+        };
+        let name = stock()
+            .vm_name(marsh_sbx::VmPurpose::Services, gone.to_str().unwrap())
+            .unwrap();
+        let mut document: Value = serde_json::from_slice(&fs::read(&map).unwrap()).unwrap();
+        document["vms"][&name]["uuid"] = json!("00000000-0000-4000-8000-000000000001");
+        fs::write(&map, document.to_string()).unwrap();
+        let backend = crate::tests::backend_with_stock(home.path(), BTreeMap::new(), stock());
+        assert_eq!(backend.sbx.owned_services_vms().len(), 1);
+        fs::write(home.path().join("config.json"), "{}").unwrap();
+        break_lock(home.path());
+        let result = backend.services_request(ServicesRequest::Remove { root: gone });
+        let _ = fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(&base);
+        result
+    }
+
+    #[test]
+    fn rm_with_nothing_to_forget_needs_no_writable_home() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let document = rm_with_nothing_to_forget(|home| {
+            fs::set_permissions(home, fs::Permissions::from_mode(0o500)).unwrap();
+        })
+        .unwrap();
+        assert_eq!(document["forgot_setting"], false);
+    }
+
+    #[test]
+    fn rm_with_nothing_to_forget_needs_no_usable_lock_file() {
+        let document = rm_with_nothing_to_forget(|home| {
+            // A link where the lock file goes: it cannot be opened.
+            std::os::unix::fs::symlink("nowhere", home.join("config.json.lock")).unwrap();
+        })
+        .unwrap();
+        assert_eq!(document["forgot_setting"], false);
+    }
+
+    /// When there is a setting to forget and the lock cannot be made, the
+    /// error names the lock file and the cause, and does not promise that a
+    /// retry will do.
+    #[test]
+    fn rm_that_must_write_and_cannot_lock_names_the_lock_file() {
+        let fixture = RmFixture::new(&json!({}));
+        let moved = fixture.key("moved");
+        fs::write(
+            fixture.home.path().join("config.json"),
+            json!({"services_projects": [moved]}).to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("nowhere", fixture.home.path().join("config.json.lock"))
+            .unwrap();
+        let message = fixture.remove("moved").unwrap_err().to_string();
+        assert!(
+            message.contains("config.json.lock") && message.contains("symbolic links"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("try again") && !message.contains("retry"),
+            "{message}"
+        );
+        assert_eq!(fixture.list("services_projects"), [moved]);
+    }
+
     /// The daemon's forget takes the lock `marsh config` takes: with another
     /// writer holding it, `rm` waits and forgets only after it lets go, and the
     /// writer's own update is not lost.

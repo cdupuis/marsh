@@ -284,6 +284,40 @@ mod tests {
         );
     }
 
+    /// The whole `limits` object is read after the lock is held: a limit another
+    /// writer sets while this one waits is kept, not overwritten.
+    #[test]
+    fn a_limit_reads_the_limits_object_under_the_lock() {
+        let root = scope();
+        std::fs::write(
+            root.path().join("config.json"),
+            r#"{"limits": {"tree-launch-rate": "120/2m"}}"#,
+        )
+        .unwrap();
+        let lock = std::fs::File::create(root.path().join("config.json.lock")).unwrap();
+        let held =
+            nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap();
+        let writer = {
+            let path = root.path().to_owned();
+            std::thread::spawn(move || set_command(&path, "job-children", "32"))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Another writer's limit, set while this one waits.
+        std::fs::write(
+            root.path().join("config.json"),
+            r#"{"limits": {"tree-launch-rate": "120/2m", "daemon-jobs": 8}}"#,
+        )
+        .unwrap();
+        drop(held);
+        assert_eq!(writer.join().unwrap(), Ok(0));
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(document["limits"]["job-children"], 32);
+        assert_eq!(document["limits"]["daemon-jobs"], 8);
+        assert_eq!(document["limits"]["tree-launch-rate"], "120/2m");
+    }
+
     #[test]
     fn values_are_validated_before_anything_is_written() {
         let root = scope();

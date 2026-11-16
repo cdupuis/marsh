@@ -8,8 +8,11 @@
 //! exclusive `flock` on `config.json.lock`, next to the file, from the read to
 //! the rename; the new copy has a name of its own, is synced, and replaces the
 //! file atomically. A writer that cannot get the lock in time fails; it never
-//! writes without it. Readers take no lock: they see the old file or the new
-//! one, never a partial one.
+//! writes without it. A change that turns out to alter nothing takes no lock at
+//! all (it is judged on one read of the file, a consistent snapshot), so a
+//! command with nothing to write cannot fail for a lock it does not need.
+//! Readers take no lock: they see the old file or the new one, never a partial
+//! one.
 
 use rustix::fs::{FlockOperation, Mode, OFlags};
 use serde_json::{Map, Value};
@@ -56,17 +59,22 @@ impl From<io::Error> for ConfigError {
 }
 
 /// Apply `change` to the document of `scope_root`'s `config.json` (empty when
-/// the file is missing) under the lock, and write it back when `change` altered
-/// it. Returns what `change` returns. When `change` returns an error the file
-/// is left as it was.
+/// the file is missing), and write it back when `change` altered it. Returns
+/// what `change` returns. When `change` returns an error the file is left as it
+/// was.
+///
+/// `change` first runs on a read of the file taken without the lock: when it
+/// alters nothing there, that is the answer and no lock is taken. Otherwise it
+/// runs again on the file as it is once the lock is held, and that run is the
+/// one that counts. It must therefore be repeatable.
 ///
 /// # Errors
-/// [`ConfigError::Rejected`] from `change`; [`ConfigError::Io`] when the lock
-/// is not obtained within [`LOCK_WAIT`], the file is not a JSON object, or it
-/// cannot be written.
+/// [`ConfigError::Rejected`] from `change`; [`ConfigError::Io`] when a write is
+/// needed and the lock cannot be opened or is not obtained within
+/// [`LOCK_WAIT`], the file is not a JSON object, or it cannot be written.
 pub fn update<R>(
     scope_root: &Path,
-    change: impl FnOnce(&mut Map<String, Value>) -> Result<R, String>,
+    change: impl FnMut(&mut Map<String, Value>) -> Result<R, String>,
 ) -> Result<R, ConfigError> {
     update_within(scope_root, LOCK_WAIT, change)
 }
@@ -78,20 +86,25 @@ pub fn update<R>(
 pub fn update_within<R>(
     scope_root: &Path,
     wait: Duration,
-    change: impl FnOnce(&mut Map<String, Value>) -> Result<R, String>,
+    mut change: impl FnMut(&mut Map<String, Value>) -> Result<R, String>,
 ) -> Result<R, ConfigError> {
+    let path = scope_root.join(CONFIG_FILE);
+    // Nothing to write: no lock, no folder to make. An unreadable file or a
+    // refusal is judged again under the lock below.
+    if let Ok(mut snapshot) = read_document(&path) {
+        let before = snapshot.clone();
+        if let Ok(result) = change(&mut snapshot)
+            && snapshot == before
+        {
+            return Ok(result);
+        }
+    }
     if !scope_root.exists() {
         fs::create_dir_all(scope_root)?;
         fs::set_permissions(scope_root, fs::Permissions::from_mode(0o700))?;
     }
     let _lock = lock(&scope_root.join(LOCK_FILE), wait)?;
-    let path = scope_root.join(CONFIG_FILE);
-    let mut document = match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<Map<String, Value>>(&bytes)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Map::new(),
-        Err(error) => return Err(error.into()),
-    };
+    let mut document = read_document(&path)?;
     let before = document.clone();
     let result = change(&mut document).map_err(ConfigError::Rejected)?;
     if document != before {
@@ -100,12 +113,37 @@ pub fn update_within<R>(
     Ok(result)
 }
 
+/// The document in `path`: empty when the file is missing.
+fn read_document(path: &Path) -> io::Result<Map<String, Value>> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(error) => Err(error),
+    }
+}
+
+/// An error that names the lock file and what went wrong with it.
+fn lock_error(path: &Path, what: &str, error: impl Into<io::Error>) -> io::Error {
+    let error = error.into();
+    io::Error::new(
+        error.kind(),
+        format!(
+            "{what} the lock file {}: {error}; nothing was written (if another user's run left it unusable, fix its owner or remove it)",
+            path.display()
+        ),
+    )
+}
+
 fn lock(path: &Path, wait: Duration) -> io::Result<rustix::fd::OwnedFd> {
+    // `flock` needs no write access, so read-only is the least that works: a
+    // lock file another user's run left unwritable can still be locked.
     let file = rustix::fs::open(
         path,
-        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
-    )?;
+    )
+    .map_err(|error| lock_error(path, "cannot open", error))?;
     let deadline = Instant::now() + wait;
     loop {
         match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
@@ -122,7 +160,7 @@ fn lock(path: &Path, wait: Duration) -> io::Result<rustix::fd::OwnedFd> {
                     ),
                 ));
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(lock_error(path, "cannot lock", error)),
         }
     }
 }
@@ -315,6 +353,109 @@ mod tests {
             fs::read_to_string(root.path().join(CONFIG_FILE)).unwrap(),
             "{\"a\":1}"
         );
+    }
+
+    /// A change that alters nothing needs no lock and no writable folder: it
+    /// succeeds where the lock cannot be made, and does not wait for a holder.
+    #[test]
+    fn a_no_op_update_takes_no_lock() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(CONFIG_FILE), "{\"a\":1}").unwrap();
+        // The lock path cannot be opened at all (a link: it is not followed).
+        std::os::unix::fs::symlink("nowhere", root.path().join(LOCK_FILE)).unwrap();
+        assert_eq!(update(root.path(), |_| Ok(7)).unwrap(), 7);
+        // A read-only folder, no lock file yet, and no config file either.
+        let readonly = tempfile::tempdir().unwrap();
+        fs::set_permissions(readonly.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        assert_eq!(update(readonly.path(), |_| Ok(8)).unwrap(), 8);
+        fs::set_permissions(readonly.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        // Another writer holds the lock: a no-op returns at once.
+        let free = tempfile::tempdir().unwrap();
+        let _held = hold(free.path());
+        let started = Instant::now();
+        update_within(free.path(), Duration::from_secs(5), |_| Ok(())).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A change that must write names the lock file and the real cause when
+    /// the lock cannot be made, and says nothing about retrying.
+    #[test]
+    fn a_needed_write_that_cannot_lock_names_the_lock_file_and_the_cause() {
+        let change = |document: &mut Map<String, Value>| {
+            document.insert("a".into(), 2.into());
+            Ok(())
+        };
+        let linked_lock = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("nowhere", linked_lock.path().join(LOCK_FILE)).unwrap();
+        let readonly = tempfile::tempdir().unwrap();
+        fs::set_permissions(readonly.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        for (root, cause) in [
+            (&linked_lock, "symbolic links"),
+            (&readonly, "Permission denied"),
+        ] {
+            let error = update(root.path(), change).unwrap_err().to_string();
+            assert!(
+                error.contains(LOCK_FILE) && error.contains(cause),
+                "{error}"
+            );
+            assert!(
+                error.contains(&root.path().display().to_string()),
+                "the path is named: {error}"
+            );
+            assert!(
+                !error.contains("try again") && !error.contains("retry"),
+                "{error}"
+            );
+            assert!(!root.path().join(CONFIG_FILE).exists());
+        }
+        fs::set_permissions(readonly.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// `flock` needs no write access, so a lock file that is readable but not
+    /// writable (left that way by another user's run) still works.
+    #[test]
+    fn a_read_only_lock_file_still_locks() {
+        let root = tempfile::tempdir().unwrap();
+        let lock = root.path().join(LOCK_FILE);
+        fs::write(&lock, "").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o400)).unwrap();
+        update(root.path(), |document| {
+            document.insert("a".into(), 1.into());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(read(root.path())["a"], 1);
+    }
+
+    /// The change is worked out again from the file as it is once the lock is
+    /// held: an update made while this writer waited is kept.
+    #[test]
+    fn a_change_is_computed_again_under_the_lock() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(CONFIG_FILE), "{\"list\":[\"x\"]}").unwrap();
+        let held = hold(root.path());
+        let writer = {
+            let root = root.path().to_owned();
+            std::thread::spawn(move || {
+                update(&root, |document| {
+                    let list = document
+                        .get_mut("list")
+                        .and_then(Value::as_array_mut)
+                        .unwrap();
+                    list.push("mine".into());
+                    Ok(())
+                })
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        fs::write(
+            root.path().join(CONFIG_FILE),
+            "{\"list\":[\"x\",\"theirs\"]}",
+        )
+        .unwrap();
+        drop(held);
+        writer.join().unwrap().unwrap();
+        assert_eq!(read(root.path())["list"], json!(["x", "theirs", "mine"]));
     }
 
     /// A file that is not a JSON object is an error, never overwritten.

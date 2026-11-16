@@ -291,7 +291,7 @@ pub fn config_command(arguments: &[OsString], scope_root: &Path) -> Result<i32, 
                     2,
                 ));
             }
-            write_config(scope_root, SERVICES_DISK_SIZE_KEY, (*size).into())
+            write_config(scope_root, SERVICES_DISK_SIZE_KEY, &(*size).into())
                 .map_err(|error| config_write_error(scope_root, &error))?;
             println!("{size}");
             Ok(0)
@@ -314,7 +314,7 @@ pub fn config_command(arguments: &[OsString], scope_root: &Path) -> Result<i32, 
                         2,
                     )
                 })?;
-            write_config(scope_root, SERVICES_IDLE_KEY, seconds.into())
+            write_config(scope_root, SERVICES_IDLE_KEY, &seconds.into())
                 .map_err(|error| config_write_error(scope_root, &error))?;
             println!("{seconds}");
             Ok(0)
@@ -345,7 +345,7 @@ pub fn config_command(arguments: &[OsString], scope_root: &Path) -> Result<i32, 
                 "skills-mirror" => SKILLS_MIRROR_KEY,
                 _ => CLOUD_DELEGATE_KEY,
             };
-            write_config(scope_root, key, (*value == "on").into()).map_err(|error| {
+            write_config(scope_root, key, &(*value == "on").into()).map_err(|error| {
                 (
                     format!(
                         "cannot write {}: {error}",
@@ -360,7 +360,7 @@ pub fn config_command(arguments: &[OsString], scope_root: &Path) -> Result<i32, 
         ["shell", name] => {
             let choice =
                 ShellChoice::parse(name).ok_or_else(|| (invalid("marsh config shell", name), 2))?;
-            write_config(scope_root, "shell", choice.name().into()).map_err(|error| {
+            write_config(scope_root, "shell", &choice.name().into()).map_err(|error| {
                 (
                     format!(
                         "cannot write {}: {error}",
@@ -550,7 +550,7 @@ fn docker_default_config(word: Option<&str>, scope_root: &Path) -> Result<i32, (
             }
         ),
         Some(value) => {
-            write_config(scope_root, DOCKER_DEFAULT_KEY, (value == "on").into())
+            write_config(scope_root, DOCKER_DEFAULT_KEY, &(value == "on").into())
                 .map_err(|error| config_write_error(scope_root, &error))?;
             println!("{value}");
         }
@@ -621,7 +621,7 @@ fn vm_idle_days_command(value: Option<&str>, scope_root: &Path) -> Result<i32, (
                 )
             })?,
     };
-    write_config(scope_root, VM_IDLE_DAYS_KEY, days.into()).map_err(|error| {
+    write_config(scope_root, VM_IDLE_DAYS_KEY, &days.into()).map_err(|error| {
         (
             format!(
                 "cannot write {}: {error}",
@@ -639,10 +639,10 @@ fn vm_idle_days_command(value: Option<&str>, scope_root: &Path) -> Result<i32, (
 pub(crate) fn write_config(
     scope_root: &Path,
     key: &str,
-    value: serde_json::Value,
+    value: &serde_json::Value,
 ) -> io::Result<()> {
     marsh_daemon::config_file::update(scope_root, |document| {
-        document.insert(key.into(), value);
+        document.insert(key.into(), value.clone());
         Ok(())
     })
     .map_err(|error| match error {
@@ -1024,6 +1024,63 @@ mod tests {
                 .unwrap()
                 .contains("\"zsh\"")
         );
+    }
+
+    /// `marsh config docker on|off` moves a project between the two lists in
+    /// one transaction: a reader of the file never sees the project in both
+    /// lists or in neither (two separate writes would show one of those between
+    /// them).
+    #[test]
+    fn docker_on_and_off_change_both_lists_in_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("home");
+        std::fs::create_dir(&root).unwrap();
+        let project = "/Users/a/one";
+        std::fs::write(
+            root.join(CONFIG_FILE),
+            serde_json::json!({
+                SERVICES_PROJECTS_KEY: [project],
+                DOCKER_OFF_KEY: [],
+                // A large value makes each write slow enough to be seen.
+                "pad": "x".repeat(4 << 20),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let (torn, reads) = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let (mut torn, mut reads) = (0_u32, 0_u32);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let Ok(bytes) = std::fs::read(root.join(CONFIG_FILE)) else {
+                        continue;
+                    };
+                    let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    let listed = |key: &str| {
+                        document[key]
+                            .as_array()
+                            .is_some_and(|roots| roots.iter().any(|root| root == project))
+                    };
+                    reads += 1;
+                    if listed(SERVICES_PROJECTS_KEY) == listed(DOCKER_OFF_KEY) {
+                        torn += 1;
+                    }
+                }
+                (torn, reads)
+            });
+            for _ in 0..15 {
+                for word in ["off", "on"] {
+                    assert_eq!(
+                        services_config(Some(word), &root, Path::new(project)),
+                        Ok(0)
+                    );
+                }
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            reader.join().unwrap()
+        });
+        assert!(reads > 0);
+        assert_eq!(torn, 0, "{torn} of {reads} reads saw a half-made change");
     }
 
     #[test]

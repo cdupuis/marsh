@@ -117,9 +117,8 @@ impl Bk {
 
     /// Keep `ev` unless the same change was reported since `since` (several
     /// streams that ran together see one change) or the same "unable to check" is
-    /// already there. At the cap the oldest report of a tag is kept: it holds the
-    /// owner's original image, so "unable to check" goes first, then the oldest
-    /// later report of a tag.
+    /// already there. At the cap the first report of a tag is kept: it holds the
+    /// owner's original image.
     fn push(&mut self, ev: TagEvent, since: u64) -> bool {
         let same = |e: &TagEvent| match ev.kind {
             TagEventKind::Changed => {
@@ -142,11 +141,13 @@ impl Bk {
                         p.kind == TagEventKind::Changed && p.tag == self.events[i].1.tag
                     })
                 };
-            // Never the event just added: "unable to check" must show up.
+            // A later report of a tag that has several goes first (the first holds
+            // the owner's original image), then "unable to check" (never the one
+            // just added: it must show up), then the oldest report.
             let last = self.events.len() - 1;
-            let drop = (0..last)
-                .find(|&i| self.events[i].1.kind == TagEventKind::Unchecked)
-                .or_else(|| (0..last).find(|&i| !first_of_tag(i)))
+            let drop = (0..=last)
+                .find(|&i| self.events[i].1.kind == TagEventKind::Changed && !first_of_tag(i))
+                .or_else(|| (0..last).find(|&i| self.events[i].1.kind == TagEventKind::Unchecked))
                 .unwrap_or(0);
             self.events.remove(drop);
         }

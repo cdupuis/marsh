@@ -495,21 +495,11 @@ has is checked.
      rebuild it); a pulled name: `docker pull <name>` fetches the registry's current
      image, not necessarily the previous one. The text says the change is not undone.
      Events are a line on the agent's standard error and an entry of
-     `Services::tag_events()` (the last 64), which the daemon reads for `marsh docker
-     status --json` (`image_tag_events`, only when there are any) and shows as one line
-     in `marsh docker status` (a count, no VM text), over the same filtered endpoint its
-     status read already uses: `GET /_marsh/tag-events`, answered by the agent itself
-     (`Kind::TagEvents`, never sent to the engine) and only to the daemon's own status
-     read: the base workspace with the reserved attempt `status`, which the host refuses
-     to give to any job, shell or lane (`AttemptScope::new` rejects it;
-     `AttemptScope::status` is the daemon's). The daemon makes every string plain
-     (control, direction and format characters dropped) and bounded (at most 64
-     events, kinds `changed`, `unchecked`; each carries `ambiguous` and `overlapped`). This is deliberately not a new relay frame:
-     a frame or `Settings` field the peer does not know is a protocol violation on both
-     sides (every message type is a closed set); an old agent refuses the unknown route
-     (no events) and an old host never asks. "Unable to check" is kept once per
-     workspace and cause, and at the cap those go first, then later reports of a tag:
-     the oldest report of a tag is kept, it holds the owner's original image. Nothing
+     `Services::tag_events()` (the last 64). "Unable to check" is kept once per
+     workspace and cause. At the cap the list gives up, in this order, a later report of
+     a tag that has several (the first report of a tag is kept: it holds the owner's
+     original image), then "unable to check" (never the one just added), then the oldest
+     report; a tag's only report goes only when nothing else can. Nothing
      expires: a report stays until the agent restarts, even after the owner put the tag
      back, and a repeated "unable to check" for the same workspace and cause is never
      shown again. Not persisted.

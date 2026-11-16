@@ -623,8 +623,9 @@ impl StockDaemonBackend {
         };
         self.note_vm_used(&ready.name);
         if let Some(relays) = &self.services.relays
-            && let Err(message) = relays.establish(&spec, &ready, self.internet_grants())
+            && let Err(error) = relays.establish(&spec, &ready, self.internet_grants())
         {
+            let message = self.settle_failed_engine_start(root, ready.cold_started, error);
             self.services.with_project(root, |project| {
                 project.starting = false;
                 project.failure = Some(message.clone());
@@ -663,6 +664,41 @@ impl StockDaemonBackend {
             document["holder"] = json!(holder);
         }
         Ok(document)
+    }
+
+    /// What a failed engine start leaves behind. When the engine refused the
+    /// pool because the disk cannot hold it, and this very start created the
+    /// VM, the VM can never work and holds nothing: it is removed (by its
+    /// recorded owner UUID, as `marsh docker rm` does), and the message says
+    /// so. A VM that already existed, and every other failure, stay as they
+    /// are: the user's data and a retry both need the VM. Returns the message.
+    fn settle_failed_engine_start(
+        &self,
+        root: &Path,
+        created_by_this_start: bool,
+        error: marsh_sbx::services_relay::EstablishError,
+    ) -> String {
+        if !(error.pool_too_small && created_by_this_start) {
+            return error.message;
+        }
+        let _ = self.close_relay(root, "the new Docker VM is being removed");
+        match self
+            .sbx
+            .remove_services_vm(root, Instant::now() + OPERATION_TIMEOUT)
+        {
+            Ok(true) => format!(
+                "{}; the Docker VM this start created was removed, so nothing is left to clean up",
+                error.message
+            ),
+            Ok(false) => format!(
+                "{}; the Docker VM this start created is no longer there, so nothing is left to clean up",
+                error.message
+            ),
+            Err(removal) => format!(
+                "{}; the Docker VM this start created could not be removed ({removal}): `marsh docker rm` removes it",
+                error.message
+            ),
+        }
     }
 
     fn services_release(
@@ -2357,6 +2393,194 @@ mod tests {
         ) -> std::io::Result<marsh_runtime::Attachment> {
             Err(std::io::Error::other("unexpected stock SBX attachment"))
         }
+    }
+
+    /// A stock with the VMs in `vms` (name, id), which answers `ls` with them,
+    /// removes one on `rm --force NAME` (or refuses, when `rm_fails`), and
+    /// notes every `rm`.
+    struct LiveStock {
+        vms: Mutex<Vec<(String, String)>>,
+        removed: Mutex<Vec<String>>,
+        rm_fails: bool,
+    }
+
+    impl marsh_runtime::CommandRunner for LiveStock {
+        fn run(
+            &self,
+            invocation: &marsh_runtime::Invocation,
+        ) -> std::io::Result<marsh_runtime::CommandOutput> {
+            self.run_bounded(invocation, Duration::ZERO)
+        }
+
+        fn run_bounded(
+            &self,
+            invocation: &marsh_runtime::Invocation,
+            _timeout: Duration,
+        ) -> std::io::Result<marsh_runtime::CommandOutput> {
+            let words: Vec<String> = invocation
+                .arguments
+                .iter()
+                .map(|word| word.to_string_lossy().into_owned())
+                .collect();
+            let mut exit_code = 0;
+            let mut stdout = br#"{"sandboxes": []}"#.to_vec();
+            match words.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+                ["ls", ..] => {
+                    let rows = self
+                        .vms
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(name, id)| json!({"name": name, "id": id, "status": "running"}))
+                        .collect::<Vec<_>>();
+                    stdout = json!({ "sandboxes": rows }).to_string().into_bytes();
+                }
+                ["rm", "--force", name] => {
+                    self.removed.lock().unwrap().push(name.to_owned());
+                    if self.rm_fails {
+                        exit_code = 1;
+                    } else {
+                        self.vms.lock().unwrap().retain(|(vm, _)| vm != name);
+                    }
+                }
+                _ => {}
+            }
+            Ok(marsh_runtime::CommandOutput {
+                exit_code: Some(exit_code),
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+
+        fn spawn_attached(
+            &self,
+            _invocation: &marsh_runtime::Invocation,
+        ) -> std::io::Result<marsh_runtime::Attachment> {
+            Err(std::io::Error::other("unexpected stock SBX attachment"))
+        }
+    }
+
+    const POOL_REFUSAL: &str = "marsh: the services disk has 22930 MiB free but a 24576 MiB pool needs 25088 MiB (including a 512 MiB reserve); set a larger disk with `marsh config services-disk-size`";
+
+    /// A project with a Docker VM the daemon owns (recorded with its UUID) and
+    /// that stock lists.
+    struct OwnedVm {
+        _home: tempfile::TempDir,
+        _control: tempfile::TempDir,
+        stock: Arc<LiveStock>,
+        backend: StockDaemonBackend,
+        root: PathBuf,
+        name: String,
+    }
+
+    impl OwnedVm {
+        fn new(rm_fails: bool) -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let control = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(home.path()).unwrap();
+            let map = control.path().join("vm-ownership.json");
+            let stock = Arc::new(LiveStock {
+                vms: Mutex::new(Vec::new()),
+                removed: Mutex::new(Vec::new()),
+                rm_fails,
+            });
+            let adapter = || {
+                marsh_sbx::StockSbx::new("sbx", stock.clone())
+                    .with_vm_ownership(map.clone())
+                    .unwrap()
+            };
+            let name = adapter()
+                .vm_name(marsh_sbx::VmPurpose::Services, root.to_str().unwrap())
+                .unwrap();
+            let id = "00000000-0000-4000-8000-000000000001".to_owned();
+            let mut document: Value = serde_json::from_slice(&fs::read(&map).unwrap()).unwrap();
+            document["vms"][&name]["uuid"] = json!(id);
+            fs::write(&map, document.to_string()).unwrap();
+            stock.vms.lock().unwrap().push((name.clone(), id));
+            let backend = crate::tests::backend_with_stock(home.path(), BTreeMap::new(), adapter());
+            assert_eq!(backend.sbx.owned_services_vms().len(), 1);
+            Self {
+                _home: home,
+                _control: control,
+                stock,
+                backend,
+                root,
+                name,
+            }
+        }
+
+        fn settle(&self, created: bool, pool_too_small: bool) -> String {
+            self.backend.settle_failed_engine_start(
+                &self.root,
+                created,
+                marsh_sbx::services_relay::EstablishError {
+                    message: POOL_REFUSAL.into(),
+                    pool_too_small,
+                },
+            )
+        }
+
+        fn removed(&self) -> Vec<String> {
+            self.stock.removed.lock().unwrap().clone()
+        }
+    }
+
+    /// The engine refused the pool for want of disk on a VM this start just
+    /// created: the VM is removed (the exact recorded one), its record goes,
+    /// and the message gives the sizes and the fix, with nothing to clean up.
+    #[test]
+    fn a_new_vm_whose_pool_cannot_fit_is_removed() {
+        let fixture = OwnedVm::new(false);
+        let message = fixture.settle(true, true);
+        assert_eq!(fixture.removed(), std::slice::from_ref(&fixture.name));
+        assert!(fixture.stock.vms.lock().unwrap().is_empty());
+        assert_eq!(fixture.backend.sbx.owned_services_vms().len(), 0);
+        assert!(message.contains("22930 MiB free"), "{message}");
+        assert!(
+            message.contains("marsh config services-disk-size"),
+            "{message}"
+        );
+        assert!(message.contains("nothing is left to clean up"), "{message}");
+        assert!(!message.contains("marsh docker rm"), "{message}");
+    }
+
+    /// A VM that was there before this start is the user's: not removed, even
+    /// though the engine refused its pool.
+    #[test]
+    fn an_existing_vm_whose_pool_cannot_fit_is_kept() {
+        let fixture = OwnedVm::new(false);
+        let message = fixture.settle(false, true);
+        assert_eq!(fixture.removed(), Vec::<String>::new());
+        assert_eq!(fixture.stock.vms.lock().unwrap().len(), 1);
+        assert_eq!(fixture.backend.sbx.owned_services_vms().len(), 1);
+        assert_eq!(message, POOL_REFUSAL);
+    }
+
+    /// Any other engine-start failure leaves even a new VM in place, as the
+    /// acceptance suites' break modes (and a retry) expect.
+    #[test]
+    fn a_new_vm_whose_engine_failed_for_another_reason_is_kept() {
+        let fixture = OwnedVm::new(false);
+        let message = fixture.settle(true, false);
+        assert_eq!(fixture.removed(), Vec::<String>::new());
+        assert_eq!(fixture.stock.vms.lock().unwrap().len(), 1);
+        assert_eq!(fixture.backend.sbx.owned_services_vms().len(), 1);
+        assert_eq!(message, POOL_REFUSAL);
+    }
+
+    /// When the removal itself fails the message says so and points at
+    /// `marsh docker rm`, which is then the right advice.
+    #[test]
+    fn a_new_vm_that_cannot_be_removed_is_reported_as_left() {
+        let fixture = OwnedVm::new(true);
+        let message = fixture.settle(true, true);
+        assert_eq!(fixture.removed(), std::slice::from_ref(&fixture.name));
+        assert!(message.contains("could not be removed"), "{message}");
+        assert!(
+            message.contains("`marsh docker rm` removes it"),
+            "{message}"
+        );
+        assert_eq!(fixture.backend.sbx.owned_services_vms().len(), 1);
     }
 
     /// A gone project the daemon has an ownership record for, whose VM stock no

@@ -25,7 +25,7 @@ use crate::services_vm::{ReadyServicesVm, ServicesVmSpec};
 use crate::vm_text::{CappedLines, DISPLAY_LINE_BYTES, plain_text};
 use crate::{InternetGrants, StockSbx};
 use marsh_runtime::Invocation;
-use marsh_services::engine::Generation;
+use marsh_services::engine::{FailureKind, Generation};
 use marsh_services::host::RelayConfig;
 pub use marsh_services::host::{
     AttemptScope, BASE_WORKSPACE, CaptureReply, DaemonBudget, Limits, PortsSubscription, Relay,
@@ -440,6 +440,44 @@ pub struct RelayView {
     pub agent_breaks: Vec<String>,
 }
 
+/// Why [`ServicesRelays::establish`] failed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EstablishError {
+    pub message: String,
+    /// The engine itself refused to start because the VM's Docker disk cannot
+    /// hold its pool (`FailureKind::DiskTooSmall`): the same start can never
+    /// succeed on this VM, and `message` is the refusal without its advice to
+    /// remove the VM first. False for every other failure.
+    pub pool_too_small: bool,
+}
+
+impl EstablishError {
+    fn other(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            pool_too_small: false,
+        }
+    }
+}
+
+impl From<String> for EstablishError {
+    fn from(message: String) -> Self {
+        Self::other(message)
+    }
+}
+
+impl From<&str> for EstablishError {
+    fn from(message: &str) -> Self {
+        Self::other(message)
+    }
+}
+
+impl std::fmt::Display for EstablishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 /// Every project's relay in this daemon.
 pub struct ServicesRelays {
     stock: Arc<StockSbx>,
@@ -630,6 +668,7 @@ impl ServicesRelays {
             .ensure_services_vm(spec)
             .map_err(|error| format!("marsh: {error}"))?;
         self.establish(spec, &ready, grants)
+            .map_err(|error| error.message)
     }
 
     /// The engine generation and relay for a VM S1 already made ready.
@@ -641,7 +680,7 @@ impl ServicesRelays {
         spec: &ServicesVmSpec,
         ready: &ReadyServicesVm,
         grants: &InternetGrants,
-    ) -> Result<Arc<RelayEntry>, String> {
+    ) -> Result<Arc<RelayEntry>, EstablishError> {
         let root = spec.project.as_path();
         let lock = self.lock_for(root);
         let _operation = lock
@@ -727,14 +766,21 @@ impl ServicesRelays {
         vm: &ServicesVmRef,
         artifacts: EngineArtifacts,
         settings: &EngineSettings,
-    ) -> Result<(Arc<EngineHandle>, Generation), String> {
+    ) -> Result<(Arc<EngineHandle>, Generation), EstablishError> {
         let handle = Arc::new(engine.start(vm.clone(), artifacts, settings.clone()));
-        let generation = handle
-            .wait_ready(settings.ready_timeout + self.ready_grace)
-            .inspect_err(|_| {
+        match handle.wait_ready(settings.ready_timeout + self.ready_grace) {
+            Ok(generation) => Ok((handle, generation)),
+            Err(reason) => {
                 self.detach_owned(root, &handle);
-            })?;
-        Ok((handle, generation))
+                if handle.failure_kind() == Some(FailureKind::DiskTooSmall) {
+                    return Err(EstablishError {
+                        message: marsh_services::engine::without_remove_advice(&reason),
+                        pool_too_small: true,
+                    });
+                }
+                Err(reason.into())
+            }
+        }
     }
 
     /// Starts a relay for a ready generation and records it.
@@ -951,6 +997,7 @@ impl ServicesRelays {
 mod tests {
     use super::*;
     use crate::stuck_engine::start_held;
+    use marsh_services::engine::EngineEvent;
 
     /// A start that is not ready in time while its worker is inside an admitted
     /// call (the failed-establish path of `establish`): `close` must refuse to
@@ -1084,5 +1131,161 @@ mod tests {
         assert!(lines[0].len() <= DISPLAY_LINE_BYTES, "{}", lines[0].len());
         assert_eq!(lines[1], "[31mred[0mtab");
         assert!(lines.iter().all(|l| !l.chars().any(char::is_control)));
+    }
+
+    /// A stock that gets an engine all the way to its log stream, where the VM
+    /// says what it likes (the `sbx` calls all succeed).
+    struct ScriptedEngine {
+        logs: Vec<u8>,
+        pin: crate::services_engine::EnginePin,
+    }
+
+    struct Finished;
+
+    impl marsh_runtime::AttachedProcess for Finished {
+        fn wait(&mut self) -> std::io::Result<i32> {
+            Ok(0)
+        }
+        fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
+            Ok(Some(0))
+        }
+        fn terminate(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl marsh_runtime::CommandRunner for ScriptedEngine {
+        fn run(&self, invocation: &Invocation) -> std::io::Result<marsh_runtime::CommandOutput> {
+            self.run_bounded(invocation, Duration::ZERO)
+        }
+
+        fn run_bounded(
+            &self,
+            invocation: &Invocation,
+            _: Duration,
+        ) -> std::io::Result<marsh_runtime::CommandOutput> {
+            let words: Vec<String> = invocation
+                .arguments
+                .iter()
+                .map(|word| word.to_string_lossy().into_owned())
+                .collect();
+            let has = |word: &str| words.iter().any(|candidate| candidate == word);
+            let stdout = if has("cat") {
+                "boot-1".to_owned()
+            } else if has("sha256sum") {
+                // The artifacts are already on the VM with their pinned hashes.
+                let is_archive = words.last().is_some_and(|path| {
+                    Path::new(path)
+                        .extension()
+                        .is_some_and(|extension| extension == "tar")
+                });
+                let hash = if is_archive {
+                    &self.pin.archive_sha256
+                } else {
+                    &"b".repeat(64)
+                };
+                format!("{hash}  artifact")
+            } else if has("create") {
+                "c".repeat(64)
+            } else if has("inspect") {
+                self.pin.image_id.clone()
+            } else {
+                String::new()
+            };
+            Ok(marsh_runtime::CommandOutput {
+                exit_code: Some(0),
+                stdout: stdout.into_bytes(),
+                stderr: Vec::new(),
+            })
+        }
+
+        fn spawn_attached(&self, _: &Invocation) -> std::io::Result<marsh_runtime::Attachment> {
+            Ok(marsh_runtime::Attachment {
+                stdin: Box::new(std::io::sink()),
+                stdout: Box::new(std::io::Cursor::new(self.logs.clone())),
+                stderr: Box::new(std::io::empty()),
+                process: Box::new(Finished),
+                control: marsh_runtime::no_attachment_control(),
+            })
+        }
+    }
+
+    /// Start an engine whose VM reports `events` and return how the start ended.
+    fn start_reporting(events: &[EngineEvent]) -> Result<(), EstablishError> {
+        let artifacts = crate::stuck_engine::test_artifacts();
+        let logs = events
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap() + "\n")
+            .collect::<String>();
+        let runner = Arc::new(ScriptedEngine {
+            logs: logs.into_bytes(),
+            pin: artifacts.pin.clone(),
+        });
+        let stock = Arc::new(StockSbx::new("sbx", runner.clone()));
+        let relays = ServicesRelays::new(stock, None, DaemonBudget::new(1), None)
+            .with_detach_wait(Duration::from_millis(50))
+            .with_ready_grace(Duration::ZERO);
+        let engine = ServicesEngine::new(PathBuf::from("sbx"), runner);
+        let mut settings = EngineSettings::default();
+        settings.ready_timeout = Duration::from_secs(20);
+        relays
+            .start_ready(
+                Path::new("/Users/alice/project"),
+                &engine,
+                &crate::stuck_engine::test_vm(),
+                artifacts,
+                &settings,
+            )
+            .map(|_| ())
+    }
+
+    fn failed(kind: FailureKind, message: &str) -> EngineEvent {
+        EngineEvent::Failed {
+            kind,
+            message: message.to_owned(),
+        }
+    }
+
+    /// The engine refusing the pool for want of disk is typed, and its message
+    /// loses the advice to remove a VM that is about to be removed anyway.
+    #[test]
+    fn a_pool_that_does_not_fit_is_a_typed_failure_without_the_remove_advice() {
+        let refusal = marsh_services::engine::check_pool_fits(24 << 30, 22_930 << 20).unwrap_err();
+        let error = start_reporting(&[failed(FailureKind::DiskTooSmall, &refusal)]).unwrap_err();
+        assert!(error.pool_too_small, "{error}");
+        assert!(error.message.contains("22930 MiB free"), "{error}");
+        assert!(
+            error.message.contains("marsh config services-disk-size"),
+            "{error}"
+        );
+        assert!(
+            !error.message.contains("docker rm") && !error.message.contains("remove"),
+            "{error}"
+        );
+    }
+
+    /// Every other way an engine start fails stays untyped (and keeps its
+    /// text): the VM is not touched for it.
+    #[test]
+    fn no_other_engine_start_failure_is_a_pool_fit_failure() {
+        let refusal = marsh_services::engine::check_pool_fits(24 << 30, 22_930 << 20).unwrap_err();
+        for event in [
+            failed(FailureKind::Setup, &refusal),
+            failed(FailureKind::PoolUnusable, "marsh: not xfs"),
+            failed(FailureKind::PoolIdentity, "marsh: not our pool"),
+            failed(FailureKind::Firewall, "marsh: no firewall"),
+            failed(FailureKind::Cgroup, "marsh: no cgroups"),
+        ] {
+            let error = start_reporting(std::slice::from_ref(&event)).unwrap_err();
+            assert!(!error.pool_too_small, "{event:?}");
+        }
+        // The stream just ends, or the VM only says the engine was lost.
+        let error = start_reporting(&[]).unwrap_err();
+        assert!(!error.pool_too_small, "{error}");
+        let error = start_reporting(&[EngineEvent::Lost { reason: "x".into() }]).unwrap_err();
+        assert!(!error.pool_too_small, "{error}");
+        // The other failure keeps the engine's own words.
+        let error = start_reporting(&[failed(FailureKind::Setup, &refusal)]).unwrap_err();
+        assert!(error.message.contains("marsh docker rm"), "{error}");
     }
 }

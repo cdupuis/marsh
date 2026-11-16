@@ -161,10 +161,14 @@ A restart of the VM or of the container is a new `start`, so a new generation.
 
 The pool is 24 GiB, fixed (there is no pool-size setting; test override
 `MARSH_SERVICES_POOL_BYTES`, read by `EngineSettings::from_env`), so a Docker disk below
-about 25g cannot start an engine. `ensure_services_vm` refuses a new VM whose configured
-`services.diskSize` is below the pool plus `DISK_RESERVE_BYTES` (`pool_needed_bytes`, the rule `check_pool_fits` uses, with
+about 28g cannot start an engine (stock SBX 0.53 measured 22930 MiB free on a 25g disk, 24843 MiB on 27g). `ensure_services_vm` refuses a new VM whose configured
+`services.diskSize`, less the filesystem's share (`USABLE_DISK_PERCENT`, 89%: an approximation just under the
+measured figures), is below the pool plus `DISK_RESERVE_BYTES` (`pool_needed_bytes`, the rule `check_pool_fits` uses, with
 the same override) before it records a name or creates the VM (`ServicesVmSpec::pool_bytes`);
-the engine's own check still runs on the disk's real free space at start. `EngineSettings::internet_open` is the project's Internet grant
+the engine's own check still runs on the disk's real free space at start. When it refuses (`failed` with
+`FailureKind::DiskTooSmall`, kept by the handle as `failure_kind()`) for a VM that this very start created
+(`ReadyServicesVm::cold_started`), `services_start` removes that VM by its recorded UUID, as `marsh docker rm`
+does, and drops the "remove the VM first" advice from the message; no other failure, and no existing VM, is removed. `EngineSettings::internet_open` is the project's Internet grant
 (`InternetGrants::is_on`), passed to `engine-up` as `--internet on|off` at every start. The Docker disk size is S1's `services.diskSize`.
 
 ## Break modes and holds (test builds only)

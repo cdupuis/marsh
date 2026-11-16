@@ -226,8 +226,17 @@ fn valid_disk_size(value: &str) -> bool {
         .is_some_and(|gib| (1..=4096).contains(&gib))
 }
 
+/// The share of a configured Docker disk that is usable once the VM's
+/// filesystem has taken its part, as a percentage: an approximation, set a
+/// little under what stock SBX 0.53 measured (25g gave 22930 MiB, 89.6%; 27g
+/// gave 24843 MiB, 89.9%) so the check refuses what cannot work and is not
+/// meant to promise what can. The engine's own check of the real free space
+/// stays the authority.
+const USABLE_DISK_PERCENT: u64 = 89;
+
 /// Refuse a new VM whose configured disk cannot hold the engine's pool plus
-/// its reserve: the engine would only fail at start, leaving the VM behind.
+/// its reserve once the filesystem's share is taken off: the engine would only
+/// fail at start, leaving the VM behind.
 fn check_disk_holds_pool(spec: &ServicesVmSpec) -> Result<(), SbxError> {
     let Some(pool_bytes) = spec.pool_bytes else {
         return Ok(());
@@ -238,12 +247,16 @@ fn check_disk_holds_pool(spec: &ServicesVmSpec) -> Result<(), SbxError> {
         .parse::<u64>()
         .unwrap_or(0);
     let needed = marsh_services::engine::pool_needed_bytes(pool_bytes);
-    if gibibytes.saturating_mul(1 << 30) >= needed {
+    let usable = gibibytes.saturating_mul(1 << 30) / 100 * USABLE_DISK_PERCENT;
+    if usable >= needed {
         return Ok(());
     }
+    // The least whole number of GiB that would pass.
+    let least = (needed / USABLE_DISK_PERCENT * 100).div_ceil(1 << 30);
     Err(SbxError::HostGrantFence(format!(
-        "the Docker disk is set to {}, which is too small: Docker needs {} MiB for its pool plus a {} MiB reserve ({} MiB in all). Set a larger disk with `marsh config services-disk-size` (for example 40g), then run `marsh docker start` again",
+        "the Docker disk is set to {}, which is too small: about {} MiB of it is usable (the VM's filesystem keeps roughly a tenth) and Docker needs {} MiB for its pool plus a {} MiB reserve ({} MiB in all). Set a larger disk with `marsh config services-disk-size` (at least {least}g), then run `marsh docker start` again",
         spec.disk_size,
+        usable >> 20,
         pool_bytes >> 20,
         marsh_services::engine::DISK_RESERVE_BYTES >> 20,
         needed >> 20,

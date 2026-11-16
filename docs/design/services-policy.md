@@ -487,6 +487,16 @@ has is checked.
      An unrecorded pulled name has no owner: only the first two rules apply.
   3. An event is a line on the agent's standard error (`marsh-services: BuildKit
      stream of workspace ...`) and an entry of `Services::tag_events()` (the last 64).
+     The relay's janitor (every 5 s) sends the list to the host as an `AgentFrame::TagEvents`
+     frame (full state, only when it changed; the host refuses more than 64 or a
+     kind other than `restored`, `not_restored`, `unchecked`, and reduces the text to
+     plain bounded words); the daemon adds it to `marsh docker status --json` as
+     `image_tag_events` when there are any. Not persisted: an agent restart forgets it.
+     Tests: `tag_events_are_sent_when_they_change`,
+     `tag_events_are_kept_as_plain_text_and_an_unknown_kind_is_a_violation`,
+     `status_reports_image_tag_events_only_when_there_are_some`; no VM-free test
+     covers the whole path (a real-stack scenario: a lane runs `docker buildx build
+     --load -t <the base's tag> .`, then `marsh docker status --json`).
      The offending workspace's next REST call is unaffected: no state is kept
      against it.
   Not done, and said so in `docs/docker.md`: **the overwrite is detected after the

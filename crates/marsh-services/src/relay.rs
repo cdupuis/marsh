@@ -75,6 +75,12 @@ pub trait DockerEndpoint: Send + Sync {
     /// Called once when the relay listens (after recovery, before `ready`).
     fn start(&self) {}
 
+    /// The image tag events of `BuildKit` streams so far (`bk_watch`), for the
+    /// host's status. The default has none.
+    fn tag_events(&self) -> Vec<crate::frame::TagEventInfo> {
+        Vec::new()
+    }
+
     /// A workspace is being dropped (C3): forget what exists for the scope
     /// itself (substituted sockets, the default network entry). The default
     /// is for endpoints with nothing to forget.
@@ -142,6 +148,26 @@ impl DockerEndpoint for Filtered {
         let _ = self
             .svc
             .serve_stream(&Self::policy_authority(&authority), stream);
+    }
+
+    fn tag_events(&self) -> Vec<crate::frame::TagEventInfo> {
+        use crate::policy::endpoint::TagEventKind;
+        self.svc
+            .tag_events()
+            .into_iter()
+            .map(|e| crate::frame::TagEventInfo {
+                at: e.at,
+                workspace: e.workspace,
+                tag: e.tag,
+                kind: match e.kind {
+                    TagEventKind::Restored => "restored",
+                    TagEventKind::NotRestored => "not_restored",
+                    TagEventKind::Unchecked => "unchecked",
+                }
+                .to_owned(),
+                detail: e.detail,
+            })
+            .collect()
     }
 
     fn forget_scope(&self, workspace: &str) -> Result<(), String> {
@@ -893,11 +919,29 @@ fn from_target_loop(shared: &Arc<Shared>, id: u32, channel: &Arc<Channel>, mut t
     }
 }
 
+/// The `tag_events` frame to send when the endpoint's events differ from `last`
+/// (which then becomes them).
+fn tag_events_frame(
+    endpoint: &dyn DockerEndpoint,
+    last: &mut Vec<crate::frame::TagEventInfo>,
+) -> Option<AgentFrame> {
+    let events = endpoint.tag_events();
+    if events == *last {
+        return None;
+    }
+    last.clone_from(&events);
+    Some(AgentFrame::TagEvents { events })
+}
+
 fn janitor(shared: &Arc<Shared>) {
     let shared = Arc::clone(shared);
     std::thread::spawn(move || {
+        let mut last = Vec::new();
         loop {
             std::thread::sleep(Duration::from_secs(5));
+            if let Some(frame) = tag_events_frame(shared.endpoint.as_ref(), &mut last) {
+                shared.out.control(frame);
+            }
             let idle: Vec<(u32, Arc<Channel>)> = shared
                 .channels()
                 .iter()
@@ -1770,6 +1814,36 @@ mod tests {
             r#"{{"State":{{"Status":"{status}"}},"Config":{{"Labels":{labels}}},"NetworkSettings":{{"Ports":{ports}}}}}"#
         ))
         .unwrap()
+    }
+
+    struct Events(Mutex<Vec<crate::frame::TagEventInfo>>);
+
+    impl DockerEndpoint for Events {
+        fn serve(&self, _authority: Authority, _stream: UnixStream) {}
+
+        fn tag_events(&self) -> Vec<crate::frame::TagEventInfo> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// The agent sends its image tag events when they change, and only then.
+    #[test]
+    fn tag_events_are_sent_when_they_change() {
+        let endpoint = Events(Mutex::default());
+        let mut last = Vec::new();
+        assert!(tag_events_frame(&endpoint, &mut last).is_none());
+        endpoint.0.lock().unwrap().push(crate::frame::TagEventInfo {
+            at: 1,
+            workspace: "lane-b".into(),
+            tag: "base-app:1".into(),
+            kind: "restored".into(),
+            detail: String::new(),
+        });
+        let Some(AgentFrame::TagEvents { events }) = tag_events_frame(&endpoint, &mut last) else {
+            panic!("no frame for a new event");
+        };
+        assert_eq!(events.len(), 1);
+        assert!(tag_events_frame(&endpoint, &mut last).is_none());
     }
 
     #[test]

@@ -1134,8 +1134,13 @@ impl StockDaemonBackend {
             .relays
             .as_ref()
             .map(|relays| relays.view(root));
-        if let Some(relay) = relay_view.filter(|relay| !relay.agent_breaks.is_empty()) {
-            document["test_breaks_agent"] = json!(relay.agent_breaks);
+        if let Some(relay) = &relay_view {
+            if !relay.agent_breaks.is_empty() {
+                document["test_breaks_agent"] = json!(relay.agent_breaks);
+            }
+            if let Some(events) = image_tag_events(relay) {
+                document["image_tag_events"] = events;
+            }
         }
         document
     }
@@ -1721,6 +1726,12 @@ enum Unavailable {
     LostContact,
 }
 
+/// The image tags a `BuildKit` build changed that it may not (and what the agent
+/// did about each), only when there are any.
+fn image_tag_events(view: &marsh_sbx::services_relay::RelayView) -> Option<Value> {
+    (!view.tag_events.is_empty()).then(|| json!(view.tag_events))
+}
+
 impl Unavailable {
     /// Short and plain: none of marsh's internals (no VM, volume, snapshot,
     /// engine or sbx).
@@ -1824,6 +1835,35 @@ fn keep_quiesced<P>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `marsh docker status --json` carries the agent's image tag events, and
+    /// nothing when there are none.
+    #[test]
+    fn status_reports_image_tag_events_only_when_there_are_some() {
+        let mut view = marsh_sbx::services_relay::RelayView {
+            state: "ready",
+            reason: None,
+            generation: None,
+            channels: 0,
+            agent_pid: None,
+            agent_breaks: Vec::new(),
+            tag_events: Vec::new(),
+        };
+        assert_eq!(image_tag_events(&view), None);
+        view.tag_events
+            .push(marsh_sbx::services_relay::TagEventInfo {
+                at: 9,
+                workspace: "lane-b".into(),
+                tag: "base-app:1".into(),
+                kind: "restored".into(),
+                detail: "put back".into(),
+            });
+        assert_eq!(
+            image_tag_events(&view),
+            Some(json!([{"at": 9, "workspace": "lane-b", "tag": "base-app:1",
+                         "kind": "restored", "detail": "put back"}]))
+        );
+    }
 
     /// The daemon-stop teardown defers a VM whose worker is not gone, and only
     /// that one; the decision is driven here with closures because a stuck

@@ -439,6 +439,18 @@ pub struct ScopePorts {
     pub ports: Vec<u16>,
 }
 
+/// An image tag a `BuildKit` stream changed, as the agent saw it (`kind`:
+/// `restored`, `not_restored` or `unchecked`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagEventInfo {
+    pub at: u64,
+    pub workspace: String,
+    pub tag: String,
+    pub kind: String,
+    pub detail: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedPath {
@@ -494,6 +506,11 @@ pub enum AgentFrame {
     Ports {
         scopes: Vec<ScopePorts>,
         truncated: bool,
+    },
+    /// Full state: the latest image tag events of `BuildKit` streams (at most
+    /// 64, oldest first), sent when they change.
+    TagEvents {
+        events: Vec<TagEventInfo>,
     },
     Captured {
         request: u64,

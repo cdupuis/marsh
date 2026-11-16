@@ -207,7 +207,9 @@ it has none yet): its folder, its state, the VM's name, and the reason in
 parentheses when there is one. The state is `off`, `stopped`, `starting`,
 `ready`, or `unavailable`. Plain `status` does not list containers, ports, or
 the Internet setting. For those, use `--json`: each project has `containers`,
-`ports`, and `internet` (with `on`, `governed`, and `effective`).
+`ports`, and `internet` (with `on`, `governed`, and `effective`). When a build
+changed an image tag that another workspace owns, the project also has
+`image_tag_events` (see [Limits and gaps](#limits-and-gaps)).
 
 <!-- services-example id=services-status-json fixture=stack-a run=host after=services-start stdout="\"schema\":\"marsh.services/v1\"" stdout="\"governed\":false" -->
 ```sh
@@ -697,7 +699,8 @@ In plain words:
   move (tags another workspace created, and names on pulled images such as
   `postgres:16`), moves back any whose image changed, with a plain `docker tag` of the old
   image ID (never forced; nothing is deleted), and says so on the services agent's
-  standard error. It does not do
+  standard error and in `marsh docker status --json` (`image_tag_events`, the
+  latest 64, kept in the agent's memory and so lost when the Docker VM restarts). It does not do
   that when another explanation exists: the tag's owner pulled, tagged or deleted it
   meanwhile, or the owner had a build running too. Then it only reports the change
   (so a lane's own legitimate build of its own tag is never touched). **What stays

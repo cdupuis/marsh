@@ -26,7 +26,8 @@ use crate::breaks;
 use crate::engine::Generation;
 use crate::frame::{
     AgentFrame, Authority, CHUNK_BYTES, ChannelKind, FrameError, HostFrame, HostOutbound, Inbound,
-    MAX_AGENT_JSON_BYTES, PROTOCOL, Settings, WINDOW_CHUNKS, read_frame, write_host_frame,
+    MAX_AGENT_JSON_BYTES, PROTOCOL, Settings, TagEventInfo, WINDOW_CHUNKS, read_frame,
+    write_host_frame,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -47,6 +48,7 @@ const MAX_SCOPES: usize = 256;
 const MAX_PORTS_PER_SCOPE: usize = 512;
 const MAX_SNAPSHOTS: usize = 4096;
 const MAX_GAPS: usize = 256;
+const MAX_TAG_EVENTS: usize = 64;
 /// A workspace drop reports at most this many leftovers, and counts below this.
 const MAX_DROP_LEFT: usize = 32;
 const MAX_DROP_COUNT: u32 = 100_000;
@@ -526,6 +528,7 @@ enum RelayPhase {
 struct State {
     phase: RelayPhase,
     agent_breaks: Vec<String>,
+    tag_events: Vec<TagEventInfo>,
     agent_pid: Option<u32>,
     channels: HashMap<u32, Arc<Chan>>,
     next_channel: u32,
@@ -815,6 +818,7 @@ impl Inner {
                 scopes,
                 truncated: _,
             } => self.handle_ports(scopes),
+            AgentFrame::TagEvents { events } => self.handle_tag_events(events),
             AgentFrame::Captured {
                 request,
                 id,
@@ -1031,6 +1035,30 @@ impl Inner {
             }
             .into()),
         })
+    }
+
+    fn handle_tag_events(&self, events: Vec<TagEventInfo>) -> bool {
+        if events.len() > MAX_TAG_EVENTS {
+            return self.violation("a tag event report with too many events");
+        }
+        if events
+            .iter()
+            .any(|e| !matches!(e.kind.as_str(), "restored" | "not_restored" | "unchecked"))
+        {
+            return self.violation("a tag event report with an unknown kind");
+        }
+        // Display text from the VM: reduced to plain bounded words.
+        self.lock().tag_events = events
+            .into_iter()
+            .map(|e| TagEventInfo {
+                at: e.at,
+                workspace: plain_text(&e.workspace),
+                tag: plain_text(&e.tag),
+                kind: e.kind,
+                detail: plain_text(&e.detail),
+            })
+            .collect();
+        false
     }
 
     fn handle_ports(&self, scopes: Vec<crate::frame::ScopePorts>) -> bool {
@@ -1549,6 +1577,7 @@ impl Relay {
             st: Mutex::new(State {
                 phase: RelayPhase::Handshake,
                 agent_breaks: Vec::new(),
+                tag_events: Vec::new(),
                 agent_pid: None,
                 channels: HashMap::new(),
                 next_channel: 1,
@@ -1667,6 +1696,12 @@ impl Relay {
     #[must_use]
     pub fn agent_breaks(&self) -> Vec<String> {
         self.inner.lock().agent_breaks.clone()
+    }
+
+    /// The image tag events the agent last reported (display only, bounded).
+    #[must_use]
+    pub fn tag_events(&self) -> Vec<TagEventInfo> {
+        self.inner.lock().tag_events.clone()
     }
 
     #[must_use]
@@ -2581,6 +2616,10 @@ mod relay_tests {
         WrongKindAnswer,
         /// `ready` reports test break modes.
         BreaksInReady,
+        /// A `tag_events` frame after `ports`.
+        TagEvents,
+        /// A `tag_events` frame with a kind the agent never sends.
+        TagEventOfUnknownKind,
     }
 
     /// One channel of the stand-in agent: data waiting for the daemon's credit,
@@ -2656,6 +2695,24 @@ mod relay_tests {
                             },
                         ] {
                             write_frame(&mut writer, &Outbound::Control(frame)).unwrap();
+                        }
+                        if matches!(quirk, Quirk::TagEvents | Quirk::TagEventOfUnknownKind) {
+                            let kind = if quirk == Quirk::TagEvents {
+                                "restored"
+                            } else {
+                                "deleted"
+                            };
+                            let event = crate::frame::TagEventInfo {
+                                at: 7,
+                                workspace: "lane-b".into(),
+                                tag: "base-app:1".into(),
+                                kind: kind.into(),
+                                detail: "moved\u{1b}[31m back".into(),
+                            };
+                            let frame = AgentFrame::TagEvents {
+                                events: vec![event],
+                            };
+                            let _ = write_frame(&mut writer, &Outbound::Control(frame));
                         }
                         if quirk == Quirk::UnrequestedRestored {
                             let frame = AgentFrame::Restored {
@@ -2880,6 +2937,32 @@ mod relay_tests {
             matches!(&error, Some(RelayError::Hostile(why)) if why.contains("test break modes")),
             "{error:?}"
         );
+    }
+
+    /// The agent's image tag events reach the daemon as display text: bounded,
+    /// without control characters; a kind the agent never sends is a violation.
+    #[test]
+    fn tag_events_are_kept_as_plain_text_and_an_unknown_kind_is_a_violation() {
+        let relay = start_with(Quirk::TagEvents, Limits::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while relay.tag_events().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let events = relay.tag_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tag, "base-app:1");
+        assert_eq!(events[0].detail, "moved [31m back");
+        match start_with(Quirk::TagEventOfUnknownKind, Limits::default()) {
+            Ok(relay) => {
+                assert!(wait_closed(&relay).contains("protocol violation"));
+                assert!(relay.violated());
+                assert_eq!(relay.tag_events().len(), 0);
+            }
+            Err(error) => assert!(
+                matches!(&error, RelayError::Hostile(why) if why.contains("protocol violation")),
+                "{error:?}"
+            ),
+        }
     }
 
     #[test]

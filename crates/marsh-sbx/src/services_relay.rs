@@ -26,6 +26,7 @@ use crate::vm_text::{CappedLines, DISPLAY_LINE_BYTES, plain_text};
 use crate::{InternetGrants, StockSbx};
 use marsh_runtime::Invocation;
 use marsh_services::engine::Generation;
+pub use marsh_services::frame::TagEventInfo;
 use marsh_services::host::RelayConfig;
 pub use marsh_services::host::{
     AttemptScope, BASE_WORKSPACE, CaptureReply, DaemonBudget, Limits, PortsSubscription, Relay,
@@ -438,6 +439,9 @@ pub struct RelayView {
     /// The test break modes the agent reported in its `ready` (empty in a
     /// release build).
     pub agent_breaks: Vec<String>,
+    /// The image tag events the agent reported: a `BuildKit` stream changed a
+    /// tag it may not move (display only).
+    pub tag_events: Vec<TagEventInfo>,
 }
 
 /// Every project's relay in this daemon.
@@ -884,6 +888,7 @@ impl ServicesRelays {
                 channels: 0,
                 agent_pid: None,
                 agent_breaks: Vec::new(),
+                tag_events: Vec::new(),
             };
         }
         let entry = self.entries().get(root).cloned();
@@ -901,6 +906,7 @@ impl ServicesRelays {
                 channels: 0,
                 agent_pid: None,
                 agent_breaks: Vec::new(),
+                tag_events: Vec::new(),
             },
             None => RelayView {
                 state: "none",
@@ -909,6 +915,7 @@ impl ServicesRelays {
                 channels: 0,
                 agent_pid: None,
                 agent_breaks: Vec::new(),
+                tag_events: Vec::new(),
             },
             Some(entry) => match entry.relay.closed() {
                 Some(reason) => RelayView {
@@ -922,6 +929,7 @@ impl ServicesRelays {
                     channels: 0,
                     agent_pid: entry.relay.agent_pid(),
                     agent_breaks: entry.relay.agent_breaks(),
+                    tag_events: entry.relay.tag_events(),
                 },
                 None => RelayView {
                     state: "ready",
@@ -930,6 +938,7 @@ impl ServicesRelays {
                     channels: entry.relay.open_channels(),
                     agent_pid: entry.relay.agent_pid(),
                     agent_breaks: entry.relay.agent_breaks(),
+                    tag_events: entry.relay.tag_events(),
                 },
             },
         }

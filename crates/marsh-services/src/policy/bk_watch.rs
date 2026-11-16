@@ -4,17 +4,18 @@
 //! -t` names is not seen. Instead of preventing it, the agent keeps, per tag a
 //! workspace may not move, the image the tag *legitimately* has (`Bk::legit`), and
 //! when a stream of that workspace ends it puts a changed tag back to that image
-//! and raises an event, unless a REST request or a build of the tag's owner could
-//! explain the change (then the event is raised and nothing is restored). Nothing
-//! is ever deleted, and a list that cannot be read lets the stream run unwatched,
-//! with an event.
+//! and raises an event. Nothing is ever deleted, and a list that cannot be read
+//! lets the stream run unwatched, with an event.
 //!
-//! The legitimate image is read from the engine only when no stream is running
-//! (nothing can then have moved the tag but a REST request, which is the owner's
-//! or a pull), under the tag lock, and is forgotten again as soon as a REST
-//! request touches the name or a stream of its owner begins. A stream that begins
-//! while others run uses what is recorded, never what the tag is now, so an
-//! overwrite that is already there is not taken for the tag's state.
+//! The legitimate image is read from the engine when no stream is running (nothing
+//! but a REST request, the owner's or a pull, can then have moved the tag). A REST
+//! request that holds the name makes it unknown while it runs, and when it has
+//! succeeded the name's image at that moment is the new legitimate one, so a
+//! change a request made is never taken for an overwrite and an overwrite after it
+//! is seen. It is not recorded while a stream of the tag's owner runs (the owner's
+//! build moves its own tag), and a stream of its owner beginning forgets it. A
+//! stream that begins while others run uses what is recorded, never what the tag
+//! is now, so an overwrite already there is not taken for the tag's state.
 //!
 //! Not prevention: while a stream runs, another workspace's tag may point at
 //! the stream's image, and a change made after the stream ended is not seen.
@@ -75,55 +76,58 @@ struct Legit {
     owner: Option<(String, u64)>,
 }
 
-/// A tag some running stream watches: refs, and the latest REST request that
-/// held its name (sequence, workspace) since it was first watched.
-struct Watching {
-    refs: usize,
-    touched: Option<(u64, String)>,
-}
-
 /// Shared state of the detection, under its own lock (taken after `tag_res`).
 #[derive(Default)]
 pub(super) struct Bk {
-    epoch: u64,
+    /// Bumped when a REST request ends (it may leave a name different): a list
+    /// read while it did not change is still what the engine had. (A request
+    /// still running is in the tag table, and its names are not watched. A stream
+    /// that ended and put a tag back changes nothing a record does not cover:
+    /// without a record nothing is restored, and the list shows what stands.)
+    changes: u64,
     next_stream: u64,
-    /// Streams running (until their check is done): id to workspace and start.
-    active: HashMap<u64, (String, u64)>,
-    /// Per workspace, the epoch its latest stream ended, kept only while a
-    /// stream that began before it still runs.
-    last_end: HashMap<String, u64>,
+    /// Streams running (until their check is done): id to workspace.
+    active: HashMap<u64, String>,
     legit: HashMap<String, Legit>,
-    watching: HashMap<String, Watching>,
+    /// Tags some running stream watches, and by how many.
+    watching: HashMap<String, usize>,
     events: VecDeque<TagEvent>,
 }
 
 impl Bk {
-    fn tick(&mut self) -> u64 {
-        self.epoch += 1;
-        self.epoch
-    }
-
-    /// A REST request of `ws` holds these names: what was recorded about them is
-    /// no longer known to be right.
-    pub(super) fn touch(&mut self, tags: &[String], ws: &str) {
+    /// A REST request holds these names: what was recorded about them is not
+    /// known to be right while it runs.
+    pub(super) fn touch(&mut self, tags: &[String]) {
         for tag in tags {
             self.legit.remove(tag);
-            let at = self.epoch + 1;
-            if let Some(w) = self.watching.get_mut(tag) {
-                w.touched = Some((at, ws.to_owned()));
-                self.epoch = at;
-            }
         }
     }
 
-    /// Did `owner` have a stream running at any time since `start`?
-    fn busy_since(&self, owner: &str, start: u64) -> bool {
-        self.active.values().any(|(w, _)| w == owner)
-            || self.last_end.get(owner).is_some_and(|end| *end > start)
+    pub(super) fn is_watched(&self, tag: &str) -> bool {
+        self.watching.contains_key(tag)
+    }
+
+    /// The request is done (`seen`: each name's image now, and whose it is):
+    /// that is what the tag legitimately is, unless its owner has a stream
+    /// running, whose build may move it.
+    pub(super) fn released(&mut self, seen: Vec<Seen>) {
+        for (tag, image, owner) in seen {
+            let busy = owner
+                .as_ref()
+                .is_some_and(|(o, _)| self.active.values().any(|w| w == o));
+            match image {
+                Some(image) if !busy && self.legit.len() < MAX_LEGIT => {
+                    self.legit.insert(tag, Legit { image, owner });
+                }
+                _ => {
+                    self.legit.remove(&tag);
+                }
+            }
+        }
+        self.changes += 1;
     }
 
     pub(super) fn forget(&mut self, workspace: &str) {
-        self.last_end.remove(workspace);
         self.legit
             .retain(|_, l| l.owner.as_ref().is_none_or(|(o, _)| o != workspace));
     }
@@ -147,6 +151,10 @@ struct Watched {
     owner: Option<(String, u64)>,
 }
 
+/// What a request left under a name: the name, its image (none: it is gone), and
+/// whose it is.
+type Seen = (String, Option<String>, Option<(String, u64)>);
+
 /// What a check found: raised once the tag lock is released.
 type Finding = (String, TagEventKind, String);
 
@@ -156,7 +164,6 @@ pub(super) struct Watch {
     svc: Arc<Services>,
     id: u64,
     ws: String,
-    start: u64,
     tags: Vec<Watched>,
     left: bool,
 }
@@ -180,17 +187,11 @@ impl Services {
         self.lock_bk().events.iter().cloned().collect()
     }
 
-    /// Sizes of the state kept: running streams, legitimate images, watched
-    /// tags, workspaces with a stream end.
+    /// Sizes of the state kept: running streams, legitimate images, watched tags.
     #[cfg(test)]
-    pub(super) fn bk_sizes(&self) -> [usize; 4] {
+    pub(super) fn bk_sizes(&self) -> [usize; 3] {
         let bk = self.lock_bk();
-        [
-            bk.active.len(),
-            bk.legit.len(),
-            bk.watching.len(),
-            bk.last_end.len(),
-        ]
+        [bk.active.len(), bk.legit.len(), bk.watching.len()]
     }
 
     /// Fill the table of legitimate images with names no tag has.
@@ -255,38 +256,67 @@ impl Services {
     }
 }
 
+impl Services {
+    /// What each of these names is in the engine now and whose it is, for the
+    /// ones a running stream watches (taken before the request's hold ends).
+    pub(super) fn bk_observe(&self, tags: &[String]) -> Vec<Seen> {
+        let watched: Vec<&String> = {
+            let bk = self.lock_bk();
+            tags.iter().filter(|t| bk.is_watched(t)).collect()
+        };
+        watched
+            .into_iter()
+            .filter_map(|tag| {
+                let (_, _, image) = self.image_info(tag).ok()?;
+                let owner = self.ledger.tag_owner(tag).map(|r| (r.scope, r.claim));
+                Some((tag.clone(), image, owner))
+            })
+            .collect()
+    }
+}
+
 impl Scope {
     /// A `BuildKit` stream of this workspace is about to run: note the tags it
     /// may not move and what each legitimately is.
     pub(super) fn bk_begin(&self) -> Watch {
         let svc = &self.svc;
         let ws = self.auth.workspace.clone();
-        // The tag lock is held across the engine's list: no REST request holds
-        // or releases a name meanwhile, so what is read is what the requests
-        // that finished left, and every later request touches the name.
-        let res = svc.lock_tags();
-        let (id, start, clean) = {
+        // The list is read before the tag lock is taken (it can be long, and
+        // a request must not wait for it) and is used only if nothing that could
+        // change it has happened since: no REST request ended. After two tries
+        // it is read under the lock instead.
+        let (res, listed) = (0..3)
+            .find_map(|attempt| {
+                let seen = svc.lock_bk().changes;
+                let early = (attempt < 2).then(|| svc.tagged_images());
+                let res = svc.lock_tags();
+                match early {
+                    Some(listed) if svc.lock_bk().changes == seen => Some((res, listed)),
+                    Some(_) => None,
+                    None => Some((res, svc.tagged_images())),
+                }
+            })
+            .expect("the last try always answers");
+        let (id, clean) = {
             let mut bk = svc.lock_bk();
             let id = bk.next_stream;
             bk.next_stream += 1;
-            let start = bk.tick();
             let clean = bk.active.is_empty();
-            bk.active.insert(id, (ws.clone(), start));
+            bk.active.insert(id, ws.clone());
             // This workspace's own build may move its own tags.
             bk.legit
                 .retain(|_, l| l.owner.as_ref().is_none_or(|(o, _)| *o != ws));
-            (id, start, clean)
+            (id, clean)
         };
         let mut watch = Watch {
             svc: Arc::clone(svc),
             id,
             ws,
-            start,
             tags: Vec::new(),
             left: false,
         };
         let mut findings = Vec::new();
-        match svc.tagged_images() {
+        match listed {
             Ok(images) => findings = watch.protect(images, &res, clean),
             Err(why) => findings.push((
                 String::new(),
@@ -372,13 +402,7 @@ impl Watch {
                 }
                 None => now_image,
             };
-            bk.watching
-                .entry(tag.clone())
-                .or_insert(Watching {
-                    refs: 0,
-                    touched: None,
-                })
-                .refs += 1;
+            *bk.watching.entry(tag.clone()).or_insert(0) += 1;
             self.tags.push(Watched { tag, image, owner });
         }
         findings
@@ -392,17 +416,10 @@ impl Watch {
         self.left = true;
         let mut bk = self.svc.lock_bk();
         bk.active.remove(&self.id);
-        let end = bk.tick();
-        bk.last_end.insert(self.ws.clone(), end);
-        // An end is only needed by a stream that began before it.
-        match bk.active.values().map(|(_, start)| *start).min() {
-            Some(oldest) => bk.last_end.retain(|_, at| *at > oldest),
-            None => bk.last_end.clear(),
-        }
         for w in &self.tags {
-            if let Some(t) = bk.watching.get_mut(&w.tag) {
-                t.refs -= 1;
-                if t.refs == 0 {
+            if let Some(refs) = bk.watching.get_mut(&w.tag) {
+                *refs -= 1;
+                if *refs == 0 {
                     bk.watching.remove(&w.tag);
                 }
             }
@@ -437,7 +454,17 @@ impl Watch {
         };
         self.tags
             .iter()
-            .filter(|w| now.get(&w.tag) != Some(&w.image))
+            .filter(|w| {
+                // What the tag should be now: what is recorded (a request may
+                // have changed it since the stream began), else what it was.
+                let should = self
+                    .svc
+                    .lock_bk()
+                    .legit
+                    .get(&w.tag)
+                    .map_or_else(|| w.image.clone(), |l| l.image.clone());
+                now.get(&w.tag) != Some(&should)
+            })
             .filter_map(|w| self.settle(w))
             .collect()
     }
@@ -448,72 +475,47 @@ impl Watch {
         let svc = &self.svc;
         // The claim's lock, held across the re-check and the engine call: a
         // request that would change the name waits for the restore.
-        let _claims = svc.lock_tags();
+        let res = svc.lock_tags();
         #[cfg(test)]
         let _marked = Marked::new();
         let say = |kind, detail: String| Some((w.tag.clone(), kind, detail));
-        let touched = svc
-            .lock_bk()
-            .watching
-            .get(&w.tag)
-            .and_then(|t| t.touched.clone())
-            .filter(|(at, _)| *at > self.start);
-        if let Some((_, by)) = touched {
-            // Someone's own request changed it meanwhile. If it was this
-            // workspace's own, that and the build cannot be told apart.
-            return (by == self.ws).then(|| {
-                (
-                    w.tag.clone(),
-                    TagEventKind::NotRestored,
-                    "this workspace also pulled or tagged it during the build, so the build's change cannot be told from it".to_owned(),
-                )
-            });
-        }
-        let rec = svc.ledger.tag_owner(&w.tag);
-        if rec.as_ref().map(|r| (r.scope.clone(), r.claim)) != w.owner {
+        // A request is in the engine with the name: when it ends, the name's
+        // image is what it left.
+        if res.contains_key(&w.tag) {
             return None;
         }
-        if let Some((owner, _)) = &w.owner
-            && svc.lock_bk().busy_since(owner, self.start)
-        {
-            return say(
-                TagEventKind::NotRestored,
-                format!(
-                    "it is workspace {owner}'s, which was building too, so the change may be its own"
-                ),
-            );
+        let rec = svc.ledger.tag_owner(&w.tag).map(|r| (r.scope, r.claim));
+        // The name is no one's now (its owner released it), or has been taken
+        // by someone: not ours to put back.
+        if rec.is_some() != w.owner.is_some() {
+            return None;
         }
         let known = svc
             .lock_bk()
             .legit
             .get(&w.tag)
-            .is_some_and(|l| l.image == w.image);
-        if !known {
+            .filter(|l| l.owner == rec)
+            .map(|l| l.image.clone());
+        let Some(image) = known else {
             return say(
                 TagEventKind::NotRestored,
-                "other builds were running when this one began, so which image the tag should have is not known".to_owned(),
+                "which image the tag should have is not known (a stream of its owner, or other builds, were running)".to_owned(),
             );
-        }
+        };
         match svc.image_info(&w.tag) {
-            Ok((_, _, id)) if id.as_deref() == Some(w.image.as_str()) => return None,
+            Ok((_, _, id)) if id.as_deref() == Some(image.as_str()) => return None,
             Ok(_) => {}
             Err(r) => return say(TagEventKind::NotRestored, r.msg),
         }
-        let owner = w
-            .owner
-            .as_ref()
-            .map_or("a pulled image".to_owned(), |(o, _)| {
-                format!("workspace {o}'s")
-            });
+        let owner = rec.as_ref().map_or("a pulled image".to_owned(), |(o, _)| {
+            format!("workspace {o}'s")
+        });
         let (repo, tag) = w.tag.rsplit_once(':').unwrap_or((&w.tag, "latest"));
-        let path = format!("/images/{}/tag?repo={repo}&tag={tag}", w.image);
+        let path = format!("/images/{image}/tag?repo={repo}&tag={tag}");
         match svc.up_request("POST", &path, None) {
             Ok((201, _)) => say(
                 TagEventKind::Restored,
-                format!(
-                    "it is {owner}, and a build moved it; put back on {}",
-                    w.image
-                ),
+                format!("it is {owner}, and a build moved it; put back on {image}"),
             ),
             Ok((status, _)) => say(
                 TagEventKind::NotRestored,

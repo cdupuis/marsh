@@ -698,9 +698,10 @@ In plain words:
   image changed, with a plain `docker tag` of the old image ID (never forced; nothing
   is deleted), and says so on the services agent's standard error. It does not do
   that when another explanation exists: the tag's owner pulled, tagged or deleted it
-  meanwhile (silent), the lane itself also pulled it, or the owner had a build
-  running too (reported, not undone, so a lane's own legitimate build of its own
-  tag is never touched). **What stays open:** the overwrite is seen when the
+  meanwhile (what the request left is then the tag's image: a later overwrite is
+  still put back), or the owner had a build running too (reported, not undone, so a
+  lane's own legitimate build of its own tag is never touched; the same while the
+  agent has no record of what the tag should be, for instance with a full table). **What stays open:** the overwrite is seen when the
   build's stream ends, not stopped: from the moment the build moves the tag until
   then (the whole build, for `buildx`), the base's tag points at the lane's image, and
   a `docker run base-app:1` in that time runs the lane's image. The tag is put back
@@ -708,7 +709,9 @@ In plain words:
   X && docker run X`) may run either image. A change made after a stream ended is
   not repaired; nor is a tag whose old image is gone. A tag a `docker build` in one
   lane creates is not recorded to that lane (only tags made over the REST API and
-  pulled names are), so another lane's build can still take it without a trace.
+  pulled names are), so another lane's build can still take it without a trace. A
+  build whose image is also a pulled image (a `FROM alpine` with no change) makes its
+  tag count as a pulled name, and a later build of that tag in the same lane is put back.
   At most 256 protected tags are watched per stream, and a stream whose image list
   could not be read runs unwatched, with an event. The BuildKit cache and history
   are as exposed as before. Where

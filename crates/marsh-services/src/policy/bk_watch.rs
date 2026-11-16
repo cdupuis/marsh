@@ -14,6 +14,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use super::{Scope, Services};
 use crate::ledger::now;
@@ -40,6 +45,8 @@ pub struct TagEvent {
     pub previous: String,
     pub current: Option<String>,
     pub ambiguous: bool,
+    /// Other streams ran with this one: the workspace may not be the one that moved the tag.
+    pub overlapped: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +89,8 @@ struct Window {
     owners: HashSet<String>,
     touched: HashSet<String>,
     others: HashSet<String>,
+    /// Another stream was running at some time with this one.
+    overlap: bool,
 }
 
 /// Shared state, under its own lock (taken after `tag_res`, never across a call out).
@@ -161,6 +170,9 @@ pub(super) struct Watch {
     began: u64,
 }
 
+/// The engine's tagged images (tag, image ID, pulled) and whether a name was left out.
+type Listed = (Vec<(String, String, bool)>, bool);
+
 impl Services {
     pub(super) fn lock_bk(&self) -> std::sync::MutexGuard<'_, Bk> {
         self.bk
@@ -206,6 +218,7 @@ impl Services {
                 previous: String::new(),
                 current: None,
                 ambiguous: false,
+                overlapped: false,
             },
             0,
         );
@@ -223,7 +236,7 @@ impl Services {
     }
 
     /// Every tagged image the engine has: canonical tag, image ID, pulled.
-    fn tagged_images(&self) -> Result<Vec<(String, String, bool)>, String> {
+    fn tagged_images(&self) -> Result<Listed, String> {
         let (status, body) = self
             .up_request("GET", "/images/json", None)
             .map_err(|e| format!("the engine's image list failed: {e}"))?;
@@ -232,7 +245,7 @@ impl Services {
         }
         let list: Vec<serde_json::Value> = serde_json::from_slice(&body)
             .map_err(|_| "the engine's image list is not readable".to_owned())?;
-        let mut out = Vec::new();
+        let (mut out, mut skipped) = (Vec::new(), false);
         for image in &list {
             let Some(id) = image.get("Id").and_then(|i| i.as_str()) else {
                 continue;
@@ -243,12 +256,14 @@ impl Services {
                 .is_some_and(|d| !d.is_empty());
             let tags = image.get("RepoTags").and_then(|t| t.as_array());
             for tag in tags.into_iter().flatten().filter_map(|t| t.as_str()) {
-                if let Ok(tag) = crate::policy::admit::canonical_tag(tag, None) {
-                    out.push((tag, id.to_owned(), pulled));
+                match crate::policy::admit::canonical_tag(tag, None) {
+                    Ok(tag) => out.push((tag, id.to_owned(), pulled)),
+                    // An untagged image is listed as `<none>:<none>`.
+                    Err(_) => skipped |= !tag.starts_with("<none>"),
                 }
             }
         }
-        Ok(out)
+        Ok((out, skipped))
     }
 }
 
@@ -260,13 +275,23 @@ impl Scope {
         // The window first, so nothing during the list is missed; a name a REST
         // request holds now is one it touches.
         let (id, began) = {
-            let held: HashSet<String> = svc.lock_tags().keys().cloned().collect();
+            // The tag table stays locked until the window exists: a request that
+            // reserves a name either is in `held` or finds the window.
+            let res = svc.lock_tags();
+            let held: HashSet<String> = res.keys().cloned().collect();
+            #[cfg(test)]
+            pause_after_held(&ws);
             let mut bk = svc.lock_bk();
             let id = bk.next;
             bk.next += 1;
             let others = bk.running.values().map(|w| w.ws.clone()).collect();
+            let overlap = !bk.running.is_empty();
             for w in bk.running.values_mut() {
-                if !w.known || w.owners.contains(&ws) {
+                w.overlap = true;
+                if !w.known {
+                    // Who it is does not matter, only that a stream began meanwhile.
+                    w.any = true;
+                } else if w.owners.contains(&ws) {
                     w.others.insert(ws.clone());
                 }
             }
@@ -281,13 +306,14 @@ impl Scope {
                     owners: HashSet::new(),
                     touched: held,
                     others,
+                    overlap,
                 },
             );
             (id, began)
         };
         let mut tags = Vec::new();
         let listed = svc.tagged_images();
-        if let Ok(images) = &listed {
+        if let Ok((images, _)) = &listed {
             for (tag, image, pulled) in images {
                 let owner = match svc.ledger.tag_owner(tag) {
                     Some(rec) if rec.scope == ws => continue,
@@ -314,11 +340,17 @@ impl Scope {
         }
         match listed {
             Err(why) => svc.unchecked(&ws, &why),
-            Ok(_) if cut > 0 => svc.unchecked(
-                &ws,
-                &format!("{cut} protected tags are not watched (only {MAX_WATCHED} are)"),
-            ),
-            Ok(_) => {}
+            Ok((_, skipped)) => {
+                if cut > 0 {
+                    svc.unchecked(
+                        &ws,
+                        &format!("{cut} protected tags are not watched (only {MAX_WATCHED} are)"),
+                    );
+                }
+                if skipped {
+                    svc.unchecked(&ws, "some image names are too long to watch");
+                }
+            }
         }
         Watch {
             svc: Arc::clone(svc),
@@ -337,7 +369,7 @@ impl Watch {
             return;
         }
         let now_images = match self.svc.tagged_images() {
-            Ok(images) => images
+            Ok((images, _)) => images
                 .into_iter()
                 .map(|(t, i, _)| (t, i))
                 .collect::<HashMap<_, _>>(),
@@ -355,7 +387,12 @@ impl Watch {
                         || w.touched.contains(&n.tag)
                         || n.owner.as_ref().is_some_and(|o| w.others.contains(o))
                 });
-                self.event(n, now_images.get(&n.tag).cloned(), ambiguous)
+                self.event(
+                    n,
+                    now_images.get(&n.tag).cloned(),
+                    ambiguous,
+                    w.is_none_or(|w| w.overlap),
+                )
             })
             .collect();
         drop(window);
@@ -364,7 +401,13 @@ impl Watch {
         }
     }
 
-    fn event(&self, n: &Noted, current: Option<String>, ambiguous: bool) -> TagEvent {
+    fn event(
+        &self,
+        n: &Noted,
+        current: Option<String>,
+        ambiguous: bool,
+        overlapped: bool,
+    ) -> TagEvent {
         let whose = n.owner.as_ref().map_or("a pulled image's".to_owned(), |o| {
             format!("workspace {o}'s")
         });
@@ -375,6 +418,11 @@ impl Watch {
             });
         let may = if ambiguous {
             " This may be the owner's own change."
+        } else {
+            ""
+        };
+        let several = if overlapped {
+            " Several builds ran at once: the workspace named may not be the one that moved it."
         } else {
             ""
         };
@@ -393,7 +441,7 @@ impl Watch {
             workspace: self.ws.clone(),
             kind: TagEventKind::Changed,
             detail: format!(
-                "image tag {} ({whose}) {state}; it was {}.{may} It is not undone: {fix}.",
+                "image tag {} ({whose}) {state}; it was {}.{may}{several} It is not undone: {fix}.",
                 n.tag, n.image
             ),
             tag: n.tag.clone(),
@@ -401,6 +449,7 @@ impl Watch {
             previous: n.image.clone(),
             current,
             ambiguous,
+            overlapped,
         }
     }
 }
@@ -408,5 +457,28 @@ impl Watch {
 impl Drop for Watch {
     fn drop(&mut self) {
         self.svc.lock_bk().running.remove(&self.id);
+    }
+}
+
+/// Test hook: a stream of this workspace waits here, after it collected the
+/// names a request holds and before its window exists.
+#[cfg(test)]
+pub(super) static PAUSE: Mutex<Option<Pause>> = Mutex::new(None);
+
+/// Workspace, reached flag, resume flag.
+#[cfg(test)]
+pub(super) type Pause = (String, Arc<AtomicBool>, Arc<AtomicBool>);
+
+#[cfg(test)]
+fn pause_after_held(ws: &str) {
+    let hook = PAUSE.lock().unwrap().clone();
+    if let Some((who, reached, release)) = hook
+        && who == ws
+    {
+        reached.store(true, Ordering::SeqCst);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !release.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }

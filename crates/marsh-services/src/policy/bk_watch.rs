@@ -63,17 +63,23 @@ impl std::fmt::Display for TagEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "BuildKit stream of workspace {}: {}",
+            "BuildKit stream (workspace {}'s, or one that ran with it): {}",
             self.workspace, self.detail
         )
     }
 }
 
 /// A running stream's window: the tags it noted, those a REST request held, and
-/// the workspaces that had a stream running with it.
+/// the workspaces that had a stream running with it. It exists from before the
+/// stream's first image list, so nothing that happens during the list is missed:
+/// until the tags are known (`known`), any REST request counts for every tag (`any`).
 struct Window {
     ws: String,
+    known: bool,
+    any: bool,
     tags: HashSet<String>,
+    /// The workspaces owning the noted tags: the only overlaps that matter.
+    owners: HashSet<String>,
     touched: HashSet<String>,
     others: HashSet<String>,
 }
@@ -82,31 +88,58 @@ struct Window {
 #[derive(Default)]
 pub(super) struct Bk {
     next: u64,
+    seq: u64,
     running: HashMap<u64, Window>,
-    events: VecDeque<TagEvent>,
+    events: VecDeque<(u64, TagEvent)>,
 }
 
 impl Bk {
     /// A REST request holds these names.
     pub(super) fn touch(&mut self, tags: &[String]) {
         for w in self.running.values_mut() {
-            w.touched
-                .extend(tags.iter().filter(|t| w.tags.contains(*t)).cloned());
+            if w.known {
+                w.touched
+                    .extend(tags.iter().filter(|t| w.tags.contains(*t)).cloned());
+            } else {
+                w.any = true;
+            }
         }
     }
 
-    fn push(&mut self, ev: TagEvent) -> bool {
-        let same = |e: &TagEvent| {
-            (&e.tag, &e.previous, &e.current, e.kind)
-                == (&ev.tag, &ev.previous, &ev.current, ev.kind)
-                && e.kind == TagEventKind::Changed
+    /// Keep `ev` unless the same change was reported since `since` (several
+    /// streams that ran together see one change) or the same "unable to check" is
+    /// already there. At the cap the oldest report of a tag is kept: it holds the
+    /// owner's original image, so "unable to check" goes first, then the oldest
+    /// later report of a tag.
+    fn push(&mut self, ev: TagEvent, since: u64) -> bool {
+        let same = |e: &TagEvent| match ev.kind {
+            TagEventKind::Changed => {
+                (&e.tag, &e.previous, &e.current) == (&ev.tag, &ev.previous, &ev.current)
+            }
+            TagEventKind::Unchecked => (&e.workspace, &e.detail) == (&ev.workspace, &ev.detail),
         };
-        if self.events.iter().any(same) {
+        let seen = self.events.iter().any(|(at, e)| {
+            e.kind == ev.kind && same(e) && (ev.kind == TagEventKind::Unchecked || *at >= since)
+        });
+        if seen {
             return false;
         }
-        self.events.push_back(ev);
+        self.seq += 1;
+        self.events.push_back((self.seq, ev));
         while self.events.len() > MAX_EVENTS {
-            self.events.pop_front();
+            let first_of_tag =
+                |i: usize| {
+                    !self.events.iter().take(i).any(|(_, p)| {
+                        p.kind == TagEventKind::Changed && p.tag == self.events[i].1.tag
+                    })
+                };
+            let drop = self
+                .events
+                .iter()
+                .position(|(_, e)| e.kind == TagEventKind::Unchecked)
+                .or_else(|| (0..self.events.len()).find(|&i| !first_of_tag(i)))
+                .unwrap_or(0);
+            self.events.remove(drop);
         }
         true
     }
@@ -125,6 +158,7 @@ pub(super) struct Watch {
     id: u64,
     ws: String,
     tags: Vec<Noted>,
+    began: u64,
 }
 
 impl Services {
@@ -137,7 +171,21 @@ impl Services {
     /// The latest events, oldest first (at most 64).
     #[must_use]
     pub fn tag_events(&self) -> Vec<TagEvent> {
-        self.lock_bk().events.iter().cloned().collect()
+        self.lock_bk()
+            .events
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect()
+    }
+
+    /// Workspaces remembered as overlapping, summed over the running streams (tests).
+    #[cfg(test)]
+    pub(super) fn bk_others(&self) -> usize {
+        self.lock_bk()
+            .running
+            .values()
+            .map(|w| w.others.len())
+            .sum()
     }
 
     /// Streams running (tests).
@@ -147,21 +195,24 @@ impl Services {
     }
 
     fn unchecked(&self, workspace: &str, detail: &str) {
-        self.raise(TagEvent {
-            at: now(),
-            workspace: workspace.to_owned(),
-            kind: TagEventKind::Unchecked,
-            detail: format!("unable to check image tags: {detail}"),
-            tag: String::new(),
-            owner: None,
-            previous: String::new(),
-            current: None,
-            ambiguous: false,
-        });
+        self.raise(
+            TagEvent {
+                at: now(),
+                workspace: workspace.to_owned(),
+                kind: TagEventKind::Unchecked,
+                detail: format!("unable to check image tags: {detail}"),
+                tag: String::new(),
+                owner: None,
+                previous: String::new(),
+                current: None,
+                ambiguous: false,
+            },
+            0,
+        );
     }
 
-    fn raise(&self, ev: TagEvent) {
-        let ev = if self.lock_bk().push(ev.clone()) {
+    fn raise(&self, ev: TagEvent, since: u64) {
+        let ev = if self.lock_bk().push(ev.clone(), since) {
             Some(ev)
         } else {
             None
@@ -206,6 +257,34 @@ impl Scope {
     /// may not move.
     pub(super) fn bk_begin(&self) -> Watch {
         let (svc, ws) = (&self.svc, self.auth.workspace.clone());
+        // The window first, so nothing during the list is missed; a name a REST
+        // request holds now is one it touches.
+        let (id, began) = {
+            let held: HashSet<String> = svc.lock_tags().keys().cloned().collect();
+            let mut bk = svc.lock_bk();
+            let id = bk.next;
+            bk.next += 1;
+            let others = bk.running.values().map(|w| w.ws.clone()).collect();
+            for w in bk.running.values_mut() {
+                if !w.known || w.owners.contains(&ws) {
+                    w.others.insert(ws.clone());
+                }
+            }
+            let began = bk.seq + 1;
+            bk.running.insert(
+                id,
+                Window {
+                    ws: ws.clone(),
+                    known: false,
+                    any: false,
+                    tags: HashSet::new(),
+                    owners: HashSet::new(),
+                    touched: held,
+                    others,
+                },
+            );
+            (id, began)
+        };
         let mut tags = Vec::new();
         let listed = svc.tagged_images();
         if let Ok(images) = &listed {
@@ -227,26 +306,12 @@ impl Scope {
         tags.sort_by(|a, b| (a.owner.is_none(), &a.tag).cmp(&(b.owner.is_none(), &b.tag)));
         let cut = tags.len().saturating_sub(MAX_WATCHED);
         tags.truncate(MAX_WATCHED);
-        let id = {
-            let mut bk = svc.lock_bk();
-            let id = bk.next;
-            bk.next += 1;
-            // Every stream running now and this one have each other in their window.
-            let mine: HashSet<String> = bk.running.values().map(|w| w.ws.clone()).collect();
-            for w in bk.running.values_mut() {
-                w.others.insert(ws.clone());
-            }
-            bk.running.insert(
-                id,
-                Window {
-                    ws: ws.clone(),
-                    tags: tags.iter().map(|n| n.tag.clone()).collect(),
-                    touched: HashSet::new(),
-                    others: mine,
-                },
-            );
-            id
-        };
+        if let Some(w) = svc.lock_bk().running.get_mut(&id) {
+            w.owners = tags.iter().filter_map(|n| n.owner.clone()).collect();
+            w.tags = tags.iter().map(|n| n.tag.clone()).collect();
+            w.others.retain(|o| w.owners.contains(o));
+            w.known = true;
+        }
         match listed {
             Err(why) => svc.unchecked(&ws, &why),
             Ok(_) if cut > 0 => svc.unchecked(
@@ -260,6 +325,7 @@ impl Scope {
             id,
             ws,
             tags,
+            began,
         }
     }
 }
@@ -284,8 +350,9 @@ impl Watch {
             .iter()
             .filter(|n| now_images.get(&n.tag) != Some(&n.image))
             .map(|n| {
-                let ambiguous = w.is_some_and(|w| {
-                    w.touched.contains(&n.tag)
+                let ambiguous = w.is_none_or(|w| {
+                    w.any
+                        || w.touched.contains(&n.tag)
                         || n.owner.as_ref().is_some_and(|o| w.others.contains(o))
                 });
                 self.event(n, now_images.get(&n.tag).cloned(), ambiguous)
@@ -293,7 +360,7 @@ impl Watch {
             .collect();
         drop(window);
         for ev in found {
-            self.svc.raise(ev);
+            self.svc.raise(ev, self.began);
         }
     }
 
@@ -313,17 +380,20 @@ impl Watch {
         };
         let fix = match &n.owner {
             Some(o) => format!(
-                "to put it back, run in workspace {o}: docker tag {} {}",
+                "if image {0} still exists, `docker tag {0} {1}` run in workspace {o} puts it back (else rebuild it)",
                 n.image, n.tag
             ),
-            None => format!("to get it back, run: docker pull {}", n.tag),
+            None => format!(
+                "`docker pull {}` fetches the registry's current image, not necessarily {}",
+                n.tag, n.image
+            ),
         };
         TagEvent {
             at: now(),
             workspace: self.ws.clone(),
             kind: TagEventKind::Changed,
             detail: format!(
-                "image tag {} ({whose}) {state}; it was {}.{may} It is not undone: {fix} (`marsh docker status` lists these reports).",
+                "image tag {} ({whose}) {state}; it was {}.{may} It is not undone: {fix}.",
                 n.tag, n.image
             ),
             tag: n.tag.clone(),

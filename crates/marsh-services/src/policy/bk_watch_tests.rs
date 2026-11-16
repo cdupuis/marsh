@@ -17,6 +17,8 @@ struct Store {
     tag_posts: Vec<String>,
     deletes: usize,
     fail_list: bool,
+    /// Hold the answer to the next image list (computed before the wait).
+    list_delay: Option<Duration>,
 }
 
 type Shared = Arc<Mutex<Store>>;
@@ -89,7 +91,14 @@ fn bk_engine(st: Shared) -> Handler {
                     answer(s, 500, "{}");
                 } else {
                     let all: Vec<String> = st.images.iter().map(|i| st.entry(i)).collect();
-                    answer(s, 200, &format!("[{}]", all.join(",")));
+                    let body = format!("[{}]", all.join(","));
+                    if let Some(delay) = st.list_delay.take() {
+                        drop(st);
+                        std::thread::sleep(delay);
+                        answer(s, 200, &body);
+                        return true;
+                    }
+                    answer(s, 200, &body);
                 }
             }
             ("GET", p) if p.starts_with("/images/") && p.ends_with("/json") => {
@@ -626,16 +635,21 @@ fn recorded_tags_come_before_pulled_names_in_the_watch() {
     );
 }
 
-/// The event list keeps the latest 64.
+/// The event list holds 64.
 #[test]
 fn the_event_list_is_bounded() {
     let w = World::new("bk-events");
-    let b = lane(&w.h, B);
-    for _ in 0..70 {
-        w.st.lock().unwrap().fail_list = true;
-        let c = open_stream(&b, "/grpc");
-        w.end(&c, B);
+    for i in 0..70 {
+        let tag = format!("t{i:02}:1");
+        w.build(&tag, &format!("sha256:t{i:02}"));
+        w.h.svc.ledger.set_tag(A, &tag).unwrap();
     }
+    let b = lane(&w.h, B);
+    let c = open_stream(&b, "/grpc");
+    for i in 0..70 {
+        w.build(&format!("t{i:02}:1"), "sha256:lane");
+    }
+    w.end(&c, B);
     assert_eq!(w.h.svc.tag_events().len(), 64);
 }
 
@@ -659,6 +673,198 @@ fn a_stream_leaves_no_state_behind() {
     assert_eq!(w.h.svc.bk_running(), 1);
     drop(watch);
     assert_eq!(w.h.svc.bk_running(), 0);
+}
+
+/// The owner puts the tag back (as the report says) and the lane's next build, a
+/// cached one with the same image, moves it again: reported again.
+#[test]
+fn a_repeated_identical_overwrite_is_reported_again() {
+    let w = World::new("bk-repeat");
+    let (a, b) = (lane(&w.h, A), lane(&w.h, B));
+    let c = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.end(&c, B);
+    assert_eq!(tag_as(&a, "sha256:a1", "base-app"), 201);
+    let c = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.end(&c, B);
+    assert_eq!(w.reports().len(), 2);
+}
+
+/// An owner's request that is in the engine when the stream begins, and lands
+/// during it, makes the report ambiguous (and so does one that lands while the
+/// first list is being read, and an owner's stream that runs during that list).
+#[test]
+fn a_request_in_flight_at_the_start_makes_the_report_ambiguous() {
+    let (gate, release) = {
+        let r = Arc::new(AtomicBool::new(false));
+        (r.clone(), r)
+    };
+    let w = World::with("bk-inflight", |e| {
+        let g = gate.clone();
+        Arc::new(move |req: &Req, s: &mut UnixStream| {
+            if req.target.starts_with("/images/src/tag") {
+                let until = Instant::now() + Duration::from_secs(5);
+                while !g.load(Ordering::SeqCst) && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            e(req, s)
+        })
+    });
+    let (a, b) = (lane(&w.h, A), lane(&w.h, B));
+    let tagging = std::thread::spawn(move || tag_as(&a, "src", "base-app"));
+    assert!(wait_for(Duration::from_secs(5), || w
+        .h
+        .engine
+        .saw("POST", "/images/src/tag")
+        == 1));
+    let c = open_stream(&b, "/grpc");
+    release.store(true, Ordering::SeqCst);
+    assert_eq!(tagging.join().unwrap(), 201);
+    w.end(&c, B);
+    assert_eq!(
+        w.reports(),
+        [rep("base-app:1", "sha256:a1", "sha256:src", true)]
+    );
+}
+
+#[test]
+fn a_request_or_an_owner_stream_during_the_first_list_makes_the_report_ambiguous() {
+    for owner_stream in [false, true] {
+        let w = World::new(&format!("bk-dl{}", u8::from(owner_stream)));
+        let (a, b) = (lane(&w.h, A), lane(&w.h, B));
+        w.st.lock().unwrap().list_delay = Some(Duration::from_millis(800));
+        let opening = std::thread::spawn({
+            let b = b.clone();
+            move || open_stream(&b, "/grpc")
+        });
+        assert!(wait_for(Duration::from_secs(5), || w
+            .h
+            .engine
+            .saw("GET", "/images/json")
+            == 1));
+        if owner_stream {
+            let ca = open_stream(&a, "/grpc");
+            w.build("base-app:1", "sha256:src");
+            w.end(&ca, A);
+        } else {
+            assert_eq!(tag_as(&a, "src", "base-app"), 201);
+        }
+        let c = opening.join().unwrap();
+        w.end(&c, B);
+        assert_eq!(
+            w.reports(),
+            [rep("base-app:1", "sha256:a1", "sha256:src", true)],
+            "owner_stream={owner_stream}"
+        );
+    }
+}
+
+/// A stream that stays open does not remember the workspaces of streams that came
+/// and went and own nothing it watches.
+#[test]
+fn a_long_stream_keeps_no_unrelated_workspaces() {
+    let w = World::new("bk-longstream");
+    let b = lane(&w.h, B);
+    let long = open_stream(&b, "/grpc");
+    for i in 0..20 {
+        let ws = format!("gone{i}");
+        let s = lane(&w.h, &ws);
+        let c = open_stream(&s, "/grpc");
+        w.h.svc.forget_scope(&ws).unwrap();
+        w.end(&c, &ws);
+    }
+    assert_eq!(w.h.svc.bk_others(), 0);
+    // The owner's own stream is remembered.
+    let a = lane(&w.h, A);
+    let ca = open_stream(&a, "/grpc");
+    assert!(w.h.svc.bk_others() >= 1);
+    w.end(&ca, A);
+    w.end(&long, B);
+}
+
+/// A lane cannot age the reports out: "unable to check" is kept once, and the
+/// oldest report of a tag (the owner's original image) is kept when the list is full.
+#[test]
+fn reports_are_not_aged_out_by_unchecked_events_or_repeated_overwrites() {
+    let w = World::new("bk-evict");
+    let b = lane(&w.h, B);
+    let c = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane0");
+    w.end(&c, B);
+    for _ in 0..70 {
+        w.st.lock().unwrap().fail_list = true;
+        let c = open_stream(&b, "/grpc");
+        w.end(&c, B);
+    }
+    assert_eq!(w.unchecked(), 1);
+    assert_eq!(w.reports().len(), 1);
+    w.st.lock().unwrap().fail_list = false;
+    for i in 1..80 {
+        let c = open_stream(&b, "/grpc");
+        w.build("base-app:1", &format!("sha256:lane{i}"));
+        w.end(&c, B);
+    }
+    let reports = w.reports();
+    assert_eq!(w.h.svc.tag_events().len(), 64);
+    assert_eq!(
+        reports[0],
+        rep("base-app:1", "sha256:a1", "sha256:lane0", false)
+    );
+}
+
+/// What a report tells the user to do, and whose stream it names.
+#[test]
+fn the_recovery_text_is_conditional_and_the_stream_is_named_with_its_overlap() {
+    let w = World::new("bk-text");
+    let b = lane(&w.h, B);
+    let c = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.build("postgres:16", "sha256:lane2");
+    w.end(&c, B);
+    let events = w.h.svc.tag_events();
+    let owned = events.iter().find(|e| e.tag == "base-app:1").unwrap();
+    assert!(
+        owned
+            .detail
+            .contains("if image sha256:a1 still exists, `docker tag sha256:a1 base-app:1` run in workspace lane-a puts it back (else rebuild it)"),
+        "{}",
+        owned.detail
+    );
+    assert!(
+        owned.to_string().contains("or one that ran with it"),
+        "{owned}"
+    );
+    let pulled = events.iter().find(|e| e.tag == "postgres:16").unwrap();
+    assert!(
+        pulled
+            .detail
+            .contains("`docker pull postgres:16` fetches the registry's current image, not necessarily sha256:pg"),
+        "{}",
+        pulled.detail
+    );
+}
+
+/// Streams that begin while another stream is reading its first list are
+/// remembered only if they own something it watches.
+#[test]
+fn workspaces_met_during_the_first_list_are_trimmed_afterwards() {
+    let w = World::new("bk-trim");
+    let b = lane(&w.h, B);
+    w.st.lock().unwrap().list_delay = Some(Duration::from_millis(800));
+    let opening = std::thread::spawn(move || open_stream(&b, "/grpc"));
+    assert!(wait_for(Duration::from_secs(5), || w
+        .h
+        .engine
+        .saw("GET", "/images/json")
+        == 1));
+    let other = lane(&w.h, "lane-z");
+    let cz = open_stream(&other, "/grpc");
+    let cb = opening.join().unwrap();
+    assert_eq!(w.h.svc.bk_others(), 0);
+    w.end(&cz, "lane-z");
+    w.end(&cb, B);
 }
 
 /// The daemon's status read (the base workspace, attempt `status`) gets the

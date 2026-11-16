@@ -456,37 +456,41 @@ has is checked.
   back was dropped: a wrong restore, one that undoes a legitimate change of the owner,
   is worse than the gap. The agent only reports:
   1. **A stream begins** (`/grpc` or `/session` after the engine's 101, before any
-     byte is relayed). The agent lists the engine's images as itself (`GET
-     /images/json`, its only engine request) and notes the image ID of every tag the
-     stream's workspace may not move: tags the ledger records to another workspace
-     and unrecorded names on an image with a registry digest (`postgres:16`), at most
-     256, recorded ones first (more is an "unable to check" event). A tag recorded to
-     the stream's workspace, and an unrecorded name on a local image, are its to
-     move. A list that fails is an "unable to check" event; the stream runs
-     (fail open). No lock is held; nothing blocks a build or a REST request.
+     byte is relayed). The stream's window opens first: it counts every REST request
+     that holds a name from then on, the names held at that moment, and the
+     workspaces that have a stream running. Then the agent lists the engine's images
+     as itself (`GET /images/json`, its only engine request) and notes the image ID
+     of every tag the stream's workspace may not move: tags the ledger records to
+     another workspace and unrecorded names on an image with a registry digest
+     (`postgres:16`), at most 256, recorded ones first (more is an "unable to check"
+     event). A tag recorded to the stream's workspace, and an unrecorded name on a
+     local image, are its to move. Any REST request during the list counts for every
+     tag, and streams that begin during it are all remembered until it is done (then
+     only owners of noted tags are kept, so a long stream cannot accumulate
+     workspaces). A list that fails is an "unable to check" event; the stream runs
+     (fail open). No lock is held across the list.
   2. **A stream ends** (the relay's pump returns, whoever closed it). The names are
      read again and each that has another image, or has gone, is reported once:
-     time, tag, owner (`None`: a pulled name), previous and current image ID, the
-     stream's workspace, and **ambiguous** when the owner had a REST request on the
-     name (any workspace's, for a pulled name), or a stream of its own running at the
-     start or beginning during the window: the text then says "this may be the
-     owner's own change". The same change seen by several streams is reported once.
-  3. **The text is the recovery**: `docker tag <previous id> <name>` to run in the
-     owner's workspace (a pulled name: `docker pull <name>`), and says the change is
-     not undone. Events are a line on the agent's standard error and an entry of
-     `Services::tag_events()` (the last 64), which the daemon reads for `marsh docker
-     status --json` (`image_tag_events`, only when there are any) and shows as one
-     line in `marsh docker status`, over the same filtered endpoint its status read
-     already uses: `GET /_marsh/tag-events`, answered by the agent itself
-     (`Kind::TagEvents`, never sent to the engine) and only to the daemon's own status
-     read: the base workspace with the reserved attempt `status`, which the host refuses
-     to give to any job, shell or lane (`AttemptScope::new` rejects it;
-     `AttemptScope::status` is the daemon's). The daemon makes the text plain and
-     bounded (at most 64 events, kinds `changed`, `unchecked`). This is deliberately not
-     a new relay frame: a frame or `Settings` field the peer does not know is a protocol
-     violation on both sides (every message type is a closed set); an old agent refuses
-     the unknown route (no events) and an old host never asks. Not persisted: an agent
-     restart forgets them.
+     time, tag, owner (`None`: a pulled name), previous and current image ID, a
+     workspace, and **ambiguous** when the owner had a REST request on the name (any
+     workspace's, for a pulled name), or a stream of its own running at the start or
+     beginning during the window, or when that cannot be told (a request in the
+     engine at the start, or during the first list): the text then says "this may be
+     the owner's own change". Ambiguity errs towards true. The workspace is that of
+     the stream that ended and saw it, which with overlapping streams is not
+     necessarily the one that moved the tag ("workspace X's, or one that ran with
+     it"). The same change seen by streams that ran together is reported once; the
+     same change after the user put the tag back, by a later stream, is reported
+     again.
+  3. **The text is the recovery**: if the previous image still exists,
+     `docker tag <previous id> <name>` run in the owner's workspace puts it back (else
+     rebuild it); a pulled name: `docker pull <name>` fetches the registry's current
+     image, not necessarily the previous one. The text says the change is not undone.
+     Events are a line on the agent's standard error and an entry of
+     `Services::tag_events()` (the last 64). "Unable to check" is kept once per
+     workspace and cause, and at the cap those go first, then later reports of a tag:
+     the oldest report of a tag is kept, it holds the owner's original image. Not
+     persisted: an agent restart forgets them.
   Not done: **the overwrite is detected after the stream, not prevented**: while the
   build runs, and from its export until its stream ends, the other workspace's tag
   points at the lane's image (a `docker run` of it then runs the lane's image), and
@@ -496,7 +500,12 @@ has is checked.
   another workspace's build may take it, unseen (only tags created over REST, and
   pulled names, are protected); a lane's own build of a name whose image is also a
   pulled image's (a no-op `FROM alpine` build) counts as a pulled name and is
-  reported; a long-lived stream is checked only when it ends; the cache,
+  reported; a pulled name stops being watched once a local image holds it (the watch
+  looks at the registry digests of the image at the stream's start), so a second
+  overwrite of it is silent; a name created after a stream began is not watched by it;
+  a long-lived stream is checked only when it ends, and the two image lists a stream
+  takes (the first before the client gets the engine's 101, so a slow engine delays
+  a build's start) cost time and memory; the cache,
   `buildx prune`/`du` and history stay as exposed as before (below). Tests: the
   `bk_watch_tests` module of `endpoint_tests.rs`, each rule above removed once with a
   test failing.

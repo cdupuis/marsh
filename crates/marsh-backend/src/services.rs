@@ -1095,14 +1095,7 @@ impl StockDaemonBackend {
                     Err(error) => json!({ "error": format!("marsh: {error}") }),
                 },
             );
-        // Display only (E2, N3's shape): the base workspace's containers and
-        // published ports, read through the same filter a job's requests use.
-        let (view, view_error) = if state == "ready" {
-            self.services_containers(root)
-        } else {
-            (super::services_view::View::default(), None)
-        };
-        self.project_document(
+        self.project_json_with(
             root,
             settings,
             ProjectParts {
@@ -1113,10 +1106,28 @@ impl StockDaemonBackend {
                 holders,
                 idle_left,
                 exposure,
-                view,
-                view_error,
+                view: super::services_view::View::default(),
+                view_error: None,
             },
+            || self.services_containers(root),
         )
+    }
+
+    /// The document of a project whose state is known: a ready one also gets the
+    /// engine view (`read_view`), display only (E2, N3's shape): the base
+    /// workspace's containers, published ports and image tag events, read through
+    /// the same filter a job's requests use.
+    fn project_json_with(
+        &self,
+        root: &Path,
+        settings: &Settings,
+        mut parts: ProjectParts,
+        read_view: impl FnOnce() -> (super::services_view::View, Option<String>),
+    ) -> Value {
+        if parts.state == "ready" {
+            (parts.view, parts.view_error) = read_view();
+        }
+        self.project_document(root, settings, parts)
     }
 
     /// A project's status document, from what was found out about it.
@@ -1884,6 +1895,43 @@ fn keep_quiesced<P>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ready project's status gets the engine view the reader gives, events
+    /// included; one that is not ready does not ask for it.
+    #[test]
+    fn a_ready_project_gets_the_view_and_others_do_not_ask() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let settings = backend.services_settings().unwrap();
+        let root = fs::canonicalize(home.path()).unwrap();
+        let parts = |state| ProjectParts {
+            state,
+            reason: None,
+            cause: None,
+            vm: None,
+            holders: Vec::new(),
+            idle_left: None,
+            exposure: None,
+            view: super::super::services_view::View::default(),
+            view_error: None,
+        };
+        let view = super::super::services_view::View {
+            containers: vec![json!({"name": "db"})],
+            tag_events: vec![json!({"at": 1, "kind": "changed"})],
+            ..Default::default()
+        };
+        let asked = std::cell::Cell::new(0);
+        let read = || {
+            asked.set(asked.get() + 1);
+            (view.clone(), Some("marsh: late".to_owned()))
+        };
+        let ready = backend.project_json_with(&root, &settings, parts("ready"), read);
+        assert_eq!(ready["image_tag_events"], json!(view.tag_events));
+        assert_eq!(ready["containers"], json!(view.containers));
+        assert_eq!(ready["containers_error"], "marsh: late");
+        let off = backend.project_json_with(&root, &settings, parts("off"), read);
+        assert_eq!((asked.get(), off.get("image_tag_events")), (1, None));
+    }
 
     /// The status read is kept for a second with its events, asked for once in
     /// that time, and a failure is reported and not kept.

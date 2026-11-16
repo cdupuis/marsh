@@ -703,7 +703,8 @@ In plain words:
   What marsh does instead is **detect it and report it, and never undo it**: when
   a build's stream ends, the services agent looks again at the tags another workspace
   created (and the names on pulled images such as `postgres:16`) and reports each one
-  whose image changed or went, on the services agent's standard error (the latest 64
+  whose image changed or went, in `marsh docker status` (one line) and `marsh docker status
+  --json` (`image_tag_events`) and on the services agent's standard error (the latest 64
   are kept in its memory, and lost when the Docker VM restarts). The report names the
   tag, its owner, the image it had and the one it has, and says what to run to put it
   back: if the previous image still exists, `docker tag <previous image id> <name>` in

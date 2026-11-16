@@ -206,11 +206,15 @@ fn bounded(text: &str) -> String {
     plain(text, 64)
 }
 
-/// Plain text, one line, bounded: control characters and anything but
-/// printable ASCII and ordinary letters are dropped.
+/// Plain text, one line, bounded: control characters and the characters that
+/// reorder or hide text (direction controls, zero-width and other format
+/// characters) are dropped; letters of any script stay.
 fn plain(text: &str, limit: usize) -> String {
     text.chars()
-        .filter(|c| !c.is_control() && *c != '\u{202e}')
+        .filter(|c| {
+            !marsh_contracts::terminal::is_terminal_unsafe(*c)
+                && !matches!(*c, '\u{061c}' | '\u{200c}'..='\u{200f}')
+        })
         .take(limit)
         .collect()
 }
@@ -417,6 +421,133 @@ mod tests {
             ]
         );
         assert_eq!(parse_tag_events(b"not json").len(), 0);
+    }
+
+    /// Nothing the VM says reaches the JSON or a terminal with a character that
+    /// reorders or hides text: bidi controls, zero-width and format characters,
+    /// in every string field.
+    #[test]
+    fn direction_and_format_controls_are_dropped_from_every_field() {
+        let bad = "\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}\u{200b}\u{200c}\u{200d}\u{200e}\u{200f}\u{061c}\u{feff}\u{2060}";
+        let body = json!({"events": [{
+            "at": 1, "kind": "changed",
+            "workspace": format!("w{bad}x"), "tag": format!("t{bad}:1"),
+            "detail": format!("d{bad}e"), "owner": format!("o{bad}p"),
+            "previous": format!("p{bad}q"), "current": format!("c{bad}d"),
+            "ambiguous": false}]})
+        .to_string();
+        let events = parse_tag_events(body.as_bytes());
+        assert_eq!(events.len(), 1);
+        let shown = serde_json::to_string_pretty(&events).unwrap();
+        for c in bad.chars() {
+            assert!(!shown.contains(c), "U+{:04X} survived: {shown}", c as u32);
+        }
+        assert_eq!(events[0]["workspace"], "wx");
+        assert_eq!(events[0]["previous"], "pq");
+    }
+
+    /// A real relay (the daemon's side) against a stand-in agent that answers the
+    /// docker channels like the real one: the tag events only on the status
+    /// authority (the base workspace's reserved attempt), a refusal to anyone else.
+    fn relay_with_agent() -> Relay {
+        use marsh_services::engine::Generation;
+        use marsh_services::frame::{
+            AgentFrame, CHUNK_BYTES, HostFrame, Inbound, Outbound, PROTOCOL, WINDOW_CHUNKS,
+            read_frame, write_frame,
+        };
+        let generation = || Generation {
+            boot_id: "boot".into(),
+            engine_id: "e".repeat(64),
+        };
+        let (host, far) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut reader = far.try_clone().unwrap();
+        let mut writer = far;
+        thread::spawn(move || {
+            let mut open = std::collections::HashMap::<u32, (String, Vec<u8>)>::default();
+            while let Ok(Some(frame)) = read_frame::<_, HostFrame>(&mut reader, 64 * 1024) {
+                match frame {
+                    Inbound::Control(HostFrame::Init { .. }) => {
+                        let ready = AgentFrame::Ready {
+                            protocol: PROTOCOL,
+                            generation: generation(),
+                            pid: 7,
+                            test_breaks_agent: vec![],
+                            window_chunks: WINDOW_CHUNKS,
+                            chunk_bytes: CHUNK_BYTES,
+                        };
+                        write_frame(&mut writer, &Outbound::Control(ready)).unwrap();
+                    }
+                    Inbound::Control(HostFrame::Open {
+                        channel, authority, ..
+                    }) => {
+                        let who = format!("{}/{}", authority.workspace, authority.attempt);
+                        open.insert(channel, (who, Vec::new()));
+                        let opened = AgentFrame::Opened { channel };
+                        write_frame(&mut writer, &Outbound::Control(opened)).unwrap();
+                    }
+                    Inbound::Data { channel, bytes } => {
+                        let Some((who, seen)) = open.get_mut(&channel) else {
+                            continue;
+                        };
+                        seen.extend_from_slice(&bytes);
+                        if !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                            continue;
+                        }
+                        let request = String::from_utf8_lossy(seen).into_owned();
+                        let path = request.split(' ').nth(1).unwrap_or("").to_owned();
+                        let (status, body) = match path.as_str() {
+                            "/containers/json?all=1" => ("200 OK", "[]".to_owned()),
+                            TAG_EVENTS_PATH if who == "base/status" => {
+                                ("200 OK", EVENTS.to_owned())
+                            }
+                            _ => ("403 Forbidden", String::new()),
+                        };
+                        let reply = format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        write_frame(
+                            &mut writer,
+                            &Outbound::Data {
+                                channel,
+                                bytes: reply.into_bytes(),
+                            },
+                        )
+                        .unwrap();
+                        write_frame(&mut writer, &Outbound::Control(AgentFrame::Eof { channel }))
+                            .unwrap();
+                        open.remove(&channel);
+                    }
+                    Inbound::Control(_) => {}
+                }
+            }
+        });
+        let closer = host.try_clone().unwrap();
+        Relay::start(
+            Box::new(host.try_clone().unwrap()),
+            Box::new(host),
+            Box::new(move || {
+                let _ = closer.shutdown(std::net::Shutdown::Both);
+            }),
+            marsh_services::host::RelayConfig {
+                project: "/p".into(),
+                expected: generation(),
+                limits: marsh_sbx::services_relay::Limits::default(),
+                budget: marsh_sbx::services_relay::DaemonBudget::new(64),
+                forge_tcp_port: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// The production adapter on a real relay: `read` reaches the agent with the
+    /// status authority, so the events come back (any other authority is refused
+    /// and the view would have none).
+    #[test]
+    fn the_relay_adapter_reads_the_events_with_the_status_authority() {
+        let view = read(&relay_with_agent()).unwrap();
+        assert_eq!(view.tag_events.len(), 1);
+        assert_eq!(view.tag_events[0]["tag"], "t:1");
     }
 
     /// The real request and answer parsing over a socket: the agent's answer is

@@ -487,7 +487,19 @@ has is checked.
      rebuild it); a pulled name: `docker pull <name>` fetches the registry's current
      image, not necessarily the previous one. The text says the change is not undone.
      Events are a line on the agent's standard error and an entry of
-     `Services::tag_events()` (the last 64). "Unable to check" is kept once per
+     `Services::tag_events()` (the last 64), which the daemon reads for `marsh docker
+     status --json` (`image_tag_events`, only when there are any) and shows as one line
+     in `marsh docker status` (a count, no VM text), over the same filtered endpoint its
+     status read already uses: `GET /_marsh/tag-events`, answered by the agent itself
+     (`Kind::TagEvents`, never sent to the engine) and only to the daemon's own status
+     read: the base workspace with the reserved attempt `status`, which the host refuses
+     to give to any job, shell or lane (`AttemptScope::new` rejects it;
+     `AttemptScope::status` is the daemon's). The daemon makes every string plain
+     (control, direction and format characters dropped) and bounded (at most 64
+     events, kinds `changed`, `unchecked`). This is deliberately not a new relay frame:
+     a frame or `Settings` field the peer does not know is a protocol violation on both
+     sides (every message type is a closed set); an old agent refuses the unknown route
+     (no events) and an old host never asks. "Unable to check" is kept once per
      workspace and cause, and at the cap those go first, then later reports of a tag:
      the oldest report of a tag is kept, it holds the owner's original image. Not
      persisted: an agent restart forgets them.

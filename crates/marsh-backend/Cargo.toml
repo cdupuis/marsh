@@ -35,6 +35,7 @@ marsh-provenance = { path = "../marsh-provenance", features = ["build"] }
 [dev-dependencies]
 nix = { version = "0.31", features = ["fs", "user"] }
 marsh-sbx = { path = "../marsh-sbx", features = ["test-support"] }
+marsh-services = { path = "../marsh-services" }
 
 [lints]
 workspace = true

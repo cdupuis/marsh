@@ -703,12 +703,13 @@ In plain words:
   What marsh does instead is **detect it and report it, and never undo it**: when
   a build's stream ends, the services agent looks again at the tags another workspace
   created (and the names on pulled images such as `postgres:16`) and reports each one
-  whose image changed or went, in `marsh docker status` (one line) and `marsh docker
-  status --json` (`image_tag_events`, the latest 64, kept in the agent's memory and so
-  lost when the Docker VM restarts) and on the agent's standard error. The report names
-  the tag, its owner, the image it had and the one it has, and says what to run to
-  put it back: `docker tag <previous image id> <name>` in the owner's workspace (for a
-  pulled name, `docker pull <name>`). marsh cannot tell, without reading BuildKit's
+  whose image changed or went, on the services agent's standard error (the latest 64
+  are kept in its memory, and lost when the Docker VM restarts). The report names the
+  tag, its owner, the image it had and the one it has, and says what to run to put it
+  back: if the previous image still exists, `docker tag <previous image id> <name>` in
+  the owner's workspace (otherwise rebuild it); for a pulled name, `docker pull <name>`
+  fetches the registry's current image, not necessarily the previous one. With several
+  builds at once the report names a stream that ran with the one that moved the tag. marsh cannot tell, without reading BuildKit's
   stream, whether the build moved the tag or its owner did, so it never changes a tag
   itself; when the owner had a `tag`, a pull or a build of its own meanwhile, the
   report says "this may be the owner's own change". **What stays open:** it is seen
@@ -721,7 +722,10 @@ In plain words:
   `FROM alpine` with no change) makes its tag count as a pulled name, and a later build
   of that tag in the same lane is reported. At most 256 protected tags are watched
   per stream, and a stream whose image list could not be read runs unwatched, with an
-  "unable to check" report. The BuildKit cache and history are as exposed as before. Where
+  "unable to check" report. A pulled name stops being watched once a local image holds
+  it, and a name created after a build began is not watched by that build. Each build
+  costs two image lists, and the first is read before the build starts. The BuildKit
+  cache and history are as exposed as before. Where
   it applies, the workspace that creates a tag may move it; a name stays free until
   an image has it (another workspace can create it first), and it is free again
   after `docker rmi`. Two lanes cannot both build `-t app` over the REST API; give

@@ -383,9 +383,7 @@ is ready as far as S1 can tell but whose relay is not is **`unavailable`** at th
 top level, with the relay's reason: losing the exec, the engine or the mount
 revokes readiness (A1). `test_breaks_agent` is on the project entry only when the
 agent reported break modes (test builds; a release daemon refuses an agent that
-reports any, as a violation). `image_tag_events` is there only when the agent has
-reported an image tag a BuildKit build changed (`tag_events` frame: full state, at most 64,
-display text; see `design/services-policy.md`). A `ready` that is refused during the handshake
+reports any, as a violation). A `ready` that is refused during the handshake
 (another generation, an unsupported protocol, unknown fields) quarantines the
 project too, so a hostile VM cannot make the daemon reconnect in a loop.
 

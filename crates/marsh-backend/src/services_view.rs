@@ -22,15 +22,47 @@ use std::{
 };
 
 const MAX_CONTAINERS: usize = 256;
+const MAX_TAG_EVENTS: usize = 64;
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const MAX_NAME: usize = 128;
 const DEADLINE: Duration = Duration::from_secs(3);
 /// The authority attempt of a status read: the base workspace, read only.
 const STATUS_ATTEMPT: &str = "status";
 
-/// The base workspace's containers and published ports, or why they could not
-/// be read.
-pub(crate) fn read(relay: &Relay) -> Result<(Vec<Value>, Vec<Value>), String> {
+/// What the status shows of the base workspace's engine.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct View {
+    pub containers: Vec<Value>,
+    pub ports: Vec<Value>,
+    /// Image tags a `BuildKit` build changed that it may not (display only).
+    pub tag_events: Vec<Value>,
+}
+
+/// The base workspace's containers, published ports and image tag events, or why
+/// the containers could not be read. The events are the agent's own answer on
+/// the same filtered endpoint; an agent that does not know the route refuses
+/// it, and that, like any failure to read them, is no events.
+pub(crate) fn read(relay: &Relay) -> Result<View, String> {
+    read_with(|path| get(relay, path))
+}
+
+/// [`read`] over any way of asking the base workspace's engine for a path.
+fn read_with(get: impl Fn(&str) -> Result<Vec<u8>, String>) -> Result<View, String> {
+    let (containers, ports) = parse(&get("/containers/json?all=1")?)?;
+    let tag_events = get(TAG_EVENTS_PATH)
+        .map(|body| parse_tag_events(&body))
+        .unwrap_or_default();
+    Ok(View {
+        containers,
+        ports,
+        tag_events,
+    })
+}
+
+const TAG_EVENTS_PATH: &str = "/_marsh/tag-events";
+
+/// One `GET` on a docker channel of the base workspace, read only, bounded in time.
+fn get(relay: &Relay, path: &str) -> Result<Vec<u8>, String> {
     let authority = AttemptScope::new(relay.project_path(), BASE_WORKSPACE, STATUS_ATTEMPT)
         .map_err(|error| error.to_string())?;
     let mut stream = relay
@@ -38,20 +70,27 @@ pub(crate) fn read(relay: &Relay) -> Result<(Vec<Value>, Vec<Value>), String> {
         .map_err(|error| error.to_string())?;
     let closer = stream.clone();
     let (send, receive) = mpsc::sync_channel(1);
+    let path = path.to_owned();
     thread::spawn(move || {
-        let request = "GET /containers/json?all=1 HTTP/1.1\r\nHost: docker\r\nUser-Agent: marsh-status\r\nAccept: application/json\r\nConnection: close\r\n\r\n";
-        let outcome = stream
-            .write_all(request.as_bytes())
-            .map_err(|error| error.to_string())
-            .and_then(|()| response(&mut stream));
-        let _ = send.send(outcome);
+        let _ = send.send(exchange(&mut stream, &path));
     });
     let body = match receive.recv_timeout(DEADLINE) {
         Ok(outcome) => outcome,
         Err(_) => Err("the services engine did not answer in time".to_owned()),
     };
     closer.close();
-    parse(&body?)
+    body
+}
+
+/// Send one `GET` and read the whole answer.
+fn exchange(stream: &mut (impl Read + Write), path: &str) -> Result<Vec<u8>, String> {
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: marsh-status\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| error.to_string())?;
+    response(stream)
 }
 
 /// One HTTP/1.1 response: the status, then a `Content-Length` or chunked body.
@@ -267,6 +306,39 @@ fn parse(body: &[u8]) -> Result<(Vec<Value>, Vec<Value>), String> {
     ))
 }
 
+/// The agent's tag events, as plain bounded display text: at most
+/// [`MAX_TAG_EVENTS`], and only kinds the agent sends.
+fn parse_tag_events(body: &[u8]) -> Vec<Value> {
+    let Ok(answer) = serde_json::from_slice::<Value>(body) else {
+        return Vec::new();
+    };
+    answer
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            let text = |key: &str, limit: usize| {
+                event
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(|text| plain(text, limit))
+            };
+            let kind = text("kind", 16).filter(|kind| {
+                matches!(kind.as_str(), "restored" | "not_restored" | "unchecked")
+            })?;
+            Some(json!({
+                "at": event.get("at").and_then(Value::as_u64)?,
+                "workspace": text("workspace", MAX_NAME)?,
+                "tag": text("tag", 255)?,
+                "kind": kind,
+                "detail": text("detail", 512)?,
+            }))
+        })
+        .take(MAX_TAG_EVENTS)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +368,100 @@ mod tests {
                 json!({"service": "db", "container_port": 5432, "host_port": 5432, "protocol": "tcp"})
             ]
         );
+    }
+
+    #[test]
+    fn tag_events_are_plain_bounded_and_only_the_kinds_the_agent_sends() {
+        let many: Vec<Value> = (0..100)
+            .map(|at| json!({"at": at, "workspace": "lane-b", "tag": "t:1", "kind": "restored", "detail": "x"}))
+            .collect();
+        let body = json!({"events": many}).to_string();
+        assert_eq!(parse_tag_events(body.as_bytes()).len(), 64);
+        let body = json!({"events": [
+            {"at": 1, "workspace": "w\u{1b}[31m", "tag": "t:1", "kind": "restored", "detail": "a\nb"},
+            {"at": 2, "workspace": "w", "tag": "t:1", "kind": "deleted", "detail": ""},
+            {"at": "x", "workspace": "w", "tag": "t:1", "kind": "restored", "detail": ""},
+            {"at": 3, "workspace": "w", "tag": "t:1", "kind": "unchecked"}
+        ]})
+        .to_string();
+        assert_eq!(
+            parse_tag_events(body.as_bytes()),
+            vec![
+                json!({"at": 1, "workspace": "w[31m", "tag": "t:1", "kind": "restored", "detail": "ab"})
+            ]
+        );
+        assert_eq!(parse_tag_events(b"not json").len(), 0);
+    }
+
+    /// The real request and answer parsing over a socket: the agent's answer is
+    /// read; an agent that does not know the route (it refuses with 403) or that
+    /// answers nothing readable gives no events and does not fail the status.
+    #[test]
+    fn the_events_are_read_over_a_stream_and_an_old_agent_gives_none() {
+        let serve = |reply: &'static str| {
+            let (mut client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let handle = thread::spawn(move || {
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    server.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                server.write_all(reply.as_bytes()).unwrap();
+                String::from_utf8(request).unwrap()
+            });
+            let body = exchange(&mut client, TAG_EVENTS_PATH);
+            (handle.join().unwrap(), body)
+        };
+        let json = r#"{"events":[{"at":5,"workspace":"lane-b","tag":"base-app:1","kind":"restored","detail":"d"}]}"#;
+        let (request, body) = serve(Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{json}",
+                json.len()
+            )
+            .into_boxed_str(),
+        ));
+        assert!(request.starts_with("GET /_marsh/tag-events HTTP/1.1\r\n"));
+        assert_eq!(parse_tag_events(&body.unwrap()).len(), 1);
+        let (_, refused) = serve("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        assert!(refused.is_err());
+        assert_eq!(
+            refused
+                .map(|body| parse_tag_events(&body))
+                .unwrap_or_default()
+                .len(),
+            0
+        );
+    }
+
+    /// The view asks for the containers and then the events; an agent that
+    /// refuses the events (it does not know the route) still gives the containers.
+    #[test]
+    fn the_view_has_the_events_and_survives_an_agent_that_has_none() {
+        let events =
+            br#"{"events":[{"at":5,"workspace":"b","tag":"t:1","kind":"unchecked","detail":"d"}]}"#;
+        let asked = std::cell::RefCell::new(Vec::new());
+        let new_agent = |path: &str| {
+            asked.borrow_mut().push(path.to_owned());
+            Ok(if path == TAG_EVENTS_PATH {
+                events.to_vec()
+            } else {
+                b"[]".to_vec()
+            })
+        };
+        let view = read_with(new_agent).unwrap();
+        assert_eq!(view.tag_events.len(), 1);
+        assert_eq!(*asked.borrow(), ["/containers/json?all=1", TAG_EVENTS_PATH]);
+        let old_agent = |path: &str| {
+            if path == TAG_EVENTS_PATH {
+                Err("the services engine answered HTTP/1.1 403 Forbidden".to_owned())
+            } else {
+                Ok(b"[]".to_vec())
+            }
+        };
+        let view = read_with(old_agent).unwrap();
+        assert_eq!(view.tag_events.len(), 0);
+        assert!(read_with(|_| Err("down".to_owned())).is_err());
     }
 
     #[test]

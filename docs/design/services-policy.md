@@ -496,8 +496,19 @@ has is checked.
   4. An event is a line on the agent's standard error (`marsh-services: BuildKit
      stream of workspace ...`; the workspace is the one whose stream saw it, which
      with overlapping streams need not be the one that moved the tag) and an entry
-     of `Services::tag_events()` (the last 64). The offending workspace's next REST
-     call is unaffected: no state is kept against it.
+     of `Services::tag_events()` (the last 64), which the daemon reads for
+     `marsh docker status --json` (`image_tag_events`, only when there are any) over
+     the same filtered endpoint its status read already uses: `GET
+     /_marsh/tag-events`, answered by the agent itself (`Kind::TagEvents`, never sent
+     to the engine) and only to the base workspace; the daemon makes the text plain
+     and bounded (at most 64 events, kinds `restored`, `not_restored`, `unchecked`).
+     This is deliberately not a new relay frame: a frame or `Settings` field the
+     peer does not know is a protocol violation on both sides (every message type is
+     a closed set), so any announcement would break one of the old-host/new-agent and
+     new-host/old-agent pairs; an old agent refuses the unknown route (the status then
+     has no events) and an old host never asks. Not persisted: an agent restart
+     forgets them. The offending workspace's next REST call is unaffected: no state is
+     kept against it.
   Not done, and said so in `docs/docker.md`: **the overwrite is detected after the
   stream, not prevented**: while the build runs, and from its export until its stream
   ends, the other workspace's tag points at the lane's image (a `docker run` of it

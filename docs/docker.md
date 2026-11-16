@@ -207,7 +207,9 @@ it has none yet): its folder, its state, the VM's name, and the reason in
 parentheses when there is one. The state is `off`, `stopped`, `starting`,
 `ready`, or `unavailable`. Plain `status` does not list containers, ports, or
 the Internet setting. For those, use `--json`: each project has `containers`,
-`ports`, and `internet` (with `on`, `governed`, and `effective`).
+`ports`, and `internet` (with `on`, `governed`, and `effective`). When a build
+changed an image tag that another workspace owns, the project also has
+`image_tag_events` (see [Limits and gaps](#limits-and-gaps)).
 
 <!-- services-example id=services-status-json fixture=stack-a run=host after=services-start stdout="\"schema\":\"marsh.services/v1\"" stdout="\"governed\":false" -->
 ```sh

@@ -770,3 +770,27 @@ fn a_pull_during_another_stream_makes_the_recorded_image_stale() {
     );
     w.end(&cc, "lane-c");
 }
+
+/// The base workspace's status read gets the agent's own answer on the filtered
+/// endpoint: the events, in the shape the daemon shows. Another workspace is
+/// refused, and the engine is never asked.
+#[test]
+fn the_base_workspace_reads_the_tag_events_and_no_other_does() {
+    let w = World::new("bk-route");
+    let (base, b) = (lane(&w.h, "base"), lane(&w.h, B));
+    let (status, body) = call(&base, "GET", "/_marsh/tag-events", None);
+    assert_eq!((status, body.as_str()), (200, r#"{"events":[]}"#));
+    let c = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.end(&c, B);
+    let (status, body) = call(&base, "GET", "/_marsh/tag-events", None);
+    assert_eq!(status, 200);
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let events = answer["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["tag"], "base-app:1");
+    assert_eq!(events[0]["workspace"], B);
+    assert_eq!(events[0]["kind"], "restored");
+    assert_eq!(call(&b, "GET", "/_marsh/tag-events", None).0, 403);
+    assert_eq!(w.h.engine.saw("GET", "/_marsh"), 0);
+}

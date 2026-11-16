@@ -69,6 +69,8 @@ pub enum ReqBody {
 #[derive(Debug, Clone)]
 pub enum Post {
     None,
+    /// The agent answers itself: `GET /_marsh/tag-events`.
+    TagEvents,
     ContainerCreate {
         name: Option<String>,
         /// Pins this create made.
@@ -654,6 +656,16 @@ pub fn admit(
         Kind::Ping => {
             q.only(&[])?;
             a.path = mk_path(m, &["_ping"]);
+        }
+        Kind::TagEvents => {
+            q.only(&[])?;
+            // The daemon's status read is the base workspace's.
+            if env.authority().workspace != crate::host::BASE_WORKSPACE {
+                return Err(Refusal::forbid(
+                    "image tag events are for the base workspace's status",
+                ));
+            }
+            a.post = Post::TagEvents;
         }
         Kind::Version | Kind::Info => {
             q.only(&[])?;

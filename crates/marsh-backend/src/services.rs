@@ -185,7 +185,7 @@ type ForwardKey = (PathBuf, String);
 /// The forwards one owner made: port to (`job` or `shell`, what happened).
 type Forwards = BTreeMap<u16, (String, marsh_worker::PortState)>;
 /// When a project's containers and ports were last read, and what they were.
-type ViewCache = (Instant, Vec<Value>, Vec<Value>);
+type ViewCache = (Instant, super::services_view::View);
 
 #[derive(Default)]
 pub(crate) struct Services {
@@ -1079,10 +1079,10 @@ impl StockDaemonBackend {
             );
         // Display only (E2, N3's shape): the base workspace's containers and
         // published ports, read through the same filter a job's requests use.
-        let (containers, ports, view_error) = if state == "ready" {
+        let (view, view_error) = if state == "ready" {
             self.services_containers(root)
         } else {
-            (Vec::new(), Vec::new(), None)
+            (super::services_view::View::default(), None)
         };
         let folder_missing = matches!(
             fs::symlink_metadata(root),
@@ -1102,8 +1102,8 @@ impl StockDaemonBackend {
                 .map(generation_json),
             "holders": holders,
             "idle_seconds_remaining": idle_left.map(|left| left.as_secs()),
-            "containers": containers,
-            "ports": ports,
+            "containers": view.containers,
+            "ports": view.ports,
             "internet": self.services_internet_json(root, vm.as_ref()),
             "credential_exposure": exposure,
             "relay": self.relay_json(root),
@@ -1120,9 +1120,7 @@ impl StockDaemonBackend {
         if state == "off" {
             document["vm"] = Value::Null;
         }
-        if let Some(reason) = view_error {
-            document["containers_error"] = json!(reason);
-        }
+        add_view_notes(&mut document, &view, view_error);
         // What the job and shell forwards did (collisions, failures), by owner.
         let forwards = self.forwards_json(root);
         if !forwards.is_empty() {
@@ -1134,13 +1132,8 @@ impl StockDaemonBackend {
             .relays
             .as_ref()
             .map(|relays| relays.view(root));
-        if let Some(relay) = &relay_view {
-            if !relay.agent_breaks.is_empty() {
-                document["test_breaks_agent"] = json!(relay.agent_breaks);
-            }
-            if let Some(events) = image_tag_events(relay) {
-                document["image_tag_events"] = events;
-            }
+        if let Some(relay) = relay_view.filter(|relay| !relay.agent_breaks.is_empty()) {
+            document["test_breaks_agent"] = json!(relay.agent_breaks);
         }
         document
     }
@@ -1161,32 +1154,30 @@ impl StockDaemonBackend {
 
     /// The base workspace's containers and ports from the live relay, cached
     /// for a second so a polling client does not open a channel per call.
-    fn services_containers(&self, root: &Path) -> (Vec<Value>, Vec<Value>, Option<String>) {
+    fn services_containers(&self, root: &Path) -> (super::services_view::View, Option<String>) {
+        let none = super::services_view::View::default;
         let Some(relays) = &self.services.relays else {
-            return (Vec::new(), Vec::new(), None);
+            return (none(), None);
         };
         let Ok(entry) = relays.get(root) else {
-            return (Vec::new(), Vec::new(), None);
+            return (none(), None);
         };
         let mut cache = self
             .services
             .view_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((at, containers, ports)) = cache.get(root)
+        if let Some((at, view)) = cache.get(root)
             && at.elapsed() < Duration::from_secs(1)
         {
-            return (containers.clone(), ports.clone(), None);
+            return (view.clone(), None);
         }
         match super::services_view::read(entry.relay()) {
-            Ok((containers, ports)) => {
-                cache.insert(
-                    root.to_owned(),
-                    (Instant::now(), containers.clone(), ports.clone()),
-                );
-                (containers, ports, None)
+            Ok(view) => {
+                cache.insert(root.to_owned(), (Instant::now(), view.clone()));
+                (view, None)
             }
-            Err(reason) => (Vec::new(), Vec::new(), Some(format!("marsh: {reason}"))),
+            Err(reason) => (none(), Some(format!("marsh: {reason}"))),
         }
     }
 
@@ -1726,10 +1717,16 @@ enum Unavailable {
     LostContact,
 }
 
-/// The image tags a `BuildKit` build changed that it may not (and what the agent
-/// did about each), only when there are any.
-fn image_tag_events(view: &marsh_sbx::services_relay::RelayView) -> Option<Value> {
-    (!view.tag_events.is_empty()).then(|| json!(view.tag_events))
+/// What the engine view adds to a project's status besides `containers` and
+/// `ports`: why they could not be read, and the image tags a `BuildKit` build
+/// changed that it may not (what the agent did about each), only when there are any.
+fn add_view_notes(document: &mut Value, view: &super::services_view::View, error: Option<String>) {
+    if let Some(reason) = error {
+        document["containers_error"] = json!(reason);
+    }
+    if !view.tag_events.is_empty() {
+        document["image_tag_events"] = json!(view.tag_events);
+    }
 }
 
 impl Unavailable {
@@ -1839,30 +1836,15 @@ mod tests {
     /// `marsh docker status --json` carries the agent's image tag events, and
     /// nothing when there are none.
     #[test]
-    fn status_reports_image_tag_events_only_when_there_are_some() {
-        let mut view = marsh_sbx::services_relay::RelayView {
-            state: "ready",
-            reason: None,
-            generation: None,
-            channels: 0,
-            agent_pid: None,
-            agent_breaks: Vec::new(),
-            tag_events: Vec::new(),
-        };
-        assert_eq!(image_tag_events(&view), None);
-        view.tag_events
-            .push(marsh_sbx::services_relay::TagEventInfo {
-                at: 9,
-                workspace: "lane-b".into(),
-                tag: "base-app:1".into(),
-                kind: "restored".into(),
-                detail: "put back".into(),
-            });
-        assert_eq!(
-            image_tag_events(&view),
-            Some(json!([{"at": 9, "workspace": "lane-b", "tag": "base-app:1",
-                         "kind": "restored", "detail": "put back"}]))
-        );
+    fn the_status_carries_image_tag_events_only_when_there_are_some() {
+        let mut view = super::super::services_view::View::default();
+        let mut document = json!({"containers": []});
+        add_view_notes(&mut document, &view, None);
+        assert!(document.get("image_tag_events").is_none());
+        view.tag_events = vec![json!({"at": 9, "kind": "restored"})];
+        add_view_notes(&mut document, &view, Some("marsh: why".into()));
+        assert_eq!(document["image_tag_events"], json!(view.tag_events));
+        assert_eq!(document["containers_error"], "marsh: why");
     }
 
     /// The daemon-stop teardown defers a VM whose worker is not gone, and only

@@ -98,6 +98,11 @@ pub mod breaks {
     }
 }
 
+/// What to tell the user about a services VM marsh refuses to reuse. Mirrors
+/// `marsh docker rm` in `docs/man/marsh.1.md`: it deletes the VM's Docker
+/// data, so say so; the project folder on the Mac is not touched.
+const DOCKER_RM_REMEDY: &str = "; run `marsh docker rm` in the project folder to remove it (this deletes the project's Docker containers, volumes, images and saved Docker data; your project files are kept)";
+const DOCKER_RM_UNREADABLE_REMEDY: &str = "; if this keeps happening, run `marsh docker rm` in the project folder to remove it (this deletes the project's Docker containers, volumes, images and saved Docker data; your project files are kept)";
 /// The per-sandbox Docker disk size variable stock SBX reads on `create`.
 const DISK_SIZE_VARIABLE: &str = "DOCKER_SANDBOXES_DOCKER_SIZE";
 /// A fresh VM's Docker filesystem must be at least this share of the size
@@ -480,7 +485,7 @@ impl StockSbx {
             let hint = if stderr.contains("cannot restore mount") {
                 "; the project folder is gone from the Mac: restore it, or remove the VM with `marsh docker rm --project FOLDER` (`marsh docker status` lists the folder)"
             } else {
-                ""
+                DOCKER_RM_UNREADABLE_REMEDY
             };
             return Err(SbxError::UnreadableVm {
                 vm: vm.to_owned(),
@@ -495,14 +500,14 @@ impl StockSbx {
         if actual.schema != "marsh.worker/v1" || actual.basis != KIT_VM_BASIS {
             return Err(SbxError::IncompatibleVm {
                 vm: vm.to_owned(),
-                detail: "its marker is not a marsh marker".into(),
+                detail: format!("its marker is not a marsh marker{DOCKER_RM_REMEDY}"),
             });
         }
         if actual.profile != profile {
             return Err(SbxError::IncompatibleVm {
                 vm: vm.to_owned(),
                 detail: format!(
-                    "its marker profile is {:?}, expected {profile:?}",
+                    "its marker profile is {:?}, expected {profile:?}{DOCKER_RM_REMEDY}",
                     actual.profile
                 ),
             });

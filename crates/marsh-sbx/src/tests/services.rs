@@ -249,3 +249,52 @@ fn reset_with_an_unknown_project_key_touches_nothing() {
     assert_eq!(model.count("rm"), 0);
     assert!(model.vm(&name).is_some());
 }
+
+const DOCKER_RM_REMEDY: &str = "run `marsh docker rm` in the project folder to remove it (this deletes the project's Docker containers, volumes, images and saved Docker data; your project files are kept)";
+
+/// A services VM with a foreign marker or one stock SBX cannot exec in is
+/// refused, and the refusal names `marsh docker rm` and what it deletes (never
+/// `marsh reset`, which skips Docker VMs).
+#[test]
+fn a_refused_services_vm_says_how_to_recover() {
+    let shell = ShellFixture::new();
+    let model = StockModel::new();
+    let adapter = model.adapter();
+    let (project, name) = owned_services_vm(&model, &adapter, &shell, "project");
+    let spec = spec(&shell, &project, "2G");
+    for (marker, expected) in [
+        (
+            &br#"{"schema":"other/v1","profile":"services:x","basis":"x"}"#[..],
+            "cannot be reused: its marker is not a marsh marker; ",
+        ),
+        (
+            &br#"{"schema":"marsh.worker/v1","profile":"services:other","basis":"native-stock-sbx-kit"}"#[..],
+            "cannot be reused: its marker profile is \"services:other\"",
+        ),
+    ] {
+        model.with_vm(&name, |vm| {
+            vm.files
+                .insert("/var/lib/marsh/worker.json".into(), marker.to_vec())
+        });
+        let error = adapter.ensure_services_vm(&spec).unwrap_err();
+        let text = error.to_string();
+        assert!(matches!(error, SbxError::IncompatibleVm { .. }), "{text}");
+        assert!(text.contains(expected), "{text}");
+        assert!(text.contains(DOCKER_RM_REMEDY), "{text}");
+        assert!(!text.contains("marsh reset"), "{text}");
+    }
+
+    let down = ExecDown::adapter(&model);
+    let (project, _) = owned_services_vm(&model, &down, &shell, "other");
+    let error = down
+        .ensure_services_vm(&self::spec(&shell, &project, "2G"))
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(matches!(error, SbxError::UnreadableVm { .. }), "{text}");
+    assert!(
+        text.contains("sandbox failed to start: boom; if this keeps happening, "),
+        "{text}"
+    );
+    assert!(text.contains(DOCKER_RM_REMEDY), "{text}");
+    assert_eq!(model.count("rm"), 0);
+}

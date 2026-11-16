@@ -27,6 +27,44 @@ mod vm_ownership_rules;
 
 use stock_model::{Fault, StockModel, WAIT_LIMIT, failure};
 
+/// The stock model with every guest `exec` failing before the guest command
+/// runs, as when stock SBX cannot start the VM.
+struct ExecDown(Arc<StockModel>);
+
+impl ExecDown {
+    fn adapter(model: &Arc<StockModel>) -> StockSbx {
+        StockSbx::new("sbx", Arc::new(Self(Arc::clone(model))))
+    }
+}
+
+impl CommandRunner for ExecDown {
+    fn run(&self, invocation: &Invocation) -> io::Result<CommandOutput> {
+        self.0.run(invocation)
+    }
+
+    fn run_bounded(&self, invocation: &Invocation, bound: Duration) -> io::Result<CommandOutput> {
+        if stock_model::Call::new(invocation).verb() == "exec" {
+            return Ok(failure("Error: sandbox failed to start: boom"));
+        }
+        self.0.run_bounded(invocation, bound)
+    }
+
+    fn spawn_attached(&self, invocation: &Invocation) -> io::Result<Attachment> {
+        self.0.spawn_attached(invocation)
+    }
+}
+
+/// The user-facing text of a refused owned shell or Kit VM names `marsh reset`
+/// and what it keeps (`docs/man/marsh.1.md`, `reset`).
+fn assert_names_reset(error: &SbxError, prefix: &str) {
+    let text = error.to_string();
+    assert!(text.contains(prefix), "{text}");
+    assert!(
+        text.contains("run `marsh reset` to remove it (your project files, the guest home and results are kept)"),
+        "{text}"
+    );
+}
+
 /// Host temp root with symlinked ancestry resolved (macOS `/var` ->
 /// `/private/var`): grant sources reject symlinks anywhere in their chain.
 fn canonical_temp_dir() -> PathBuf {

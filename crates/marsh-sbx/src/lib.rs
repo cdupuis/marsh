@@ -119,6 +119,11 @@ const KIT_RESOLUTION_TIMEOUT: Duration = Duration::from_mins(2);
 const KEEPALIVE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCAL_SCRATCH_STALE_AFTER: Duration = Duration::from_hours(1);
 const NO_MARKER_DETAIL: &str = "it has no marsh worker marker";
+/// What to tell the user about an owned shell or Kit VM marsh refuses to
+/// reuse. Mirrors `marsh reset` in `docs/man/marsh.1.md`: it removes the VMs,
+/// not the guest home, the results or the project folders on the Mac.
+const RESET_REMEDY: &str =
+    "run `marsh reset` to remove it (your project files, the guest home and results are kept)";
 const PREPARATION_SBX_TIMEOUT: Duration = Duration::from_mins(5);
 /// `sbx create` pulls the VM's image: on a slow link that alone takes many
 /// minutes, and stock SBX reports success or failure on its own. This only
@@ -7004,7 +7009,7 @@ impl StockSbx {
             return Err(SbxError::IncompatibleVm {
                 vm: vm.to_owned(),
                 detail: format!(
-                    "its worker marker has schema {:?} and basis {:?}",
+                    "its worker marker has schema {:?} and basis {:?}; {RESET_REMEDY}",
                     actual.schema, actual.basis
                 ),
             });
@@ -7013,7 +7018,7 @@ impl StockSbx {
             return Err(SbxError::IncompatibleVm {
                 vm: vm.to_owned(),
                 detail: format!(
-                    "its worker marker profile is {:?}, expected {profile:?}",
+                    "its worker marker profile is {:?}, expected {profile:?}; {RESET_REMEDY}",
                     actual.profile
                 ),
             });
@@ -7074,7 +7079,9 @@ impl StockSbx {
             // landed after the daemon that submitted it ended (or before its
             // marker was written). marsh made it and may retire it; the
             // caller creates it afresh.
-            Err(SbxError::IncompatibleVm { detail, .. }) if detail == NO_MARKER_DETAIL => {
+            Err(SbxError::IncompatibleVm { detail, .. })
+                if detail.starts_with(NO_MARKER_DETAIL) =>
+            {
                 return Ok(KitMarkerState::Stale);
             }
             Err(error) => return Err(error),
@@ -7156,7 +7163,7 @@ impl StockSbx {
                 return serde_json::from_slice(&output.stdout).map_err(|_| {
                     SbxError::IncompatibleVm {
                         vm: vm.to_owned(),
-                        detail: "its worker marker is not a marsh marker".into(),
+                        detail: format!("its worker marker is not a marsh marker; {RESET_REMEDY}"),
                     }
                 });
             }
@@ -7177,12 +7184,15 @@ impl StockSbx {
                     return Err(if stderr.starts_with("cat: ") {
                         SbxError::IncompatibleVm {
                             vm: vm.to_owned(),
-                            detail: NO_MARKER_DETAIL.into(),
+                            detail: format!("{NO_MARKER_DETAIL}; {RESET_REMEDY}"),
                         }
                     } else {
                         SbxError::UnreadableVm {
                             vm: vm.to_owned(),
-                            detail: stderr.trim().to_owned(),
+                            detail: format!(
+                                "{}; if this keeps happening, {RESET_REMEDY}",
+                                stderr.trim()
+                            ),
                         }
                     });
                 }

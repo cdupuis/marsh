@@ -291,6 +291,32 @@ Do not delete the control directory or kill the daemon to get past it. The
 daemon's list of its VMs is in that directory, and without it marsh cannot
 prove which VMs are its own.
 
+### Every command fails on a VM marsh made but cannot reuse
+
+An interrupted start can leave a half-built shell or Kit VM, for example when
+the shell's first start was killed midway. Every later command then fails with:
+
+```text
+marsh: daemon rejected the request: invalid daemon state: owned sandbox marsh-s-9532sd4g cannot be reused: it has no marsh worker marker; run `marsh reset` to remove it (your project files, the guest home and results are kept)
+```
+
+or, when stock SBX could not start or run a command in the VM,
+`owned sandbox NAME could not be read (stock SBX could not start or exec in it): …`.
+marsh refuses on purpose. A VM it made but never finished setting up (or whose
+marker is not the one it expects) may hold your state, so marsh neither adopts
+nor replaces it.
+
+Run `marsh reset` from your Mac. It removes this home's Kit and shell VMs by
+their recorded ids (your project folders, the guest home and results are kept),
+and the next command creates a fresh VM. If the message instead says
+`could not be read`, check that `sbx ls` works first; run `marsh reset` if it
+keeps happening.
+
+A [Docker (services) VM](design/services.md) that is refused this way names
+`marsh docker rm` instead, because `marsh reset` skips Docker VMs. Run it in the
+project folder. It deletes that project's Docker containers, volumes, images and
+saved Docker data (not the project files), and asks first.
+
 ## A split was kept
 
 `join --keep` retains results deliberately. A nonzero join status, interrupted

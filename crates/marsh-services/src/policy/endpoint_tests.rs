@@ -2371,10 +2371,16 @@ fn a_late_bind_does_not_bring_back_a_forgotten_root() {
         c.write_all(bind_create(&root).as_bytes()).unwrap();
         let _ = c.read_to_end(&mut Vec::new());
         drop(c);
-        assert!(wait_for(Duration::from_secs(5), || h
-            .svc
-            .open_connections()
-            == 0));
+        // The connection's teardown drops its count first and releases the
+        // roots after: wait for the roots themselves, not for the count.
+        assert!(
+            wait_for(Duration::from_secs(30), || {
+                let (roots, _, _, workspaces) = h.svc.tracked();
+                h.svc.open_connections() == 0 && roots == 0 && workspaces == 0
+            }),
+            "workspace {index}: forgotten roots came back: {:?}",
+            h.svc.tracked()
+        );
     }
     assert_eq!(h.svc.tracked().0, 0, "forgotten roots came back");
     assert_eq!(h.svc.tracked().3, 0, "ended workspaces kept a count");

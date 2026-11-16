@@ -7,6 +7,7 @@ fn spec(shell: &ShellFixture, project: &Path, disk_size: &str) -> ServicesVmSpec
         image: shell.spec.image.clone(),
         shell_binary: shell.spec.shell_binary.clone(),
         disk_size: disk_size.into(),
+        pool_bytes: None,
     }
 }
 
@@ -305,4 +306,113 @@ fn a_refused_services_vm_says_how_to_recover() {
         at += found + part.len();
     }
     assert_eq!(model.count("rm"), 0);
+}
+
+/// What a refusal says: the sizes, and what to do next. It never tells the
+/// user to remove a VM, since none has been created.
+fn assert_pool_refusal(error: &SbxError, size: &str) {
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("the Docker disk is set to {size}"))
+            && text.contains("24576 MiB for its pool plus a 512 MiB reserve (25088 MiB in all)")
+            && text.contains("marsh config services-disk-size"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("marsh docker rm") && !text.contains("remove"),
+        "{text}"
+    );
+}
+
+fn pooled(spec: ServicesVmSpec, pool: Option<u64>) -> ServicesVmSpec {
+    ServicesVmSpec {
+        pool_bytes: pool,
+        ..spec
+    }
+}
+
+const POOL: u64 = 24 << 30;
+
+/// A new VM whose configured disk cannot hold the engine's pool and reserve is
+/// refused before a name is recorded or any stock call is made; a disk that
+/// can hold it, or no pool to hold, creates.
+#[test]
+fn a_disk_too_small_for_the_pool_is_refused_before_a_vm_is_created() {
+    let model = StockModel::new();
+    let adapter = model.adapter();
+    let shell = ShellFixture::new();
+    let project = directory(shell.dir.path(), "project");
+
+    for size in ["5g", "24g"] {
+        let refused = adapter
+            .ensure_services_vm(&pooled(spec(&shell, &project, size), Some(POOL)))
+            .unwrap_err();
+        assert_pool_refusal(&refused, size);
+        assert!(model.calls().is_empty(), "{size}: {:?}", model.calls());
+        assert_eq!(adapter.recorded_services_vm(&project), None);
+    }
+
+    // 25g holds the pool and the reserve; a 5g disk holds a small test pool.
+    for (size, pool) in [("25g", Some(POOL)), ("5g", Some(4_u64 << 30)), ("5g", None)] {
+        let model = StockModel::new();
+        let adapter = model.adapter();
+        let _ = adapter.ensure_services_vm(&pooled(spec(&shell, &project, size), pool));
+        assert_eq!(model.count("create"), 1, "{size} {pool:?}");
+    }
+}
+
+/// A VM that already exists keeps the disk it was made with: a smaller disk in
+/// the setting now never refuses it (or strands it).
+#[test]
+fn an_existing_vm_is_not_refused_for_a_smaller_disk_setting() {
+    let model = StockModel::new();
+    let adapter = model.adapter();
+    let shell = ShellFixture::new();
+    let (project, _name) = owned_services_vm(&model, &adapter, &shell, "project");
+    let outcome = adapter.ensure_services_vm(&pooled(spec(&shell, &project, "5g"), Some(POOL)));
+    // The model stops it later (it has no engine); what matters is that it got
+    // past the pool check and made nothing.
+    if let Err(error) = outcome {
+        assert!(
+            !error.to_string().contains("the Docker disk is set to"),
+            "{error}"
+        );
+    }
+    assert_eq!(model.count("create"), 0);
+}
+
+/// A recorded VM that is gone from stock is created again, so the disk must
+/// hold the pool then too: refused, with nothing created.
+#[test]
+fn a_vm_created_again_after_it_vanished_is_checked_against_the_pool() {
+    let model = StockModel::new();
+    let adapter = model.adapter();
+    let shell = ShellFixture::new();
+    let (project, name) = owned_services_vm(&model, &adapter, &shell, "project");
+    model.remove_vm(&name);
+    let refused = adapter
+        .ensure_services_vm(&pooled(spec(&shell, &project, "5g"), Some(POOL)))
+        .unwrap_err();
+    assert_pool_refusal(&refused, "5g");
+    assert_eq!(model.count("create"), 0);
+}
+
+/// When another VM holds the recorded name, this project would take a new
+/// name and a new VM: refused for the same reason, and the other VM and our
+/// record are left alone.
+#[test]
+fn a_vm_created_again_beside_a_foreign_one_is_checked_against_the_pool() {
+    let model = StockModel::new();
+    let adapter = model.adapter();
+    let shell = ShellFixture::new();
+    let (project, name) = owned_services_vm(&model, &adapter, &shell, "project");
+    // A VM that is not ours now holds the recorded name.
+    model.with_vm(&name, |vm| vm.id = IMPOSTOR.into());
+    let refused = adapter
+        .ensure_services_vm(&pooled(spec(&shell, &project, "5g"), Some(POOL)))
+        .unwrap_err();
+    assert_pool_refusal(&refused, "5g");
+    assert_eq!(model.count("create"), 0);
+    assert_eq!(model.vm(&name).unwrap().id, IMPOSTOR);
+    assert_eq!(adapter.recorded_services_vm(&project), Some(name));
 }

@@ -899,7 +899,10 @@ fn services_command(
         Command::Release { holder, json } => (Request::Release { root, holder }, json),
         Command::Internet { on, json } => (Request::Internet { root, on }, json),
         Command::Remove { yes, json, project } => {
-            if !yes && !confirm_services_removal(&root, project.is_some())? {
+            let named = project.is_some();
+            if !removal_confirmed(client, session, &root, named, yes, || {
+                confirm_services_removal(&root, named)
+            })? {
                 writeln!(stdout, "not removed")?;
                 return Ok(ProductOutcome::Complete(1));
             }
@@ -923,6 +926,53 @@ fn write_project_list(stderr: &mut impl Write, projects: &[String]) -> std::io::
         writeln!(stderr, "  {}", display_safe(project))?;
     }
     Ok(())
+}
+
+/// Whether `rm` may go ahead: `--yes` says so, and so does a `--project` with
+/// no Docker VM to destroy; otherwise `ask` decides.
+fn removal_confirmed(
+    client: &dyn DaemonClient,
+    session: &SessionConfig,
+    root: &std::path::Path,
+    named: bool,
+    yes: bool,
+    ask: impl FnOnce() -> Result<bool, ProductError>,
+) -> Result<bool, ProductError> {
+    if yes || !removal_needs_confirmation(client, session, root, named) {
+        return Ok(true);
+    }
+    ask()
+}
+
+/// `rm` asks before destroying a Docker VM, so it does not ask about a project
+/// named with `--project` that has none.
+fn removal_needs_confirmation(
+    client: &dyn DaemonClient,
+    session: &SessionConfig,
+    root: &std::path::Path,
+    named: bool,
+) -> bool {
+    !named || project_has_vm(client, session, root)
+}
+
+/// Whether the daemon lists a Docker VM for `project`. When that cannot be
+/// found out, say yes: the caller then asks.
+fn project_has_vm(
+    client: &dyn DaemonClient,
+    session: &SessionConfig,
+    project: &std::path::Path,
+) -> bool {
+    let Ok(here) = std::fs::canonicalize(&session.launch_directory) else {
+        return true;
+    };
+    let Ok(status) = client.services(&marsh_daemon::ServicesRequest::Status { root: here }) else {
+        return true;
+    };
+    status["projects"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|row| row["vm"].is_string() && row["root"].as_str() == project.to_str())
 }
 
 /// Ask on the terminal; with no terminal the caller must pass `--yes`.
@@ -1034,15 +1084,20 @@ fn write_services_lines(
                 "the Docker VM was not running"
             }
         )?,
-        Request::Remove { .. } => writeln!(
-            stdout,
-            "{}",
-            if document["removed"].as_bool().unwrap_or(false) {
-                "removed the Docker VM and its disk"
-            } else {
-                "there was no Docker VM to remove"
+        Request::Remove { root } => {
+            writeln!(
+                stdout,
+                "{}",
+                if document["removed"].as_bool().unwrap_or(false) {
+                    "removed the Docker VM and its disk"
+                } else {
+                    "there was no Docker VM to remove"
+                }
+            )?;
+            if document["forgot_setting"].as_bool().unwrap_or(false) {
+                writeln!(stdout, "forgot the Docker setting for {}", root.display())?;
             }
-        )?,
+        }
     }
     Ok(())
 }
@@ -1888,6 +1943,117 @@ mod tests {
         assert_eq!(out.matches("the folder is gone").count(), 1, "{out}");
     }
 
+    /// `rm` says what it did: a VM removed, none to remove, and a setting
+    /// forgotten.
+    #[test]
+    fn rm_says_whether_a_vm_was_removed_and_a_setting_forgotten() {
+        let request = marsh_daemon::ServicesRequest::Remove {
+            root: "/gone/project".into(),
+        };
+        let say = |document: serde_json::Value| {
+            let mut out = Vec::new();
+            write_services(&mut out, &request, &document).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(
+            say(json!({"removed": true, "forgot_setting": false})),
+            "removed the Docker VM and its disk\n"
+        );
+        assert_eq!(
+            say(json!({"removed": false, "forgot_setting": true})),
+            "there was no Docker VM to remove\nforgot the Docker setting for /gone/project\n"
+        );
+        assert_eq!(
+            say(json!({"removed": false, "forgot_setting": false})),
+            "there was no Docker VM to remove\n"
+        );
+    }
+
+    /// `rm --project` asks for confirmation only for a project the daemon
+    /// lists a VM for; when that cannot be told, it asks.
+    #[test]
+    fn rm_project_asks_only_for_a_project_with_a_vm() {
+        let here = tempfile::tempdir().unwrap();
+        let real = SessionConfig {
+            launch_directory: here.path().to_owned(),
+            ..session()
+        };
+        let client = FakeClient {
+            services: Some(json!({"projects": [
+                {"vm": "marsh-svc-a", "root": "/gone/with-vm"},
+                {"vm": null, "root": "/gone/no-vm"},
+            ]})),
+            ..FakeClient::default()
+        };
+        let asks = |session: &SessionConfig, project: &str, named: bool| {
+            removal_needs_confirmation(&client, session, std::path::Path::new(project), named)
+        };
+        assert!(asks(&real, "/gone/with-vm", true));
+        // No VM listed, or the project is not listed at all: nothing to confirm.
+        assert!(!asks(&real, "/gone/no-vm", true));
+        assert!(!asks(&real, "/gone/unlisted", true));
+        // Without --project the folder's own VM is always asked about.
+        assert!(asks(&real, "/gone/unlisted", false));
+        // The launch folder cannot be read: ask.
+        assert!(asks(&session(), "/gone/no-vm", true));
+    }
+
+    /// The question itself: `rm` asks (once) only without `--yes` and for a
+    /// project with a VM, or when no `--project` names another folder.
+    #[test]
+    fn rm_asks_the_question_only_when_it_has_to() {
+        let here = tempfile::tempdir().unwrap();
+        let real = SessionConfig {
+            launch_directory: here.path().to_owned(),
+            ..session()
+        };
+        let client = FakeClient {
+            services: Some(json!({"projects": [
+                {"vm": "marsh-svc-a", "root": "/gone/with-vm"},
+                {"vm": null, "root": "/gone/no-vm"},
+            ]})),
+            ..FakeClient::default()
+        };
+        let run = |project: &str, named: bool, yes: bool, answer: bool| {
+            let asked = std::cell::Cell::new(0);
+            let confirmed = removal_confirmed(
+                &client,
+                &real,
+                std::path::Path::new(project),
+                named,
+                yes,
+                || {
+                    asked.set(asked.get() + 1);
+                    Ok(answer)
+                },
+            )
+            .unwrap();
+            (confirmed, asked.get())
+        };
+        assert_eq!(run("/gone/with-vm", true, false, true), (true, 1));
+        assert_eq!(run("/gone/with-vm", true, false, false), (false, 1));
+        assert_eq!(run("/gone/with-vm", true, true, false), (true, 0));
+        assert_eq!(run("/gone/no-vm", true, false, false), (true, 0));
+        assert_eq!(run("/gone/no-vm", false, false, false), (false, 1));
+
+        // Through the command itself: no `--yes` and no terminal, and a
+        // project with no VM goes ahead without a question (a question would
+        // be an error here, with nobody to answer).
+        let mut out = Vec::new();
+        let outcome = services_command(
+            &client,
+            crate::cli::ServicesCommand::Remove {
+                yes: false,
+                json: true,
+                project: Some("/gone/no-vm".into()),
+            },
+            &real,
+            &mut out,
+        )
+        .unwrap();
+        assert!(matches!(outcome, ProductOutcome::Complete(0)));
+    }
+
     #[test]
     fn the_results_list_prints_no_terminal_control_from_the_workload() {
         let evil = "x\u{1b}[2Jy";
@@ -2271,6 +2437,8 @@ mod tests {
     struct FakeClient {
         /// The `marsh status --json` document, when a test needs more than the schema.
         status: Option<serde_json::Value>,
+        /// What `services` answers, when a test needs more than the fixed document.
+        services: Option<serde_json::Value>,
         fail_prepare: bool,
         detached: AtomicBool,
         prepared: AtomicBool,
@@ -2354,6 +2522,9 @@ mod tests {
         }
 
         fn services(&self, _: &marsh_daemon::ServicesRequest) -> Result<Value, ClientError> {
+            if let Some(document) = &self.services {
+                return Ok(document.clone());
+            }
             Ok(json!({"projects": [{"vm": "vm", "root": EVIL}]}))
         }
 

@@ -128,6 +128,10 @@ struct Gate {
     changed: Condvar,
 }
 
+/// Answers by which the engine refuses to untag a name, after which a lane's
+/// cleanup gives up on it (see `Services::untag_scope`).
+pub const MAX_UNTAG_REFUSALS: u32 = 12;
+
 pub struct Services {
     pub cfg: Config,
     pub ledger: Ledger,
@@ -1068,29 +1072,57 @@ impl Services {
     /// rmi <name>` makes: it untags only that name (an image another tag
     /// references stays), refuses a tag another workspace now owns or is
     /// making, and holds the name against other workspaces' claims while it
-    /// runs. A record goes only after the engine answered 2xx or 404; any other
-    /// answer, or none, keeps it, so the name stays the scope's (and refused to
-    /// everyone else while its image is there) until a repeated drop untags it.
-    /// Returns the tags that are still recorded to `scope` and not confirmed.
+    /// runs.
+    ///
+    /// A record is trusted to mean "this name is still what the scope tagged"
+    /// because every way the name can stop being so retires it first: the
+    /// owner's own delete releases it, a pull of a name the engine lacks drops
+    /// it (`reserve_pull`), a claim of such a name replaces it, and the records
+    /// of images the engine no longer has are dropped here before anything is
+    /// sent. (A build over `/grpc` is the one writer not seen; see docs.)
+    ///
+    /// A record goes only after the engine answered 2xx or 404; any other answer,
+    /// or none, keeps it (the name stays the scope's, refused to others while its
+    /// image is there) until a repeated drop untags it. An answer that is a
+    /// refusal is counted: after [`MAX_UNTAG_REFUSALS`] of them the record is
+    /// released and the report says what stays in the engine, so a conflict that
+    /// never clears is not retried for ever.
+    ///
+    /// Returns what is still to do or say: the tags still recorded to `scope`
+    /// and not confirmed, and the one it gave up on.
     pub fn untag_scope(
         &self,
         scope: &str,
         mut delete: impl FnMut(&str) -> Option<u16>,
     ) -> Vec<String> {
+        self.evict_stale_tags(&self.lock_tags());
         let mut left = Vec::new();
         for name in self.ledger.scope_tags(scope) {
-            if !matches!(delete(&name), Some(200..=299 | 404)) {
-                if self
-                    .ledger
-                    .tag_owner(&name)
-                    .is_some_and(|r| r.scope == scope)
-                {
+            let status = delete(&name);
+            if matches!(status, Some(200..=299 | 404)) {
+                if let Err(e) = self.ledger.release_tag(scope, &name) {
+                    self.log(&format!("image tag record not released: {e}"));
                     left.push(name);
                 }
                 continue;
             }
-            if let Err(e) = self.ledger.release_tag(scope, &name) {
-                self.log(&format!("image tag record not released: {e}"));
+            if self
+                .ledger
+                .tag_owner(&name)
+                .is_none_or(|r| r.scope != scope)
+            {
+                continue;
+            }
+            let Some(code) = status else {
+                left.push(name);
+                continue;
+            };
+            let refused = self.ledger.note_untag_refused(scope, &name).unwrap_or(0);
+            if refused >= MAX_UNTAG_REFUSALS && self.ledger.release_tag(scope, &name).is_ok() {
+                left.push(format!(
+                    "{name} (the engine refused to untag it {refused} times, last answer {code}; it stays in the engine, and `marsh docker rm` removes it)"
+                ));
+            } else {
                 left.push(name);
             }
         }
@@ -1322,6 +1354,16 @@ impl std::fmt::Debug for ScopeTagHold {
 
 impl TagCommit for ScopeTagHold {
     fn commit(&self) {
+        if self.kind == HoldKind::Delete {
+            // The engine removed the names: the owner's records go with them, so
+            // none outlives its tag (a name pulled later is the registry's).
+            for tag in &self.tags {
+                if let Err(e) = self.svc.ledger.release_tag(&self.ws, tag) {
+                    self.svc.log(&format!("image tag record not released: {e}"));
+                }
+            }
+            return;
+        }
         if self.kind != HoldKind::Claim {
             return;
         }
@@ -1774,6 +1816,11 @@ impl Env for Scope {
             return Ok(None);
         }
         let ws = &self.auth.workspace;
+        // `DELETE /images/<name>` routes at most 255 characters: a longer name
+        // could never be untagged, by its owner or when its lane is dropped.
+        if let Some(tag) = tags.iter().find(|t| t.len() > 255) {
+            return Err(tag_refusal(tag, "is longer than 255 characters"));
+        }
         let mut res = self.svc.lock_tags();
         for tag in tags {
             if res.get(tag).is_some_and(|h| h.blocks_claim(ws)) {
@@ -1845,14 +1892,20 @@ impl Env for Scope {
             if res.get(tag).is_some_and(|h| h.blocks_pull(ws)) {
                 return Err(tag_refusal(tag, "is being made by another workspace"));
             }
-            if let Some(rec) = self.svc.ledger.tag_owner(tag)
-                && rec.scope != *ws
-                && self.svc.image_state(tag)?.0 != TagImage::Absent
-            {
-                return Err(tag_refusal(
-                    tag,
-                    "belongs to another workspace of this project",
-                ));
+            if let Some(rec) = self.svc.ledger.tag_owner(tag) {
+                if self.svc.image_state(tag)?.0 != TagImage::Absent {
+                    if rec.scope != *ws {
+                        return Err(tag_refusal(
+                            tag,
+                            "belongs to another workspace of this project",
+                        ));
+                    }
+                } else if let Err(e) = self.svc.ledger.release_tag(&rec.scope, tag) {
+                    // The image is gone: the record is stale, and the name about
+                    // to be pulled is the registry's, not the old owner's (a lane
+                    // drop would untag it).
+                    return Err(led(e));
+                }
             }
         }
         Ok(Some(self.hold(&mut res, tags, HoldKind::Pull, Vec::new())))

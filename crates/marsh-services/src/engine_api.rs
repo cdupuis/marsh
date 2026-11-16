@@ -61,6 +61,18 @@ impl ApiError {
     }
 }
 
+/// The status of a `DELETE` for the services' own bookkeeping: `Some(200)` for
+/// any 2xx (`Engine::call` fails on the rest), the engine's code for a refusal,
+/// `None` when the outcome is unknown (no answer, a broken stream).
+#[must_use]
+pub fn delete_status(result: &Result<Vec<u8>, ApiError>) -> Option<u16> {
+    match result {
+        Ok(_) => Some(200),
+        Err(ApiError::Status { code, .. }) => Some(*code),
+        Err(_) => None,
+    }
+}
+
 impl From<std::io::Error> for ApiError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
@@ -543,5 +555,27 @@ impl Engine {
             return Err(ApiError::Protocol("chunked event stream".into()));
         }
         Ok(reader)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a lane drop's tag cleanup is told: any 2xx and each refusal are
+    /// answers, a broken transport is "unknown" (the record is kept, uncounted).
+    #[test]
+    fn a_delete_reports_its_status_or_none_when_unknown() {
+        let status = |code| ApiError::Status {
+            code,
+            body: String::new(),
+        };
+        assert_eq!(delete_status(&Ok(Vec::new())), Some(200));
+        assert_eq!(delete_status(&Err(status(404))), Some(404));
+        assert_eq!(delete_status(&Err(status(409))), Some(409));
+        assert_eq!(delete_status(&Err(status(403))), Some(403));
+        let io = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert_eq!(delete_status(&Err(ApiError::Io(io))), None);
+        assert_eq!(delete_status(&Err(ApiError::Protocol("x".into()))), None);
     }
 }

@@ -2886,9 +2886,199 @@ fn a_failed_untag_keeps_the_claim_until_it_is_confirmed() {
     assert_eq!(tag_as(&lane_b, "postgres:16", "built"), 201);
 }
 
-/// While the engine untags a name, another workspace cannot adopt it (an image
-/// built here that no record covers is adopted), so its tag is not removed from
-/// under it.
+/// The cleanup deletes a name only while it is still what the workspace tagged.
+/// A name the workspace removed itself, and another workspace then pulled, is the
+/// registry's tag and stays: with a record left behind by the workspace's own
+/// `docker rmi`, or by an untag whose answer was lost.
+fn repulled_name(unknown_untag: bool) {
+    let (inner, names) = image_engine_with(&[], Duration::ZERO);
+    let pulled_names = names.clone();
+    let custom: Handler = Arc::new(move |req, s| {
+        if req.method == "POST" && req.target == "/images/create?fromImage=app&tag=1" {
+            pulled_names.lock().unwrap().push("app:1".into());
+            answer(s, 200, "{}");
+            return true;
+        }
+        inner(req, s)
+    });
+    let h = H::new("tag-repull", false, custom, |_| {});
+    let lane_a = h.serve(&h.auth);
+    let lane_b = lane(&h, "lane-b");
+    assert_eq!(tag_as(&lane_a, "postgres:16", "app"), 201);
+    if unknown_untag {
+        let stuck = h.svc.untag_scope("lane-a", |name| {
+            // The engine applied the delete; the answer never came back.
+            names.lock().unwrap().retain(|t| t != name);
+            None
+        });
+        assert_eq!(stuck, ["app:1"]);
+        h.svc.forget_scope("lane-a").unwrap();
+    } else {
+        assert_eq!(call(&lane_a, "DELETE", "/images/app:1", None).0, 200);
+    }
+    assert!(!names.lock().unwrap().iter().any(|t| t == "app:1"));
+    let pull = "/images/create?fromImage=app&tag=1";
+    assert_eq!(call(&lane_b, "POST", pull, None).0, 200);
+    assert!(names.lock().unwrap().iter().any(|t| t == "app:1"));
+    assert_eq!(drop_tags(&h, &lane_a, "lane-a"), NONE);
+    assert!(
+        names.lock().unwrap().iter().any(|t| t == "app:1"),
+        "closing lane-a removed the tag lane-b pulled"
+    );
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+}
+
+#[test]
+fn closing_a_workspace_leaves_a_name_another_workspace_pulled_after_its_rmi() {
+    repulled_name(false);
+}
+
+#[test]
+fn a_retry_leaves_a_name_pulled_after_an_untag_of_unknown_outcome() {
+    repulled_name(true);
+}
+
+/// A workspace's own `docker rmi` of its tag releases the record at once, so no
+/// stale record outlives the name (even before any other request or reconcile).
+#[test]
+fn deleting_your_own_tag_releases_its_record() {
+    let h = H::new("tag-rmi-release", false, image_engine(), |_| {});
+    let lane_a = h.serve(&h.auth);
+    assert_eq!(tag_as(&lane_a, "postgres:16", "app"), 201);
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), ["app:1"]);
+    assert_eq!(call(&lane_a, "DELETE", "/images/app:1", None).0, 200);
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+}
+
+/// The cleanup starts by dropping the records of images the engine no longer
+/// has (a prune, a delete by ID): nothing is asked of the engine for them.
+#[test]
+fn the_cleanup_starts_by_dropping_records_of_missing_images() {
+    let h = H::new("tag-evict-first", false, image_engine(), |_| {});
+    h.svc.ledger.set_tag("lane-a", "gone:1").unwrap();
+    let mut asked = Vec::new();
+    let stuck = h.svc.untag_scope("lane-a", |name| {
+        asked.push(name.to_owned());
+        Some(200)
+    });
+    assert_eq!(stuck, NONE);
+    assert_eq!(asked, NONE);
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+}
+
+/// A tag the route cannot name (255 characters, as for `DELETE /images/<name>`)
+/// is refused when it is claimed, so no record can exist that no cleanup could
+/// ever release.
+#[test]
+fn a_tag_longer_than_the_delete_route_allows_is_not_claimed() {
+    let h = H::new("tag-long", false, image_engine(), |_| {});
+    let lane_a = h.serve(&h.auth);
+    let long = "a".repeat(250);
+    let target = format!("/images/postgres:16/tag?repo={long}&tag=0123456789");
+    assert_eq!(call(&lane_a, "POST", &target, None).0, 403);
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+    let ok = "a".repeat(240);
+    let target = format!("/images/postgres:16/tag?repo={ok}&tag=0123456789");
+    assert_eq!(call(&lane_a, "POST", &target, None).0, 201);
+    let name = format!("{ok}:0123456789");
+    assert_eq!(
+        call(&lane_a, "DELETE", &format!("/images/{name}"), None).0,
+        200
+    );
+}
+
+/// Only a 2xx or a 404 confirms the untag; a refusal, a conflict, an engine
+/// error and no answer keep the record. A record someone else took over in the
+/// meantime is not reported.
+#[test]
+fn only_a_2xx_or_a_404_confirms_an_untag() {
+    let (custom, _) = image_engine_with(&["x:1"], Duration::ZERO);
+    let h = H::new("tag-statuses", false, custom, |_| {});
+    for (status, confirmed) in [
+        (Some(200), true),
+        (Some(204), true),
+        (Some(404), true),
+        (Some(403), false),
+        (Some(409), false),
+        (Some(500), false),
+        (Some(503), false),
+        (None, false),
+    ] {
+        h.svc.ledger.set_tag("lane-a", "x:1").unwrap();
+        let stuck = h.svc.untag_scope("lane-a", |_| status);
+        assert_eq!(stuck.is_empty(), confirmed, "{status:?}");
+        assert_eq!(
+            h.svc.ledger.scope_tags("lane-a").is_empty(),
+            confirmed,
+            "{status:?}"
+        );
+    }
+    h.svc.ledger.set_tag("lane-a", "x:1").unwrap();
+    let stuck = h.svc.untag_scope("lane-a", |name| {
+        h.svc.ledger.set_tag("lane-b", name).unwrap();
+        Some(403)
+    });
+    assert_eq!(
+        stuck, NONE,
+        "a tag lane-b took over is not lane-a's to report"
+    );
+}
+
+/// A refusal that never changes (a 409: the last tag of an image a container
+/// uses) is not retried for ever: after `MAX_UNTAG_REFUSALS` answers the record
+/// is released and the last report says what stays and how to remove it; the
+/// next drop is clean. An unknown outcome is never counted.
+#[test]
+fn a_permanent_refusal_is_given_up_with_a_message() {
+    use crate::policy::endpoint::MAX_UNTAG_REFUSALS;
+    let (custom, _) = image_engine_with(&["x:1"], Duration::ZERO);
+    let h = H::new("tag-giveup", false, custom, |_| {});
+    h.svc.ledger.set_tag("lane-a", "x:1").unwrap();
+    for _ in 0..MAX_UNTAG_REFUSALS * 2 {
+        assert_eq!(h.svc.untag_scope("lane-a", |_| None), ["x:1"]);
+    }
+    for round in 1..MAX_UNTAG_REFUSALS {
+        assert_eq!(
+            h.svc.untag_scope("lane-a", |_| Some(409)),
+            ["x:1"],
+            "round {round}"
+        );
+    }
+    let last = h.svc.untag_scope("lane-a", |_| Some(409));
+    assert_eq!(last.len(), 1);
+    assert!(last[0].starts_with("x:1 ("), "{last:?}");
+    assert!(last[0].contains("409") && last[0].contains("marsh docker rm"));
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+    assert_eq!(h.svc.untag_scope("lane-a", |_| Some(409)), NONE);
+}
+
+/// The production wiring: the relay's endpoint forwards the cleanup to the
+/// services (a no-op there would leave every lane's tags in the engine).
+#[test]
+fn the_relays_endpoint_runs_the_cleanup() {
+    use crate::relay::{DockerEndpoint, Filtered};
+    let (custom, names) = image_engine_with(&["built:1"], Duration::ZERO);
+    let h = H::new("tag-relay", false, custom, |_| {});
+    let lane_a = h.serve(&h.auth);
+    h.svc.ledger.set_tag("lane-a", "built:1").unwrap();
+    let endpoint = Filtered::new(h.svc.clone());
+    let stuck = endpoint.untag_scope("lane-a", &mut |name| {
+        Some(call(&lane_a, "DELETE", &format!("/images/{name}"), None).0)
+    });
+    assert_eq!(stuck, NONE);
+    assert!(!names.lock().unwrap().iter().any(|t| t == "built:1"));
+    assert_eq!(h.svc.ledger.scope_tags("lane-a"), NONE);
+    h.svc.ledger.set_tag("lane-a", "postgres:16").unwrap();
+    assert_eq!(
+        endpoint.untag_scope("lane-a", &mut |_| None),
+        ["postgres:16"]
+    );
+}
+
+/// While the engine untags a name another workspace cannot take it, and can
+/// right after. The record keeps the name (it is the closing workspace's until
+/// the engine answers); the delete's own hold, which covers a name no record
+/// covers, is pinned by `a_delete_holds_its_name_until_the_engine_finishes`.
 #[test]
 fn a_claim_during_the_untag_is_refused() {
     let release = Arc::new(AtomicBool::new(false));

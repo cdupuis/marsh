@@ -73,6 +73,9 @@ pub struct VolRec {
 pub struct TagRec {
     pub scope: String,
     pub created: u64,
+    /// How many times the engine refused to untag it when its scope was dropped.
+    #[serde(default)]
+    pub untag_refused: u32,
 }
 
 /// Most tag records kept. At the cap, records whose image is gone are dropped
@@ -770,6 +773,18 @@ impl Ledger {
         })
     }
 
+    /// Count one refusal by the engine to untag `scope`'s record of a tag;
+    /// returns the count (0 when the record is not the scope's).
+    pub fn note_untag_refused(&self, scope: &str, name: &str) -> LedgerResult<u32> {
+        self.mutate(|s| match s.tags.get_mut(name) {
+            Some(rec) if rec.scope == scope => {
+                rec.untag_refused += 1;
+                (rec.untag_refused, true)
+            }
+            _ => (0, false),
+        })
+    }
+
     /// Keep only the tag records `keep` accepts; returns how many went.
     pub fn retain_tags(&self, keep: impl Fn(&str, &TagRec) -> bool) -> LedgerResult<usize> {
         self.mutate(|s| {
@@ -792,6 +807,7 @@ impl Ledger {
                 TagRec {
                     scope: scope.to_string(),
                     created: now(),
+                    untag_refused: 0,
                 },
             );
             (true, true)
@@ -1257,6 +1273,7 @@ mod tests {
         let rec = |scope: &str| TagRec {
             scope: scope.into(),
             created: 0,
+            untag_refused: 0,
         };
         for (what, held, image, want) in [
             ("nobody, no image", None, TagImage::Absent, TagClaim::New),
@@ -1329,6 +1346,28 @@ mod tests {
         assert!(l.tag_owner("gone:1").is_none());
         assert_eq!(l.tag_owner("keep:1").map(|r| r.scope), Some("live".into()));
         assert_eq!(l.tag_owner("keep:2").map(|r| r.scope), Some("other".into()));
+    }
+
+    /// Ledgers written before the refusal count was added still load.
+    #[test]
+    fn a_tag_record_without_a_refusal_count_loads() {
+        let rec: TagRec = serde_json::from_str(r#"{"scope":"a","created":7}"#).unwrap();
+        assert_eq!((rec.scope.as_str(), rec.untag_refused), ("a", 0));
+        let l = Ledger::in_memory();
+        l.set_tag("a", "app:1").unwrap();
+        assert_eq!(l.note_untag_refused("a", "app:1").unwrap(), 1);
+        assert_eq!(l.note_untag_refused("a", "app:1").unwrap(), 2);
+        assert_eq!(
+            l.note_untag_refused("b", "app:1").unwrap(),
+            0,
+            "not its record"
+        );
+        l.set_tag("a", "app:1").unwrap();
+        assert_eq!(
+            l.note_untag_refused("a", "app:1").unwrap(),
+            1,
+            "a new claim restarts it"
+        );
     }
 
     #[test]

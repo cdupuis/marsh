@@ -361,27 +361,59 @@ has is checked.
   of its records, `DELETE /images/<name>` without `force`, through the filtered
   endpoint as that workspace. That is the call `docker rmi <name>` makes, so it
   untags that name only (an image another tag references stays; an image whose
-  last tag it was goes, nothing uses it any more), it holds the name against other
-  workspaces' claims while it runs, and it is refused for a tag another workspace
-  owns or is making (a pulled image's own name is never in the list: nobody
-  recorded it). A record goes (`Ledger::release_tag`, only while still the closing
-  workspace's) only after the engine answered 2xx or 404. **Fail closed:** any
-  other answer, or none, keeps the record; `forget_scope` no longer drops tag
-  records. The name then stays the closed workspace's and is refused to others
-  while its image is there, and the drop reports `image tag <name>` as left, until
-  a repeated drop untags it (`drop_workspace` is safe to repeat). Without this a
-  tag on a pulled image outlived its lane unrecorded, and no workspace could move
-  or remove it. **Not covered:** tags whose records were lost when the ledger was
-  quarantined as corrupt are unrecorded and, on a pulled image, are protected
-  like any pulled tag; only `marsh docker rm` (which removes the whole Docker VM)
-  clears them. Tests (`endpoint_tests.rs`, `ledger.rs`):
-  `closing_a_workspace_untags_its_own_tags_and_frees_the_names`,
-  `closing_a_workspace_leaves_a_tag_another_workspace_took`,
-  `a_failed_untag_keeps_the_claim_until_it_is_confirmed`,
-  `a_claim_during_the_untag_is_refused`, `released_and_stale_records_free_the_tag_table`.
-  The `Restorer` closure that maps the engine's answer to a status, and its
-  ordering after the containers, run only on Linux in the real stack; no unit
-  test covers them.
+  last tag it was goes), it holds the name against other workspaces' claims while
+  it runs, and it is refused for a tag another workspace owns or is making.
+  - **When a record may be trusted.** The cleanup deletes a name only because the
+    record says it is still what the workspace tagged, so every way a name stops
+    being so retires the record first (no image ID is stored): the owner's own
+    `docker rmi` releases it when the engine answers 2xx (`ScopeTagHold::commit`,
+    delete holds); a pull of a name the engine does not have drops it
+    (`reserve_pull`, so the registry's tag is nobody's but a later claim's); a claim
+    of such a name replaces it; and `untag_scope` first drops the records of images
+    the engine no longer has (a prune, a delete by ID), the same pass as
+    `reconcile`. A pulled image's own name is therefore in the list only if the
+    workspace itself pulled it over a name it had recorded and the engine still
+    has. **Gap:** a build over `/grpc` (not filtered, see below) can put an image
+    under a name whose record went stale without any of these seeing it; closing
+    the old owner would then untag it.
+  - **Fail closed.** A record goes (`Ledger::release_tag`, only while still the
+    closing workspace's) after the engine answered 2xx or 404. Any other answer,
+    or none, keeps it, and `forget_scope` does not drop tag records: the name stays
+    the closed workspace's, refused to others while its image is there, and the
+    drop reports `image tag <name>` as left. A claim cannot be longer than 255
+    characters (the route's limit, `reserve_tags`), so no record is a name the
+    cleanup could not send.
+  - **Retries.** `marsh-daemon` journals a drop with a non-empty `left` and repeats
+    it from the services timer (every 5 s), printing `marshd: dropping lane <id>
+    left image tag <name>; will retry` on its stderr; an unknown outcome is
+    settled by the retry (a delete that did apply answers 404). An answer that is
+    a refusal (a 409: the last tag of an image another lane's container uses; a
+    403) is counted in the record (`TagRec.untag_refused`); after
+    `MAX_UNTAG_REFUSALS` (12, about a minute) the record is released and that
+    round's `left` says `<name> (the engine refused to untag it N times, last
+    answer C; it stays in the engine, and `marsh docker rm` removes it)`, so the
+    next retry finds nothing and the journal entry ends. What is given up is a tag
+    that stays in the engine: on a pulled image it is again protected and
+    unrecorded. An unknown outcome is never counted.
+  - **Not covered:** tags whose records were lost when the ledger was quarantined
+    as corrupt are unrecorded and, on a pulled image, are protected like any pulled
+    tag; only `marsh docker rm` (which removes the whole Docker VM) clears them.
+    The `Restorer` call (its ordering after the containers, the filtered socket)
+    runs only on Linux in the real stack and has no unit test; the mapping of the
+    engine's answer to a status (`engine_api::delete_status`) and the relay's
+    forwarding are tested.
+  - Tests (`endpoint_tests.rs`, `ledger.rs`, `engine_api.rs`):
+    `closing_a_workspace_untags_its_own_tags_and_frees_the_names`,
+    `closing_a_workspace_leaves_a_tag_another_workspace_took`,
+    `closing_a_workspace_leaves_a_name_another_workspace_pulled_after_its_rmi`,
+    `a_retry_leaves_a_name_pulled_after_an_untag_of_unknown_outcome`,
+    `deleting_your_own_tag_releases_its_record`,
+    `the_cleanup_starts_by_dropping_records_of_missing_images`,
+    `a_tag_longer_than_the_delete_route_allows_is_not_claimed`,
+    `only_a_2xx_or_a_404_confirms_an_untag`, `a_failed_untag_keeps_the_claim_until_it_is_confirmed`,
+    `a_permanent_refusal_is_given_up_with_a_message`, `the_relays_endpoint_runs_the_cleanup`,
+    `a_claim_during_the_untag_is_refused`, `released_and_stale_records_free_the_tag_table`,
+    `a_delete_reports_its_status_or_none_when_unknown`.
 - **Not covered.** The default `docker build -t` and `docker buildx build -t` send no
   `POST /build`: they use `/grpc` and `/session` only (recorded e3 traffic,
   `e3/corpus/cli.jsonl`), and the tag names are inside the opaque BuildKit solve.

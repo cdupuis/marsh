@@ -194,9 +194,6 @@ pub(crate) struct Services {
     projects: Mutex<BTreeMap<PathBuf, Project>>,
     locks: Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>,
     next_holder: AtomicU64,
-    /// Held across every read-modify-write of `config.json` the daemon makes,
-    /// whatever the project: two forgets never start from the same snapshot.
-    config_lock: Mutex<()>,
     /// The projects' Internet grants (`services-internet.json` in the scope).
     grants: OnceLock<InternetGrants>,
     /// The relays to ready services VMs (E1). `None` until the daemon gives
@@ -883,11 +880,6 @@ impl StockDaemonBackend {
         );
         let mut forgot_setting = false;
         if folder_gone {
-            let _config = self
-                .services
-                .config_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // A setting that stays would keep the folder listed: the request
             // fails, and running it again (the folder is still recorded) tries
             // again; the VM, if any, is already removed.
@@ -1649,55 +1641,26 @@ fn missing_project_root(root: &Path, recorded: &[String]) -> Option<PathBuf> {
 
 /// Take `root` out of the project lists of `config.json` (`services_projects`,
 /// `docker_projects_off`), as `marsh config docker` writes them. Returns
-/// whether anything was listed. The caller holds the daemon's config lock. The
-/// new file has a name of its own, is synced, and is renamed over the old one;
-/// only a file this call created is ever removed.
-fn forget_project_settings(scope_root: &Path, root: &Path) -> std::io::Result<bool> {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let path = scope_root.join("config.json");
+/// whether anything was listed. The change goes through the same locked
+/// transaction as every `marsh config` setter (`marsh_daemon::config_file`).
+fn forget_project_settings(
+    scope_root: &Path,
+    root: &Path,
+) -> Result<bool, marsh_daemon::config_file::ConfigError> {
     let Some(key) = root.to_str() else {
         return Ok(false);
     };
-    let mut document = match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<serde_json::Map<String, Value>>(&bytes)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    let mut listed = false;
-    for name in ["services_projects", "docker_projects_off"] {
-        if let Some(Value::Array(roots)) = document.get_mut(name) {
-            let before = roots.len();
-            roots.retain(|entry| entry.as_str() != Some(key));
-            listed |= roots.len() != before;
+    marsh_daemon::config_file::update(scope_root, |document| {
+        let mut listed = false;
+        for name in ["services_projects", "docker_projects_off"] {
+            if let Some(Value::Array(roots)) = document.get_mut(name) {
+                let before = roots.len();
+                roots.retain(|entry| entry.as_str() != Some(key));
+                listed |= roots.len() != before;
+            }
         }
-    }
-    if !listed {
-        return Ok(false);
-    }
-    let mut encoded = serde_json::to_vec_pretty(&document)?;
-    encoded.push(b'\n');
-    let temporary = scope_root.join(format!(
-        ".config.json.marshd-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    let result = (|| {
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-        fs::rename(&temporary, &path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result.map(|()| true)
+        Ok(listed)
+    })
 }
 
 /// What the project's services containers can reach right now, in one line.
@@ -2323,6 +2286,44 @@ mod tests {
             })
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    /// The daemon's forget takes the lock `marsh config` takes: with another
+    /// writer holding it, `rm` waits and forgets only after it lets go, and the
+    /// writer's own update is not lost.
+    #[test]
+    fn rm_waits_for_the_shared_config_lock_and_keeps_the_other_writers_update() {
+        let fixture = RmFixture::new(&json!({}));
+        let moved = fixture.key("moved");
+        fs::write(
+            fixture.home.path().join("config.json"),
+            json!({"services_projects": [moved], "shell": "marsh"}).to_string(),
+        )
+        .unwrap();
+        let lock = fs::File::create(fixture.home.path().join("config.json.lock")).unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        std::thread::scope(|scope| {
+            let removal = scope.spawn(|| fixture.remove("moved"));
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!removal.is_finished(), "rm did not wait for the lock");
+            // The other writer's update, then it lets go.
+            let mut document: Value =
+                serde_json::from_slice(&fs::read(fixture.home.path().join("config.json")).unwrap())
+                    .unwrap();
+            document["shell"] = json!("zsh");
+            fs::write(
+                fixture.home.path().join("config.json"),
+                document.to_string(),
+            )
+            .unwrap();
+            drop(lock);
+            removal.join().unwrap().unwrap();
+        });
+        let document: Value =
+            serde_json::from_slice(&fs::read(fixture.home.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(document["shell"], "zsh");
+        assert_eq!(fixture.list("services_projects"), Vec::<String>::new());
     }
 
     /// A setting that cannot be forgotten fails the request, naming it, and

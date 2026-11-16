@@ -899,10 +899,10 @@ fn services_command(
         Command::Release { holder, json } => (Request::Release { root, holder }, json),
         Command::Internet { on, json } => (Request::Internet { root, on }, json),
         Command::Remove { yes, json, project } => {
-            if !yes
-                && removal_needs_confirmation(client, session, &root, project.is_some())
-                && !confirm_services_removal(&root, project.is_some())?
-            {
+            let named = project.is_some();
+            if !removal_confirmed(client, session, &root, named, yes, || {
+                confirm_services_removal(&root, named)
+            })? {
                 writeln!(stdout, "not removed")?;
                 return Ok(ProductOutcome::Complete(1));
             }
@@ -926,6 +926,22 @@ fn write_project_list(stderr: &mut impl Write, projects: &[String]) -> std::io::
         writeln!(stderr, "  {}", display_safe(project))?;
     }
     Ok(())
+}
+
+/// Whether `rm` may go ahead: `--yes` says so, and so does a `--project` with
+/// no Docker VM to destroy; otherwise `ask` decides.
+fn removal_confirmed(
+    client: &dyn DaemonClient,
+    session: &SessionConfig,
+    root: &std::path::Path,
+    named: bool,
+    yes: bool,
+    ask: impl FnOnce() -> Result<bool, ProductError>,
+) -> Result<bool, ProductError> {
+    if yes || !removal_needs_confirmation(client, session, root, named) {
+        return Ok(true);
+    }
+    ask()
 }
 
 /// `rm` asks before destroying a Docker VM, so it does not ask about a project
@@ -1980,6 +1996,62 @@ mod tests {
         assert!(asks(&real, "/gone/unlisted", false));
         // The launch folder cannot be read: ask.
         assert!(asks(&session(), "/gone/no-vm", true));
+    }
+
+    /// The question itself: `rm` asks (once) only without `--yes` and for a
+    /// project with a VM, or when no `--project` names another folder.
+    #[test]
+    fn rm_asks_the_question_only_when_it_has_to() {
+        let here = tempfile::tempdir().unwrap();
+        let real = SessionConfig {
+            launch_directory: here.path().to_owned(),
+            ..session()
+        };
+        let client = FakeClient {
+            services: Some(json!({"projects": [
+                {"vm": "marsh-svc-a", "root": "/gone/with-vm"},
+                {"vm": null, "root": "/gone/no-vm"},
+            ]})),
+            ..FakeClient::default()
+        };
+        let run = |project: &str, named: bool, yes: bool, answer: bool| {
+            let asked = std::cell::Cell::new(0);
+            let confirmed = removal_confirmed(
+                &client,
+                &real,
+                std::path::Path::new(project),
+                named,
+                yes,
+                || {
+                    asked.set(asked.get() + 1);
+                    Ok(answer)
+                },
+            )
+            .unwrap();
+            (confirmed, asked.get())
+        };
+        assert_eq!(run("/gone/with-vm", true, false, true), (true, 1));
+        assert_eq!(run("/gone/with-vm", true, false, false), (false, 1));
+        assert_eq!(run("/gone/with-vm", true, true, false), (true, 0));
+        assert_eq!(run("/gone/no-vm", true, false, false), (true, 0));
+        assert_eq!(run("/gone/no-vm", false, false, false), (false, 1));
+
+        // Through the command itself: no `--yes` and no terminal, and a
+        // project with no VM goes ahead without a question (a question would
+        // be an error here, with nobody to answer).
+        let mut out = Vec::new();
+        let outcome = services_command(
+            &client,
+            crate::cli::ServicesCommand::Remove {
+                yes: false,
+                json: true,
+                project: Some("/gone/no-vm".into()),
+            },
+            &real,
+            &mut out,
+        )
+        .unwrap();
+        assert!(matches!(outcome, ProductOutcome::Complete(0)));
     }
 
     #[test]

@@ -181,30 +181,33 @@ pub fn set_command(scope_root: &Path, name: &str, value: &str) -> Result<i32, (S
         )
     };
     let path = scope_root.join(crate::shell_choice::CONFIG_FILE);
-    let mut document = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
-            .map_err(|error| (format!("invalid {}: {error}", path.display()), 1))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(error) => return Err((format!("cannot read {}: {error}", path.display()), 1)),
-    };
-    let mut values = document
-        .get_mut(limits::CONFIG_KEY)
-        .and_then(serde_json::Value::as_object_mut)
-        .map(std::mem::take)
-        .unwrap_or_default();
-    match &parsed {
-        Some(parsed) => {
-            values.insert(
-                spec.name.into(),
-                serde_json::to_value(parsed).map_err(|error| (error.to_string(), 1))?,
-            );
+    // Read, change and write the limits in one locked transaction.
+    marsh_daemon::config_file::update(scope_root, |document| {
+        let mut values = document
+            .get_mut(limits::CONFIG_KEY)
+            .and_then(serde_json::Value::as_object_mut)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        match &parsed {
+            Some(parsed) => {
+                values.insert(
+                    spec.name.into(),
+                    serde_json::to_value(parsed).map_err(|error| error.to_string())?,
+                );
+            }
+            None => {
+                values.remove(spec.name);
+            }
         }
-        None => {
-            values.remove(spec.name);
+        document.insert(limits::CONFIG_KEY.into(), values.into());
+        Ok(())
+    })
+    .map_err(|error| match error {
+        marsh_daemon::config_file::ConfigError::Rejected(message) => (message, 1),
+        marsh_daemon::config_file::ConfigError::Io(error) => {
+            (format!("cannot write {}: {error}", path.display()), 1)
         }
-    }
-    crate::shell_choice::write_config(scope_root, limits::CONFIG_KEY, values.into())
-        .map_err(|error| (format!("cannot write {}: {error}", path.display()), 1))?;
+    })?;
     let listing = listing(scope_root).map_err(|message| (message, 1))?;
     let Some(entry) = listing.limits.iter().find(|entry| entry.name == spec.name) else {
         return Ok(0);

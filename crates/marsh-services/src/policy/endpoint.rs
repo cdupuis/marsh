@@ -1269,7 +1269,7 @@ impl Scope {
         for tag in tags {
             res.entry(tag.clone()).or_default().add(ws, kind);
         }
-        self.svc.lock_bk().touch(tags, ws);
+        self.svc.lock_bk().touch(tags);
         for (id, k) in &images {
             res.entry(id.clone()).or_default().add(ws, *k);
         }
@@ -1290,6 +1290,7 @@ impl Scope {
             kind,
             images,
             claims,
+            accepted: AtomicBool::new(false),
         })
     }
 }
@@ -1382,6 +1383,8 @@ struct ScopeTagHold {
     /// A delete's own records as they were when it was reserved (name and
     /// claim): the engine's answer releases those and no newer claim.
     claims: Vec<(String, u64)>,
+    /// The engine answered 2xx: what the request did to its names stands.
+    accepted: AtomicBool,
 }
 
 impl std::fmt::Debug for ScopeTagHold {
@@ -1396,6 +1399,7 @@ impl std::fmt::Debug for ScopeTagHold {
 
 impl TagCommit for ScopeTagHold {
     fn commit(&self) {
+        self.accepted.store(true, Ordering::SeqCst);
         if self.kind == HoldKind::Delete {
             // The engine removed the names: the owner's records go with them, so
             // none outlives its tag (a name pulled later is the registry's).
@@ -1421,6 +1425,13 @@ impl TagCommit for ScopeTagHold {
 
 impl Drop for ScopeTagHold {
     fn drop(&mut self) {
+        // What the finished request left under the names a stream watches is
+        // what they legitimately are (read while the names are still held).
+        let seen = if self.accepted.load(Ordering::SeqCst) {
+            self.svc.bk_observe(&self.tags)
+        } else {
+            Vec::new()
+        };
         let mut res = self.svc.lock_tags();
         for tag in &self.tags {
             if let Some(held) = res.get_mut(tag)
@@ -1436,6 +1447,7 @@ impl Drop for ScopeTagHold {
                 res.remove(id);
             }
         }
+        self.svc.lock_bk().released(seen);
     }
 }
 

@@ -995,7 +995,9 @@ fn write_services_lines(
                         .and_then(Value::as_str)
                         .map_or_else(String::new, |reason| format!("  ({reason})")),
                 )?;
-                if project["folder_missing"].as_bool().unwrap_or(false) {
+                // Only a VM can be removed: a gone folder with none has nothing to suggest.
+                if project["folder_missing"].as_bool().unwrap_or(false) && project["vm"].is_string()
+                {
                     writeln!(
                         stdout,
                         "  the folder is gone from this Mac: `marsh docker rm --project {}` removes its Docker VM and disk",
@@ -1860,6 +1862,30 @@ mod tests {
             .filter(|c| marsh_contracts::terminal::is_terminal_unsafe(*c) && *c != '\n')
             .collect();
         assert!(unsafe_found.is_empty(), "{out:?}");
+    }
+
+    /// `status` points at `marsh docker rm --project` only for a gone folder
+    /// that still has a Docker VM to remove.
+    #[test]
+    fn status_suggests_rm_only_for_a_gone_folder_with_a_vm() {
+        let document = json!({
+            "enabled_projects": [],
+            "projects": [
+                {"root": "/gone/with-vm", "state": "stopped", "vm": "marsh-svc-a", "folder_missing": true},
+                {"root": "/gone/no-vm", "state": "off", "vm": null, "folder_missing": true},
+                {"root": "/here/with-vm", "state": "ready", "vm": "marsh-svc-b", "folder_missing": false},
+            ],
+        });
+        let request = marsh_daemon::ServicesRequest::Status {
+            root: "/here/with-vm".into(),
+        };
+        let mut out = Vec::new();
+        write_services(&mut out, &request, &document).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("rm --project /gone/with-vm`"), "{out}");
+        assert!(!out.contains("rm --project /gone/no-vm"), "{out}");
+        assert!(!out.contains("rm --project /here"), "{out}");
+        assert_eq!(out.matches("the folder is gone").count(), 1, "{out}");
     }
 
     #[test]

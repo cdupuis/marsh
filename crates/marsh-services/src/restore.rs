@@ -458,7 +458,7 @@ mod linux {
     };
     use crate::breaks::{break_mode, hold};
     use crate::capture::valid_snapshot_id;
-    use crate::engine_api::{ContainerSummary, Engine, SCOPE_LABEL, percent_encode};
+    use crate::engine_api::{ApiError, ContainerSummary, Engine, SCOPE_LABEL, percent_encode};
     use crate::frame::{Authority, validate_label};
     use crate::fsops::{self, Copier, Pool, VolumeCopy};
     use crate::locks::ScopeLocks;
@@ -2259,7 +2259,9 @@ mod linux {
         /// Drops everything of one workspace (C3: a lane is closed, cancelled
         /// or removed): its containers, volumes and networks are removed
         /// through the filter **as that workspace** (so nothing of another
-        /// workspace can be named), then the scope's own ledger records go.
+        /// workspace can be named), then the image tags it created (untagged by
+        /// name, kept recorded until the engine confirms), then the scope's own
+        /// ledger records go.
         /// Safe to repeat. What is still there afterwards is reported, never
         /// hidden.
         ///
@@ -2322,6 +2324,25 @@ mod linux {
                     report.left.push(format!("{what} {}", text(item, 80)));
                 }
             }
+            // The scope's own image tags, after its containers: the tag of a
+            // pulled image would otherwise stay in the engine, protected, with
+            // nobody to move or remove it. Unforced and by name, as the scope.
+            let stuck = self
+                .endpoint
+                .untag_scope(workspace, &mut |name| match engine.call(
+                    "DELETE",
+                    &format!("/images/{name}"),
+                    None,
+                ) {
+                    Ok(_) => Some(200),
+                    Err(ApiError::Status { code, .. }) => Some(code),
+                    Err(_) => None,
+                });
+            report.left.extend(
+                stuck
+                    .iter()
+                    .map(|name| format!("image tag {}", text(name, 80))),
+            );
             if let Err(why) = self.endpoint.forget_scope(workspace) {
                 report
                     .left

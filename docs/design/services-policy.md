@@ -349,13 +349,39 @@ has is checked.
   ledger cannot be written at that moment (a failing disk) the tag stays unrecorded
   and a later claimant adopts the local image. Capacity is decided with the
   reservation, under one lock: records plus the new names in flight (this request's
-  included) never exceed `MAX_TAGS` (8192). Records go when their scope is dropped
-  (`forget_scope`), and when the engine no longer has the image, at the reconcile
-  pass and when the table is full; a record of an image that is there, or of a name
+  included) never exceed `MAX_TAGS` (8192). Records go when the engine no longer
+  has the image, at the reconcile pass and when the table is full; a record of an image that is there, or of a name
   in flight, is never dropped, and a request that still would not fit is refused.
   The lock covers one engine inspect per name (a multi-name build inspects each),
   at most `up_request`'s 30 s progress timeout per call when the engine hangs; every
   tag claim, pull, delete and request end waits on it meanwhile.
+- **Closing a workspace** (a lane is closed, cancelled or removed:
+  `Restorer::drop_workspace`). After its containers, volumes and networks are
+  removed, `Services::untag_scope` removes the tags the workspace created: for each
+  of its records, `DELETE /images/<name>` without `force`, through the filtered
+  endpoint as that workspace. That is the call `docker rmi <name>` makes, so it
+  untags that name only (an image another tag references stays; an image whose
+  last tag it was goes, nothing uses it any more), it holds the name against other
+  workspaces' claims while it runs, and it is refused for a tag another workspace
+  owns or is making (a pulled image's own name is never in the list: nobody
+  recorded it). A record goes (`Ledger::release_tag`, only while still the closing
+  workspace's) only after the engine answered 2xx or 404. **Fail closed:** any
+  other answer, or none, keeps the record; `forget_scope` no longer drops tag
+  records. The name then stays the closed workspace's and is refused to others
+  while its image is there, and the drop reports `image tag <name>` as left, until
+  a repeated drop untags it (`drop_workspace` is safe to repeat). Without this a
+  tag on a pulled image outlived its lane unrecorded, and no workspace could move
+  or remove it. **Not covered:** tags whose records were lost when the ledger was
+  quarantined as corrupt are unrecorded and, on a pulled image, are protected
+  like any pulled tag; only `marsh docker rm` (which removes the whole Docker VM)
+  clears them. Tests (`endpoint_tests.rs`, `ledger.rs`):
+  `closing_a_workspace_untags_its_own_tags_and_frees_the_names`,
+  `closing_a_workspace_leaves_a_tag_another_workspace_took`,
+  `a_failed_untag_keeps_the_claim_until_it_is_confirmed`,
+  `a_claim_during_the_untag_is_refused`, `released_and_stale_records_free_the_tag_table`.
+  The `Restorer` closure that maps the engine's answer to a status, and its
+  ordering after the containers, run only on Linux in the real stack; no unit
+  test covers them.
 - **Not covered.** The default `docker build -t` and `docker buildx build -t` send no
   `POST /build`: they use `/grpc` and `/session` only (recorded e3 traffic,
   `e3/corpus/cli.jsonl`), and the tag names are inside the opaque BuildKit solve.

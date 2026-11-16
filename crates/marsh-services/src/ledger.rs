@@ -526,16 +526,15 @@ impl Ledger {
 
     /// A dropped workspace's records that exist for the scope itself: its
     /// substituted sockets and its default network entry. Objects are removed
-    /// through the engine (and leave the ledger by their own removal).
+    /// through the engine (and leave the ledger by their own removal). Image
+    /// tag records stay: they go one by one, once the engine confirmed the
+    /// untag (`release_tag`), so a tag that is still there keeps its owner.
     pub fn forget_scope(&self, scope: &str) -> LedgerResult<()> {
         self.mutate(|s| {
             let before = (s.sockets.len(), s.scope_networks.len());
             s.sockets.retain(|_, rec| rec.scope != scope);
             s.scope_networks.remove(scope);
-            let tags = s.tags.len();
-            s.tags.retain(|_, rec| rec.scope != scope);
-            let changed =
-                before != (s.sockets.len(), s.scope_networks.len()) || tags != s.tags.len();
+            let changed = before != (s.sockets.len(), s.scope_networks.len());
             ((), changed)
         })
     }
@@ -742,6 +741,33 @@ impl Ledger {
     #[must_use]
     pub fn tag_count(&self) -> usize {
         self.with(|s| s.tags.len())
+    }
+
+    /// The tags `scope` is recorded as the creator of, in name order.
+    #[must_use]
+    pub fn scope_tags(&self, scope: &str) -> Vec<String> {
+        self.with(|s| {
+            let mut names: Vec<String> = s
+                .tags
+                .iter()
+                .filter(|(_, rec)| rec.scope == scope)
+                .map(|(name, _)| name.clone())
+                .collect();
+            names.sort();
+            names
+        })
+    }
+
+    /// Forget `scope`'s record of a tag; a record another scope has taken over
+    /// since stays. Returns whether a record went.
+    pub fn release_tag(&self, scope: &str, name: &str) -> LedgerResult<bool> {
+        self.mutate(|s| {
+            let mine = s.tags.get(name).is_some_and(|rec| rec.scope == scope);
+            if mine {
+                s.tags.remove(name);
+            }
+            (mine, mine)
+        })
     }
 
     /// Keep only the tag records `keep` accepts; returns how many went.
@@ -1277,13 +1303,22 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_scope_and_stale_records_free_the_tag_table() {
+    fn released_and_stale_records_free_the_tag_table() {
         let l = Ledger::in_memory();
         for n in 0..MAX_TAGS {
             assert!(l.set_tag("dead", &format!("dead:{n}")).unwrap());
         }
         assert!(!l.set_tag("live", "new:1").unwrap(), "full");
+        // Forgetting the scope keeps its tag records: they go one by one, once
+        // the engine confirmed the untag, and only while still the scope's.
         l.forget_scope("dead").unwrap();
+        assert_eq!(l.tag_count(), MAX_TAGS);
+        assert_eq!(l.scope_tags("dead").len(), MAX_TAGS);
+        assert!(!l.release_tag("live", "dead:0").unwrap(), "not its record");
+        assert_eq!(l.tag_count(), MAX_TAGS);
+        for name in l.scope_tags("dead") {
+            assert!(l.release_tag("dead", &name).unwrap());
+        }
         assert_eq!(l.tag_count(), 0);
         assert!(l.set_tag("live", "keep:1").unwrap());
         assert!(l.set_tag("live", "gone:1").unwrap());

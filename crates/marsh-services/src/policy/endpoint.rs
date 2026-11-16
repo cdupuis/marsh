@@ -1061,6 +1061,42 @@ impl Services {
         self.ledger.forget_scope(scope)
     }
 
+    /// Remove the image tags `scope` created from the engine, as part of
+    /// dropping it (a lane is closed). `delete` sends `DELETE /images/<name>`
+    /// (no `force`) through the filtered endpoint **as `scope`** and returns the
+    /// status, `None` when the outcome is unknown. That call is the one `docker
+    /// rmi <name>` makes: it untags only that name (an image another tag
+    /// references stays), refuses a tag another workspace now owns or is
+    /// making, and holds the name against other workspaces' claims while it
+    /// runs. A record goes only after the engine answered 2xx or 404; any other
+    /// answer, or none, keeps it, so the name stays the scope's (and refused to
+    /// everyone else while its image is there) until a repeated drop untags it.
+    /// Returns the tags that are still recorded to `scope` and not confirmed.
+    pub fn untag_scope(
+        &self,
+        scope: &str,
+        mut delete: impl FnMut(&str) -> Option<u16>,
+    ) -> Vec<String> {
+        let mut left = Vec::new();
+        for name in self.ledger.scope_tags(scope) {
+            if !matches!(delete(&name), Some(200..=299 | 404)) {
+                if self
+                    .ledger
+                    .tag_owner(&name)
+                    .is_some_and(|r| r.scope == scope)
+                {
+                    left.push(name);
+                }
+                continue;
+            }
+            if let Err(e) = self.ledger.release_tag(scope, &name) {
+                self.log(&format!("image tag record not released: {e}"));
+                left.push(name);
+            }
+        }
+        left
+    }
+
     // --- serving ---------------------------------------------------------------
 
     /// Serve one connection for `auth` and return when it ends: the

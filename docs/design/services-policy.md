@@ -509,7 +509,11 @@ has is checked.
      `marsh docker status --json` (`image_tag_events`, only when there are any) over
      the same filtered endpoint its status read already uses: `GET
      /_marsh/tag-events`, answered by the agent itself (`Kind::TagEvents`, never sent
-     to the engine) and only to the base workspace; the daemon makes the text plain
+     to the engine) and only to the daemon's own status read: the base workspace with
+     the reserved attempt `status`, which the host refuses to give to any job, shell or
+     lane (`AttemptScope::new` rejects it; `AttemptScope::status` is the daemon's), so
+     a base job or a substituted socket, which carry their job's attempt, get 403.
+     The daemon makes the text plain
      and bounded (at most 64 events, kinds `restored`, `not_restored`, `unchecked`).
      This is deliberately not a new relay frame: a frame or `Settings` field the
      peer does not know is a protocol violation on both sides (every message type is

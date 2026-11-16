@@ -1084,6 +1084,36 @@ impl StockDaemonBackend {
         } else {
             (super::services_view::View::default(), None)
         };
+        self.project_document(
+            root,
+            settings,
+            ProjectParts {
+                state,
+                reason,
+                cause,
+                vm,
+                holders,
+                idle_left,
+                exposure,
+                view,
+                view_error,
+            },
+        )
+    }
+
+    /// A project's status document, from what was found out about it.
+    fn project_document(&self, root: &Path, settings: &Settings, parts: ProjectParts) -> Value {
+        let ProjectParts {
+            state,
+            reason,
+            cause,
+            vm,
+            holders,
+            idle_left,
+            exposure,
+            view,
+            view_error,
+        } = parts;
         let folder_missing = matches!(
             fs::symlink_metadata(root),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -1706,6 +1736,19 @@ fn effective_internet(on: bool, governance: &Governance, gate: Option<&Gate>) ->
     }
 }
 
+/// What `services_project_json` found out about a project, for its document.
+struct ProjectParts {
+    state: &'static str,
+    reason: Option<String>,
+    cause: Option<Unavailable>,
+    vm: Option<ServicesVmView>,
+    holders: Vec<String>,
+    idle_left: Option<Duration>,
+    exposure: Option<Value>,
+    view: super::services_view::View,
+    view_error: Option<String>,
+}
+
 /// Why a project's services are unavailable, as `summary` says it.
 #[derive(Clone, Copy, Debug)]
 enum Unavailable {
@@ -1833,18 +1876,40 @@ fn keep_quiesced<P>(
 mod tests {
     use super::*;
 
-    /// `marsh docker status --json` carries the agent's image tag events, and
-    /// nothing when there are none.
+    /// `marsh docker status --json`: a ready project's document carries the
+    /// engine view's image tag events (and nothing of the kind without any), and
+    /// the view's containers, through the real document builder.
     #[test]
-    fn the_status_carries_image_tag_events_only_when_there_are_some() {
-        let mut view = super::super::services_view::View::default();
-        let mut document = json!({"containers": []});
-        add_view_notes(&mut document, &view, None);
-        assert!(document.get("image_tag_events").is_none());
-        view.tag_events = vec![json!({"at": 9, "kind": "restored"})];
-        add_view_notes(&mut document, &view, Some("marsh: why".into()));
+    fn a_ready_projects_document_carries_the_views_image_tag_events() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let settings = backend.services_settings().unwrap();
+        let root = fs::canonicalize(home.path()).unwrap();
+        let parts = |view: super::super::services_view::View| ProjectParts {
+            state: "ready",
+            reason: None,
+            cause: None,
+            vm: None,
+            holders: Vec::new(),
+            idle_left: None,
+            exposure: None,
+            view,
+            view_error: None,
+        };
+        let mut view = super::super::services_view::View {
+            containers: vec![
+                json!({"name": "app-db-1", "service": "db", "state": "running", "health": null}),
+            ],
+            ..Default::default()
+        };
+        let quiet = backend.project_document(&root, &settings, parts(view.clone()));
+        assert!(quiet.get("image_tag_events").is_none(), "{quiet}");
+        view.tag_events = vec![json!({"at": 9, "workspace": "lane-b", "tag": "base-app:1",
+                                      "kind": "restored", "detail": "put back"})];
+        let document = backend.project_document(&root, &settings, parts(view.clone()));
         assert_eq!(document["image_tag_events"], json!(view.tag_events));
-        assert_eq!(document["containers_error"], "marsh: why");
+        assert_eq!(document["containers"], json!(view.containers));
+        assert_eq!(document["state"], "ready");
     }
 
     /// The daemon-stop teardown defers a VM whose worker is not gone, and only

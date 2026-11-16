@@ -65,6 +65,11 @@ const DROP_EVERY: u64 = 700;
 /// The workspace of a project's base tree (lanes get their own in C3).
 pub const BASE_WORKSPACE: &str = "base";
 
+/// The attempt of the daemon's own status read (`AttemptScope::status`). No
+/// job, shell or lane can have it: `AttemptScope::new` refuses it, so the agent
+/// can tell the daemon's channel from any endpoint a job reaches.
+pub const STATUS_ATTEMPT: &str = "status";
+
 /// Settings with documented defaults (`docs/design/services.md`).
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -204,6 +209,28 @@ impl AttemptScope {
     /// valid scope id (the policy's own rule: 1..=64 of `[A-Za-z0-9_.-]`, no
     /// leading dot).
     pub fn new(
+        project_root: impl Into<PathBuf>,
+        workspace: &str,
+        attempt: &str,
+    ) -> Result<Self, RelayError> {
+        if attempt == STATUS_ATTEMPT {
+            return Err(RelayError::Invalid(format!(
+                "the attempt id {attempt:?} is the daemon's own"
+            )));
+        }
+        Self::build(project_root, workspace, attempt)
+    }
+
+    /// The daemon's own status read: the base workspace, attempt
+    /// [`STATUS_ATTEMPT`].
+    ///
+    /// # Errors
+    /// As [`Self::new`] for the root.
+    pub fn status(project_root: impl Into<PathBuf>) -> Result<Self, RelayError> {
+        Self::build(project_root, BASE_WORKSPACE, STATUS_ATTEMPT)
+    }
+
+    fn build(
         project_root: impl Into<PathBuf>,
         workspace: &str,
         attempt: &str,
@@ -2880,6 +2907,18 @@ mod relay_tests {
             matches!(&error, Some(RelayError::Hostile(why)) if why.contains("test break modes")),
             "{error:?}"
         );
+    }
+
+    /// The attempt of the daemon's status read belongs to it alone: no job,
+    /// shell or lane can be given it, so the agent can tell that channel apart.
+    #[test]
+    fn the_status_attempt_cannot_be_given_to_anything_else() {
+        assert!(AttemptScope::new("/p", "base", STATUS_ATTEMPT).is_err());
+        assert!(AttemptScope::new("/p", "lane-1", STATUS_ATTEMPT).is_err());
+        let scope = AttemptScope::status("/p").unwrap();
+        assert_eq!(scope.workspace(), BASE_WORKSPACE);
+        assert!(AttemptScope::status("relative").is_err());
+        assert!(AttemptScope::new("/p", "base", "status2").is_ok());
     }
 
     #[test]

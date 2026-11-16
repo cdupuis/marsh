@@ -659,10 +659,14 @@ pub fn admit(
         }
         Kind::TagEvents => {
             q.only(&[])?;
-            // The daemon's status read is the base workspace's.
-            if env.authority().workspace != crate::host::BASE_WORKSPACE {
+            // Only the daemon's own status read (the host attests the authority,
+            // and refuses the attempt to every job, shell and lane).
+            let who = env.authority();
+            if who.workspace != crate::host::BASE_WORKSPACE
+                || who.attempt != crate::host::STATUS_ATTEMPT
+            {
                 return Err(Refusal::forbid(
-                    "image tag events are for the base workspace's status",
+                    "image tag events are for the daemon's status read only",
                 ));
             }
             a.post = Post::TagEvents;

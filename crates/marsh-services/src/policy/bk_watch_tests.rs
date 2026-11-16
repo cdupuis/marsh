@@ -859,19 +859,28 @@ fn the_initial_image_list_holds_the_tag_lock() {
     assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:src"));
 }
 
-/// The base workspace's status read gets the agent's own answer on the filtered
-/// endpoint: the events, in the shape the daemon shows. Another workspace is
-/// refused, and the engine is never asked.
+/// The daemon's status read (the base workspace, attempt `status`) gets the
+/// agent's own answer on the filtered endpoint: the events, in the shape the
+/// daemon shows. Nothing else does: not a lane, not a base job, not a base
+/// workspace's substituted socket (which has its job's attempt), and the engine
+/// is never asked.
 #[test]
-fn the_base_workspace_reads_the_tag_events_and_no_other_does() {
+fn only_the_daemons_status_read_gets_the_tag_events() {
     let w = World::new("bk-route");
-    let (base, b) = (lane(&w.h, "base"), lane(&w.h, B));
-    let (status, body) = call(&base, "GET", "/_marsh/tag-events", None);
+    let as_attempt = |workspace: &str, attempt: &str| {
+        w.h.serve(&Authority {
+            workspace: workspace.into(),
+            attempt: attempt.into(),
+            ..w.h.auth.clone()
+        })
+    };
+    let (status_read, b) = (as_attempt("base", "status"), lane(&w.h, B));
+    let (status, body) = call(&status_read, "GET", "/_marsh/tag-events", None);
     assert_eq!((status, body.as_str()), (200, r#"{"events":[]}"#));
     let c = open_stream(&b, "/grpc");
     w.build("base-app:1", "sha256:lane");
     w.end(&c, B);
-    let (status, body) = call(&base, "GET", "/_marsh/tag-events", None);
+    let (status, body) = call(&status_read, "GET", "/_marsh/tag-events", None);
     assert_eq!(status, 200);
     let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
     let events = answer["events"].as_array().unwrap();
@@ -879,6 +888,14 @@ fn the_base_workspace_reads_the_tag_events_and_no_other_does() {
     assert_eq!(events[0]["tag"], "base-app:1");
     assert_eq!(events[0]["workspace"], B);
     assert_eq!(events[0]["kind"], "restored");
-    assert_eq!(call(&b, "GET", "/_marsh/tag-events", None).0, 403);
+    for (who, sock) in [
+        ("a lane's job", b.clone()),
+        ("a base job", as_attempt("base", "job1")),
+        ("a base shell", as_attempt("base", "shell")),
+        ("a lane's status-named attempt", as_attempt(B, "status")),
+    ] {
+        let (status, body) = call(&sock, "GET", "/_marsh/tag-events", None);
+        assert_eq!(status, 403, "{who} read the events: {body}");
+    }
     assert_eq!(w.h.engine.saw("GET", "/_marsh"), 0);
 }

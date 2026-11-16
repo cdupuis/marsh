@@ -698,7 +698,9 @@ In plain words:
   what each tag another workspace created (and each name on a pulled image such as
   `postgres:16`) legitimately is; when a build's stream ends it moves back any whose
   image changed, with a plain `docker tag` of the old image ID (never forced; nothing
-  is deleted), and says so on the services agent's standard error. It does not do
+  is deleted), and says so on the services agent's standard error and in
+  `marsh docker status --json` (`image_tag_events`, the latest 64, kept in the
+  agent's memory and so lost when the Docker VM restarts). It does not do
   that when another explanation exists: the tag's owner pulled, tagged or deleted it
   meanwhile (silent), the lane itself also pulled it, or the owner had a build
   running too (reported, not undone, so a lane's own legitimate build of its own

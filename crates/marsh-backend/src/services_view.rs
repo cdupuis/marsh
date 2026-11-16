@@ -11,7 +11,7 @@
 //! health are reduced to plain bounded words, and nothing here names a VM,
 //! volume, snapshot, engine or sbx.
 
-use marsh_sbx::services_relay::{AttemptScope, BASE_WORKSPACE, Relay};
+use marsh_sbx::services_relay::{AttemptScope, Relay};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -26,8 +26,6 @@ const MAX_TAG_EVENTS: usize = 64;
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const MAX_NAME: usize = 128;
 const DEADLINE: Duration = Duration::from_secs(3);
-/// The authority attempt of a status read: the base workspace, read only.
-const STATUS_ATTEMPT: &str = "status";
 
 /// What the status shows of the base workspace's engine.
 #[derive(Clone, Debug, Default)]
@@ -42,14 +40,9 @@ pub(crate) struct View {
 /// the containers could not be read. The events are the agent's own answer on
 /// the same filtered endpoint; an agent that does not know the route refuses
 /// it, and that, like any failure to read them, is no events.
-pub(crate) fn read(relay: &Relay) -> Result<View, String> {
-    read_with(|path| get(relay, path))
-}
-
-/// [`read`] over any way of asking the base workspace's engine for a path.
-fn read_with(get: impl Fn(&str) -> Result<Vec<u8>, String>) -> Result<View, String> {
-    let (containers, ports) = parse(&get("/containers/json?all=1")?)?;
-    let tag_events = get(TAG_EVENTS_PATH)
+pub(crate) fn read(channel: &dyn Channel) -> Result<View, String> {
+    let (containers, ports) = parse(&get(channel, "/containers/json?all=1")?)?;
+    let tag_events = get(channel, TAG_EVENTS_PATH)
         .map(|body| parse_tag_events(&body))
         .unwrap_or_default();
     Ok(View {
@@ -61,14 +54,34 @@ fn read_with(get: impl Fn(&str) -> Result<Vec<u8>, String>) -> Result<View, Stri
 
 const TAG_EVENTS_PATH: &str = "/_marsh/tag-events";
 
-/// One `GET` on a docker channel of the base workspace, read only, bounded in time.
-fn get(relay: &Relay, path: &str) -> Result<Vec<u8>, String> {
-    let authority = AttemptScope::new(relay.project_path(), BASE_WORKSPACE, STATUS_ATTEMPT)
-        .map_err(|error| error.to_string())?;
-    let mut stream = relay
-        .open_docker(&authority)
-        .map_err(|error| error.to_string())?;
-    let closer = stream.clone();
+/// A byte stream.
+pub(crate) trait Duplex: Read + Write + Send {}
+impl<T: Read + Write + Send> Duplex for T {}
+
+/// A stream and what closes it again.
+pub(crate) type Opened = (Box<dyn Duplex>, Box<dyn FnOnce() + Send>);
+
+/// A way to open the daemon's own status channel to the base workspace's
+/// filtered docker endpoint, and what closes it again.
+pub(crate) trait Channel {
+    fn open(&self) -> Result<Opened, String>;
+}
+
+impl Channel for Relay {
+    fn open(&self) -> Result<Opened, String> {
+        let authority =
+            AttemptScope::status(self.project_path()).map_err(|error| error.to_string())?;
+        let stream = self
+            .open_docker(&authority)
+            .map_err(|error| error.to_string())?;
+        let closer = stream.clone();
+        Ok((Box::new(stream), Box::new(move || closer.close())))
+    }
+}
+
+/// One `GET` on a status channel, read only, bounded in time.
+fn get(channel: &dyn Channel, path: &str) -> Result<Vec<u8>, String> {
+    let (mut stream, close) = channel.open()?;
     let (send, receive) = mpsc::sync_channel(1);
     let path = path.to_owned();
     thread::spawn(move || {
@@ -78,7 +91,7 @@ fn get(relay: &Relay, path: &str) -> Result<Vec<u8>, String> {
         Ok(outcome) => outcome,
         Err(_) => Err("the services engine did not answer in time".to_owned()),
     };
-    closer.close();
+    close();
     body
 }
 
@@ -434,34 +447,86 @@ mod tests {
         );
     }
 
-    /// The view asks for the containers and then the events; an agent that
-    /// refuses the events (it does not know the route) still gives the containers.
+    /// A stand-in for the status channel: a stream whose far end answers each
+    /// request by path, and records what was asked.
+    struct Fake {
+        answers: Vec<(&'static str, &'static str)>,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Channel for Fake {
+        fn open(&self) -> Result<Opened, String> {
+            let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let (answers, asked) = (self.answers.clone(), self.asked.clone());
+            thread::spawn(move || {
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    if server.read_exact(&mut byte).is_err() {
+                        return;
+                    }
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let path = request.split(' ').nth(1).unwrap_or("").to_owned();
+                asked
+                    .lock()
+                    .unwrap()
+                    .push(request.lines().next().unwrap().to_owned());
+                let reply = answers.iter().find(|(p, _)| *p == path).map_or(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_owned(),
+                    |(_, body)| {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                    },
+                );
+                let _ = server.write_all(reply.as_bytes());
+            });
+            let closer = client.try_clone().unwrap();
+            Ok((
+                Box::new(client),
+                Box::new(move || {
+                    let _ = closer.shutdown(std::net::Shutdown::Both);
+                }),
+            ))
+        }
+    }
+
+    const EVENTS: &str =
+        r#"{"events":[{"at":5,"workspace":"b","tag":"t:1","kind":"unchecked","detail":"d"}]}"#;
+
+    /// The real read over a stream: the containers first and then the events
+    /// (both as `GET`s the agent can route); an agent that refuses the events
+    /// route (an older one) still gives the containers.
     #[test]
     fn the_view_has_the_events_and_survives_an_agent_that_has_none() {
-        let events =
-            br#"{"events":[{"at":5,"workspace":"b","tag":"t:1","kind":"unchecked","detail":"d"}]}"#;
-        let asked = std::cell::RefCell::new(Vec::new());
-        let new_agent = |path: &str| {
-            asked.borrow_mut().push(path.to_owned());
-            Ok(if path == TAG_EVENTS_PATH {
-                events.to_vec()
-            } else {
-                b"[]".to_vec()
-            })
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let new_agent = Fake {
+            answers: vec![("/containers/json?all=1", "[]"), (TAG_EVENTS_PATH, EVENTS)],
+            asked: asked.clone(),
         };
-        let view = read_with(new_agent).unwrap();
+        let view = read(&new_agent).unwrap();
         assert_eq!(view.tag_events.len(), 1);
-        assert_eq!(*asked.borrow(), ["/containers/json?all=1", TAG_EVENTS_PATH]);
-        let old_agent = |path: &str| {
-            if path == TAG_EVENTS_PATH {
-                Err("the services engine answered HTTP/1.1 403 Forbidden".to_owned())
-            } else {
-                Ok(b"[]".to_vec())
-            }
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                "GET /containers/json?all=1 HTTP/1.1",
+                "GET /_marsh/tag-events HTTP/1.1"
+            ]
+        );
+        let old_agent = Fake {
+            answers: vec![("/containers/json?all=1", "[]")],
+            asked: asked.clone(),
         };
-        let view = read_with(old_agent).unwrap();
+        let view = read(&old_agent).unwrap();
         assert_eq!(view.tag_events.len(), 0);
-        assert!(read_with(|_| Err("down".to_owned())).is_err());
+        let down = Fake {
+            answers: vec![],
+            asked,
+        };
+        assert!(read(&down).is_err());
     }
 
     #[test]

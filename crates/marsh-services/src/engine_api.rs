@@ -61,15 +61,40 @@ impl ApiError {
     }
 }
 
-/// The status of a `DELETE` for the services' own bookkeeping: `Some(200)` for
-/// any 2xx (`Engine::call` fails on the rest), the engine's code for a refusal,
-/// `None` when the outcome is unknown (no answer, a broken stream).
+/// What a lane drop's `DELETE /images/<name>` came to, told apart by who spoke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Untag {
+    /// The name is gone: a 2xx, or a 404 (it was not there).
+    Confirmed,
+    /// The engine answered and refused (a 409 conflict, a 403 from the filter's
+    /// own rules, a 500): the same request will probably be refused again.
+    Refused(u16),
+    /// No answer, or one the filter made up for a lost one (502, 503, 504): the
+    /// delete may or may not have happened. Never counted against the record.
+    Unknown,
+}
+
+impl Untag {
+    /// The filter answers 502 when the engine's reply never came, and 503/504
+    /// when it could not ask; the engine does not send these for an image delete.
+    #[must_use]
+    pub fn from_status(code: u16) -> Self {
+        match code {
+            200..=299 | 404 => Self::Confirmed,
+            502..=504 => Self::Unknown,
+            other => Self::Refused(other),
+        }
+    }
+}
+
+/// The outcome of an `Engine::call` that deleted an image (`call` fails on any
+/// status of 300 or more, and on transport errors).
 #[must_use]
-pub fn delete_status(result: &Result<Vec<u8>, ApiError>) -> Option<u16> {
+pub fn untag_outcome(result: &Result<Vec<u8>, ApiError>) -> Untag {
     match result {
-        Ok(_) => Some(200),
-        Err(ApiError::Status { code, .. }) => Some(*code),
-        Err(_) => None,
+        Ok(_) => Untag::Confirmed,
+        Err(ApiError::Status { code, .. }) => Untag::from_status(*code),
+        Err(_) => Untag::Unknown,
     }
 }
 
@@ -562,20 +587,27 @@ impl Engine {
 mod tests {
     use super::*;
 
-    /// What a lane drop's tag cleanup is told: any 2xx and each refusal are
-    /// answers, a broken transport is "unknown" (the record is kept, uncounted).
+    /// Only the engine's own refusals are refusals: a lost reply (the filter's
+    /// 502, a broken transport) is unknown, and a 404 means the name is gone.
     #[test]
-    fn a_delete_reports_its_status_or_none_when_unknown() {
+    fn a_delete_is_confirmed_refused_or_unknown() {
         let status = |code| ApiError::Status {
             code,
             body: String::new(),
         };
-        assert_eq!(delete_status(&Ok(Vec::new())), Some(200));
-        assert_eq!(delete_status(&Err(status(404))), Some(404));
-        assert_eq!(delete_status(&Err(status(409))), Some(409));
-        assert_eq!(delete_status(&Err(status(403))), Some(403));
+        assert_eq!(untag_outcome(&Ok(Vec::new())), Untag::Confirmed);
+        assert_eq!(untag_outcome(&Err(status(404))), Untag::Confirmed);
+        for code in [403, 409, 500] {
+            assert_eq!(untag_outcome(&Err(status(code))), Untag::Refused(code));
+        }
+        for code in [502, 503, 504] {
+            assert_eq!(untag_outcome(&Err(status(code))), Untag::Unknown, "{code}");
+        }
         let io = std::io::Error::from(std::io::ErrorKind::TimedOut);
-        assert_eq!(delete_status(&Err(ApiError::Io(io))), None);
-        assert_eq!(delete_status(&Err(ApiError::Protocol("x".into()))), None);
+        assert_eq!(untag_outcome(&Err(ApiError::Io(io))), Untag::Unknown);
+        assert_eq!(
+            untag_outcome(&Err(ApiError::Protocol("x".into()))),
+            Untag::Unknown
+        );
     }
 }

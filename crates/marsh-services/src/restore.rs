@@ -458,7 +458,7 @@ mod linux {
     };
     use crate::breaks::{break_mode, hold};
     use crate::capture::valid_snapshot_id;
-    use crate::engine_api::{ContainerSummary, Engine, SCOPE_LABEL, delete_status, percent_encode};
+    use crate::engine_api::{ContainerSummary, Engine, SCOPE_LABEL, percent_encode, untag_outcome};
     use crate::frame::{Authority, validate_label};
     use crate::fsops::{self, Copier, Pool, VolumeCopy};
     use crate::locks::ScopeLocks;
@@ -2290,10 +2290,16 @@ mod linux {
             self.endpoint
                 .check(&authority)
                 .map_err(RestoreError::Invalid)?;
-            let run = RunDir::create(&self.config.run_root, 0, 0, &authority, &self.endpoint)
+            // Owned by whoever runs the drop: root in the agent (so as before),
+            // anyone in a test.
+            let (uid, gid) = (
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+            );
+            let run = RunDir::create(&self.config.run_root, uid, gid, &authority, &self.endpoint)
                 .map_err(|error| {
-                    RestoreError::Failed(format!("could not start the filtered socket: {error}"))
-                })?;
+                RestoreError::Failed(format!("could not start the filtered socket: {error}"))
+            })?;
             let engine = Engine::new(run.socket());
             let mut report = DropReport::default();
             // Containers first (they hold the volumes and the networks).
@@ -2328,7 +2334,7 @@ mod linux {
             // pulled image would otherwise stay in the engine, protected, with
             // nobody to move or remove it. Unforced and by name, as the scope.
             let stuck = self.endpoint.untag_scope(workspace, &mut |name| {
-                delete_status(&engine.call("DELETE", &format!("/images/{name}"), None))
+                untag_outcome(&engine.call("DELETE", &format!("/images/{name}"), None))
             });
             report.left.extend(
                 stuck
@@ -2889,6 +2895,110 @@ mod linux {
             Err("the kernel enforces only part of the confinement".into())
         }
     }
+    #[cfg(test)]
+    mod drop_tests {
+        use super::*;
+        use std::io::BufRead;
+        use std::os::unix::net::UnixStream;
+
+        /// An endpoint that is also a small engine: it answers what a drop asks,
+        /// and records every request and call in order.
+        struct Recording {
+            log: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl DockerEndpoint for Recording {
+            fn serve(&self, authority: Authority, stream: UnixStream) {
+                self.log.lock().unwrap().push(format!(
+                    "serve {} {} {}",
+                    authority.workspace, authority.attempt, authority.kind
+                ));
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    return;
+                }
+                let request = line.trim_end().rsplit_once(' ').map_or("", |(r, _)| r);
+                self.log.lock().unwrap().push(request.to_owned());
+                let (status, body) = match request {
+                    "DELETE /images/stuck:1" => ("409 Conflict", r#"{"message":"in use"}"#),
+                    "GET /volumes" => ("200 OK", r#"{"Volumes":[]}"#),
+                    _ => ("200 OK", "[]"),
+                };
+                let mut stream = reader.into_inner();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+
+            fn untag_scope(
+                &self,
+                workspace: &str,
+                delete: &mut dyn FnMut(&str) -> crate::engine_api::Untag,
+            ) -> Vec<String> {
+                self.log.lock().unwrap().push(format!("untag {workspace}"));
+                ["app:1", "stuck:1"]
+                    .into_iter()
+                    .filter(|name| delete(name) != crate::engine_api::Untag::Confirmed)
+                    .map(str::to_owned)
+                    .collect()
+            }
+
+            fn forget_scope(&self, workspace: &str) -> Result<(), String> {
+                self.log.lock().unwrap().push(format!("forget {workspace}"));
+                Ok(())
+            }
+        }
+
+        /// The drop asks the endpoint to untag the scope's tags after the
+        /// containers, volumes and networks, with an unforced delete by name on
+        /// the filtered socket as that workspace, reports what is still there,
+        /// and forgets the scope last.
+        #[test]
+        fn dropping_a_workspace_untags_its_tags_after_its_objects() {
+            let root = std::env::temp_dir().join(format!("restore-drop-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("pool")).unwrap();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let restorer = Restorer::new(
+                &root.join("pool"),
+                Engine::new(root.join("engine.sock")),
+                Arc::new(ScopeLocks::default()),
+                Arc::new(Recording {
+                    log: Arc::clone(&log),
+                }),
+                RestoreConfig {
+                    run_root: root.join("run"),
+                    ..RestoreConfig::default()
+                },
+            )
+            .unwrap();
+            let report = restorer.drop_workspace("lane-a").unwrap();
+            let log = log.lock().unwrap().clone();
+            let at = |what: &str| {
+                log.iter()
+                    .position(|entry| entry == what)
+                    .unwrap_or_else(|| panic!("{what:?} not in {log:?}"))
+            };
+            assert!(at("untag lane-a") > at("GET /networks"), "{log:?}");
+            assert!(at("untag lane-a") > at("GET /volumes"), "{log:?}");
+            assert!(at("DELETE /images/app:1") > at("untag lane-a"));
+            at("DELETE /images/stuck:1");
+            assert!(
+                at("forget lane-a") > at("DELETE /images/stuck:1"),
+                "{log:?}"
+            );
+            assert!(
+                log.iter().any(|e| e == "serve lane-a drop restore"),
+                "the filtered socket is the workspace's own: {log:?}"
+            );
+            assert_eq!(report.left, ["image tag stuck:1"], "{log:?}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
     #[cfg(test)]
     mod install_tests {
         use super::*;

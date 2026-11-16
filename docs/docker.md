@@ -723,6 +723,9 @@ In plain words:
   was set aside as corrupt) are not removed with a lane and, on a pulled image,
   cannot be moved or removed by any workspace; only `marsh docker rm` clears them.
   A tag longer than 255 characters cannot be claimed (the delete route could not name it).
+  Because a normal `docker build -t` is not covered (above), a lane can build over a tag
+  another lane created; closing the first lane then removes that tag from the engine
+  (the second lane's image loses its name; nothing else is touched).
 - **Docker's built-in `bridge` network is refused.** Containers without a
   network join their workspace's own network, so a plain `docker run` in two
   lanes cannot reach each other. Containers in one stack reach each other by

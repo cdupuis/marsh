@@ -86,13 +86,12 @@ pub trait DockerEndpoint: Send + Sync {
     }
 
     /// Before `forget_scope`, once the scope's containers are gone: remove the
-    /// image tags the scope created, by `delete` (a status per tag name, `None`
-    /// when unknown). Returns the tags that are still there. The default has
+    /// image tags the scope created, by `delete` (an outcome per tag name). Returns the tags that are still there. The default has
     /// no tags.
     fn untag_scope(
         &self,
         _workspace: &str,
-        _delete: &mut dyn FnMut(&str) -> Option<u16>,
+        _delete: &mut dyn FnMut(&str) -> crate::engine_api::Untag,
     ) -> Vec<String> {
         Vec::new()
     }
@@ -154,7 +153,7 @@ impl DockerEndpoint for Filtered {
     fn untag_scope(
         &self,
         workspace: &str,
-        delete: &mut dyn FnMut(&str) -> Option<u16>,
+        delete: &mut dyn FnMut(&str) -> crate::engine_api::Untag,
     ) -> Vec<String> {
         self.svc.untag_scope(workspace, delete)
     }

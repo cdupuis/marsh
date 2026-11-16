@@ -544,8 +544,7 @@ has is checked.
   read of the name (a few milliseconds) is taken for the request's. Tests: the
   `bk_watch_tests` module of `endpoint_tests.rs`; each rule above was removed once
   and a test failed, except the choice between the record and the image the stream began
-  with when they agree (no outcome differs), and that the end check names a tag only
-  when it differs from the record (an optimisation: the settle step re-reads it).
+  with when they agree (no outcome differs).
 - Names are not forced under `<workspace>/` (that would refuse `docker build -t app`
   and Compose's default names); the cost is that two workspaces cannot both build the
   same tag over REST, such as an `image:` plus `build:` stack.

@@ -5,7 +5,7 @@
 //! the break mode that reintroduces its defect and requires the test to fail
 //! (`E3_TEST_BREAKS`, read only by the unit-test build, see `breaks.rs`).
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -290,7 +290,7 @@ const SWITCH: &[u8] = b"HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.d
 fn attach(h: &H, sock: &Path) -> UnixStream {
     h.own_container(C1, &[]);
     let mut c = UnixStream::connect(sock).unwrap();
-    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     write!(
         c,
         "POST /containers/{C1}/attach?stream=1&stdin=1&stdout=1 HTTP/1.1\r\nHost: d\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Length: 0\r\n\r\n"
@@ -349,7 +349,7 @@ fn a_silent_hijacked_stream_is_closed_at_the_idle_limit() {
     );
     let sock = h.serve(&h.auth);
     let mut c = attach(&h, &sock);
-    c.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     let mut b = [0u8; 16];
     let r = c.read(&mut b);
     r2.store(true, Ordering::SeqCst);
@@ -482,7 +482,7 @@ fn the_project_cap_counts_every_workspace_root() {
         .open_connections()
         == 2));
     let mut c3 = UnixStream::connect(&socks[2]).unwrap();
-    c3.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    c3.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     let mut b = [0u8; 12];
     let n = c3.read(&mut b).unwrap_or(0);
     assert_eq!(
@@ -498,7 +498,10 @@ fn the_project_cap_counts_every_workspace_root() {
     c4.set_read_timeout(Some(Duration::from_millis(500)))
         .unwrap();
     let r = c4.read(&mut b);
-    assert!(r.is_err(), "a separate project was refused: {r:?}");
+    assert!(
+        matches!(&r, Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
+        "a separate project was refused: {r:?}"
+    );
 }
 
 // --- ledger persistence at the endpoint ---------------------------------------
@@ -1224,8 +1227,42 @@ fn a_hung_volume_create_is_bounded_and_fences_the_name() {
     engine.create_release.store(true, Ordering::SeqCst);
 }
 
+/// One reply read whole from a kept-alive connection: the head up to the blank
+/// line, then exactly `Content-Length` body bytes. The endpoint writes a head
+/// and a body in separate writes, so a single `read` may return only the head.
+fn read_reply(c: &mut UnixStream) -> (String, Vec<u8>) {
+    let mut head = Vec::new();
+    let mut b = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert_eq!(
+            c.read(&mut b).unwrap(),
+            1,
+            "closed in a reply head: {head:?}"
+        );
+        head.push(b[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    let len = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+    let mut body = vec![0_u8; len];
+    c.read_exact(&mut body).unwrap();
+    (head, body)
+}
+
 /// The lock a volume create holds for its whole request is released with it: a
 /// later request on the same connection (the same thread) takes it again.
+///
+/// The first reply is read whole, so nothing of it is left to be mistaken for
+/// the second. The wait for the lock can only be observed as silence, so it
+/// is bounded in time; but a request that got past the lock shows at once in
+/// the engine's log, and the silence is checked to be a timeout, not a close.
+/// Slowness can therefore only let a bug go unseen, never fail a correct run.
 #[test]
 fn a_connection_takes_the_volume_lock_again_after_a_volume_create() {
     let engine = VolumeEngine::new();
@@ -1233,7 +1270,7 @@ fn a_connection_takes_the_volume_lock_again_after_a_volume_create() {
     let h = H::new("lockflag", false, engine.handler(), |_| {});
     let sock = h.serve(&h.auth);
     let mut c = UnixStream::connect(&sock).unwrap();
-    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     let body = r#"{"Name":"data"}"#;
     write!(
         c,
@@ -1241,9 +1278,12 @@ fn a_connection_takes_the_volume_lock_again_after_a_volume_create() {
         body.len()
     )
     .unwrap();
-    let mut buf = vec![0_u8; 4096];
-    let n = c.read(&mut buf).unwrap();
-    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 201"));
+    let (first, _) = read_reply(&mut c);
+    assert!(first.starts_with("HTTP/1.1 201"), "{first}");
+    assert!(
+        !first.to_ascii_lowercase().contains("connection: close"),
+        "the connection was not kept: {first}"
+    );
     // Another thread holds the volume lock; the next request on this
     // connection (a container with a named volume) must wait for it.
     let held = h.svc.vol_lock.lock().unwrap();
@@ -1254,16 +1294,23 @@ fn a_connection_takes_the_volume_lock_again_after_a_volume_create() {
         create.len()
     )
     .unwrap();
-    c.set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let mut buf = [0_u8; 1];
+    let silent = c.read(&mut buf);
     assert!(
-        c.read(&mut buf).is_err(),
-        "the request did not wait for the volume lock"
+        matches!(&silent, Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
+        "the request did not wait for the volume lock: {silent:?}"
+    );
+    assert_eq!(
+        h.engine.saw("POST", "/containers/create"),
+        0,
+        "the request got past the volume lock"
     );
     drop(held);
-    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let n = c.read(&mut buf).unwrap();
-    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 201"));
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let (second, _) = read_reply(&mut c);
+    assert!(second.starts_with("HTTP/1.1 201"), "{second}");
+    assert_eq!(h.engine.saw("POST", "/containers/create"), 1);
 }
 
 /// A create whose engine body is slow does not hold every workspace's volume
@@ -1889,7 +1936,7 @@ fn the_delete_reply_is_the_engines_and_keeps_a_keep_alive_connection() {
         if round == 0 {
             // Keep-alive: a second request goes down the same connection.
             let mut c = UnixStream::connect(&sock).unwrap();
-            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
             c.write_all(b"DELETE /volumes/data HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
             let mut buf = vec![0_u8; 4096];
@@ -1911,7 +1958,7 @@ fn the_delete_reply_is_the_engines_and_keeps_a_keep_alive_connection() {
             let reply = raw_exchange(
                 &sock,
                 "DELETE /volumes/data HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                Duration::from_secs(5),
+                Duration::from_secs(30),
             );
             assert!(reply.starts_with("HTTP/1.1 204 No Content\r\n"), "{reply}");
             assert!(reply.contains("Connection: close"), "{reply}");

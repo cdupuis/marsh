@@ -69,7 +69,12 @@ containers and its Docker VM at once and keeps the data.
 
 The Docker disk of a new Docker VM is 40 GiB. Change it with
 `marsh config services-disk-size SIZE` (`1g` to `4096g`); it applies to VMs
-created afterwards.
+created afterwards. Docker needs a 24 GiB pool and a 512 MiB reserve on that
+disk, so a size below `25g` is refused when marsh would create the VM, before
+any VM exists; the message gives the sizes and says to set a larger disk, and
+nothing is left to remove. A Docker VM that already exists keeps the disk it
+was made with and is never refused for the setting. (A disk just above 25g can still be too small once the filesystem has
+taken its share; the engine then says so at start.)
 
 ## Use Docker from a job or the shell
 
@@ -379,8 +384,11 @@ mounted looks gone too, so mount it first); for a folder that exists it acts
 like `marsh docker rm` run there. Once a gone folder's VM is removed, `rm`
 also forgets its setting, so `marsh docker status` and `marsh config docker ls`
 stop listing it; a gone folder that only has a setting (no VM was ever made)
-is forgotten the same way, and `rm` says there was no Docker VM to remove.
-Running it again for a folder marsh no longer has anything recorded for is
+is forgotten the same way, and `rm` says there was no Docker VM to remove and
+that it forgot the setting. `rm --project` asks for confirmation only when the
+project has a Docker VM. If the setting cannot be forgotten (the config file is
+unreadable or cannot be written), `rm` fails and says so; the VM is already
+gone, and running the same command again finishes the job. Running it again for a folder marsh no longer has anything recorded for is
 refused with a message saying so.
 
 ## Checkpoints and Branch from here

@@ -59,6 +59,7 @@ pub mod cloud_call;
 pub mod cloud_delegate;
 pub mod cloud_detached;
 pub mod cloud_fs;
+pub mod config_file;
 pub mod open_url;
 pub mod peer_review;
 pub mod process;

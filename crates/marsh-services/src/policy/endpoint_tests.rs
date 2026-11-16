@@ -328,8 +328,15 @@ fn engine_attach(
 
 /// A hijacked stream that carries nothing either way is closed at the idle
 /// limit. (`hijack-deadlines-off`: it stays open for ever.)
+///
+/// The read is bounded by the configured limit plus a generous slack, and the
+/// fake engine keeps its side open for longer than that: only the endpoint's
+/// idle deadline can end the read with a close, and without it the read times
+/// out and the test fails.
 #[test]
 fn a_silent_hijacked_stream_is_closed_at_the_idle_limit() {
+    const IDLE: Duration = Duration::from_millis(400);
+    const SLACK: Duration = Duration::from_secs(10);
     let rel = Arc::new(AtomicBool::new(false));
     let r2 = rel.clone();
     let h = H::new(
@@ -337,7 +344,7 @@ fn a_silent_hijacked_stream_is_closed_at_the_idle_limit() {
         false,
         engine_attach(
             |s, rel| {
-                let end = Instant::now() + Duration::from_secs(20);
+                let end = Instant::now() + IDLE + SLACK + Duration::from_secs(30);
                 while !rel.load(Ordering::SeqCst) && Instant::now() < end {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -345,19 +352,19 @@ fn a_silent_hijacked_stream_is_closed_at_the_idle_limit() {
             },
             rel,
         ),
-        |c| c.hijack_idle = Duration::from_millis(400),
+        |c| c.hijack_idle = IDLE,
     );
     let sock = h.serve(&h.auth);
     let mut c = attach(&h, &sock);
-    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    c.set_read_timeout(Some(IDLE + SLACK)).unwrap();
     let mut b = [0u8; 16];
     let r = c.read(&mut b);
     r2.store(true, Ordering::SeqCst);
-    assert!(matches!(r, Ok(0)), "the idle stream was not closed: {r:?}");
-    assert!(wait_for(Duration::from_secs(2), || h
-        .svc
-        .open_connections()
-        == 0));
+    assert!(
+        matches!(r, Ok(0)),
+        "the idle stream was not closed within {IDLE:?} + {SLACK:?}: {r:?}"
+    );
+    assert!(wait_for(SLACK, || h.svc.open_connections() == 0));
 }
 
 /// A client that vanishes frees its slot although the engine side is silent.
@@ -482,7 +489,7 @@ fn the_project_cap_counts_every_workspace_root() {
         .open_connections()
         == 2));
     let mut c3 = UnixStream::connect(&socks[2]).unwrap();
-    c3.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    c3.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut b = [0u8; 12];
     let n = c3.read(&mut b).unwrap_or(0);
     assert_eq!(

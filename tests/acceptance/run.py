@@ -33,6 +33,9 @@ from provenance import (candidate_arguments, candidate_environment, host_only_pa
                         stock_vm_inventory, stock_baseline, stock_cleanup_errors)
 
 
+# A cold `marsh --load` build on a busy machine exceeded 300 s once.
+PREWARM_LOAD_TIMEOUT_S = 900
+
 CHECKS = [
     "cold-parallel-prewarm",
     "prewarm-ready-and-subsecond",
@@ -777,7 +780,7 @@ class Harness(IsolatedScope):
                 completed = self.run(
                     [self.marsh, "--load", selection, "-c", "true"],
                     cwd=self.project,
-                    timeout=900,  # a cold build on a busy machine exceeded 300 s once
+                    timeout=PREWARM_LOAD_TIMEOUT_S,
                 )
                 if completed.returncode != 0:
                     raise AssertionError(f"--load {selection} failed: {completed.stderr!r}")

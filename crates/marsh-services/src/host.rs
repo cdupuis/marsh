@@ -65,6 +65,11 @@ const DROP_EVERY: u64 = 700;
 /// The workspace of a project's base tree (lanes get their own in C3).
 pub const BASE_WORKSPACE: &str = "base";
 
+/// The attempt of the daemon's own status read (`AttemptScope::status`). No
+/// job, shell or lane can have it: `AttemptScope::new` refuses it, so the agent
+/// can tell the daemon's channel from any endpoint a job reaches.
+pub const STATUS_ATTEMPT: &str = "status";
+
 /// Settings with documented defaults (`docs/design/services.md`).
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -204,6 +209,28 @@ impl AttemptScope {
     /// valid scope id (the policy's own rule: 1..=64 of `[A-Za-z0-9_.-]`, no
     /// leading dot).
     pub fn new(
+        project_root: impl Into<PathBuf>,
+        workspace: &str,
+        attempt: &str,
+    ) -> Result<Self, RelayError> {
+        if attempt == STATUS_ATTEMPT {
+            return Err(RelayError::Invalid(format!(
+                "the attempt id {attempt:?} is the daemon's own"
+            )));
+        }
+        Self::build(project_root, workspace, attempt)
+    }
+
+    /// The daemon's own status read: the base workspace, attempt
+    /// [`STATUS_ATTEMPT`].
+    ///
+    /// # Errors
+    /// As [`Self::new`] for the root.
+    pub fn status(project_root: impl Into<PathBuf>) -> Result<Self, RelayError> {
+        Self::build(project_root, BASE_WORKSPACE, STATUS_ATTEMPT)
+    }
+
+    fn build(
         project_root: impl Into<PathBuf>,
         workspace: &str,
         attempt: &str,
@@ -1700,6 +1727,16 @@ impl Relay {
         self.open(scope, ChannelKind::Docker, None, "docker".to_owned())
     }
 
+    /// The daemon's own status channel: a docker channel with the reserved
+    /// [`STATUS_ATTEMPT`] of the base workspace, the one the agent answers
+    /// `GET /_marsh/tag-events` on.
+    ///
+    /// # Errors
+    /// As [`Self::open_docker`].
+    pub fn open_status_docker(&self) -> Result<Stream, RelayError> {
+        self.open_docker(&AttemptScope::status(self.project_path())?)
+    }
+
     /// A channel to a published port of the workspace's containers. The port
     /// must be in the workspace's published-port map the agent reported; that
     /// check is the daemon's own and happens before any frame is sent.
@@ -2570,6 +2607,9 @@ mod relay_tests {
         }
     }
 
+    /// The (workspace, attempt) of every docker channel a stand-in agent was asked to open.
+    static OPENED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quirk {
         Honest,
@@ -2682,7 +2722,13 @@ mod relay_tests {
                         };
                         let _ = write_frame(&mut writer, &Outbound::Control(frame));
                     }
-                    Ok(Some(Inbound::Control(HostFrame::Open { channel, .. }))) => {
+                    Ok(Some(Inbound::Control(HostFrame::Open {
+                        channel, authority, ..
+                    }))) => {
+                        OPENED
+                            .lock()
+                            .unwrap()
+                            .push((authority.workspace.clone(), authority.attempt.clone()));
                         channels.insert(channel, EchoChannel::new());
                         write_frame(
                             &mut writer,
@@ -2880,6 +2926,38 @@ mod relay_tests {
             matches!(&error, Some(RelayError::Hostile(why)) if why.contains("test break modes")),
             "{error:?}"
         );
+    }
+
+    /// The daemon's status channel carries the base workspace and the reserved
+    /// attempt, as the agent sees it in the open frame (the one the route answers).
+    #[test]
+    fn the_status_channel_is_opened_with_the_status_authority() {
+        let relay = start(false, Limits::default());
+        let before = OPENED.lock().unwrap().len();
+        drop(relay.open_status_docker().unwrap());
+        let opened = OPENED.lock().unwrap().clone();
+        assert!(
+            opened[before..].contains(&(BASE_WORKSPACE.to_owned(), STATUS_ATTEMPT.to_owned())),
+            "{opened:?}"
+        );
+        let scope = AttemptScope::status("/p").unwrap();
+        let authority = scope.authority("docker".to_owned());
+        assert_eq!(
+            (authority.workspace.as_str(), authority.attempt.as_str()),
+            ("base", "status")
+        );
+    }
+
+    /// The attempt of the daemon's status read belongs to it alone: no job,
+    /// shell or lane can be given it, so the agent can tell that channel apart.
+    #[test]
+    fn the_status_attempt_cannot_be_given_to_anything_else() {
+        assert!(AttemptScope::new("/p", "base", STATUS_ATTEMPT).is_err());
+        assert!(AttemptScope::new("/p", "lane-1", STATUS_ATTEMPT).is_err());
+        let scope = AttemptScope::status("/p").unwrap();
+        assert_eq!(scope.workspace(), BASE_WORKSPACE);
+        assert!(AttemptScope::status("relative").is_err());
+        assert!(AttemptScope::new("/p", "base", "status2").is_ok());
     }
 
     #[test]

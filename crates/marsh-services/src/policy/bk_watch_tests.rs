@@ -1147,3 +1147,98 @@ fn eviction_takes_duplicates_then_unable_to_check_then_the_oldest() {
     w.end(&c, B);
     assert_eq!((w.unchecked(), w.reports().len()), (0, 64));
 }
+
+/// The daemon's status read (the base workspace, attempt `status`) gets the
+/// agent's own answer on the filtered endpoint: the events, in the shape the
+/// daemon shows. Nothing else does: not a lane, not a base job, not a base
+/// workspace's substituted socket (which has its job's attempt), and the engine
+/// is never asked.
+#[test]
+fn only_the_daemons_status_read_gets_the_tag_events() {
+    let w = World::new("bk-route");
+    let as_attempt = |workspace: &str, attempt: &str| {
+        w.h.serve(&Authority {
+            workspace: workspace.into(),
+            attempt: attempt.into(),
+            ..w.h.auth.clone()
+        })
+    };
+    let (status_read, b) = (as_attempt("base", "status"), lane(&w.h, B));
+    let (status, body) = call(&status_read, "GET", "/_marsh/tag-events", None);
+    assert_eq!((status, body.as_str()), (200, r#"{"events":[]}"#));
+    let c = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.end(&c, B);
+    let (status, body) = call(&status_read, "GET", "/_marsh/tag-events", None);
+    assert_eq!(status, 200);
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let events = answer["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["tag"], "base-app:1");
+    assert_eq!(events[0]["workspace"], B);
+    assert_eq!(events[0]["kind"], "changed");
+    assert_eq!(events[0]["owner"], A);
+    assert_eq!(events[0]["previous"], "sha256:a1");
+    assert_eq!(events[0]["current"], "sha256:lane");
+    assert_eq!(events[0]["ambiguous"], false);
+    assert_eq!(events[0]["overlapped"], false);
+    assert!(
+        events[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("docker tag sha256:a1 base-app:1")
+    );
+    for (who, sock) in [
+        ("a lane's job", b.clone()),
+        ("a base job", as_attempt("base", "job1")),
+        ("a base shell", as_attempt("base", "shell")),
+        ("a lane's status-named attempt", as_attempt(B, "status")),
+    ] {
+        let (status, body) = call(&sock, "GET", "/_marsh/tag-events", None);
+        assert_eq!(status, 403, "{who} read the events: {body}");
+    }
+    // The ambiguity flag travels too.
+    let a = lane(&w.h, A);
+    let c = open_stream(&b, "/grpc");
+    assert_eq!(tag_as(&a, "src", "base-app"), 201);
+    w.end(&c, B);
+    let (_, body) = call(&status_read, "GET", "/_marsh/tag-events", None);
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        answer["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["ambiguous"] == true && e["current"] == "sha256:src"),
+        "{body}"
+    );
+    // So does the overlap flag.
+    let c3 = lane(&w.h, "lane-c");
+    let cc = open_stream(&c3, "/grpc");
+    let c = open_stream(&b, "/grpc");
+    w.build("postgres:16", "sha256:lane");
+    w.end(&c, B);
+    w.end(&cc, "lane-c");
+    let (_, body) = call(&status_read, "GET", "/_marsh/tag-events", None);
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        answer["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["tag"] == "postgres:16" && e["overlapped"] == true),
+        "{body}"
+    );
+    // The route takes no parameters, nor does it answer other methods.
+    for (method, target) in [
+        ("GET", "/_marsh/tag-events?since=1"),
+        ("POST", "/_marsh/tag-events"),
+    ] {
+        let (status, _) = call(&status_read, method, target, None);
+        assert!(
+            status == 403 || status == 405 || status == 400,
+            "{method} {target} answered {status}"
+        );
+    }
+    assert_eq!(w.h.engine.saw("GET", "/_marsh"), 0);
+}

@@ -53,6 +53,9 @@ pub enum Kind {
     Build,
     Session,
     Grpc,
+    /// Answered by the agent itself (not the engine): the image tag events of
+    /// `BuildKit` streams, for the base workspace's status read.
+    TagEvents,
     NetworkList,
     NetworkInspect,
     NetworkCreate,
@@ -103,6 +106,7 @@ const ROUTES: &[(&str, &str, Kind)] = &[
     ("GET", "/version", Kind::Version),
     ("GET", "/info", Kind::Info),
     ("GET", "/events", Kind::Events),
+    ("GET", "/_marsh/tag-events", Kind::TagEvents),
     ("GET", "/containers/json", Kind::ContainerList),
     ("POST", "/containers/create", Kind::ContainerCreate),
     ("POST", "/containers/prune", Kind::ContainerPrune),
@@ -351,6 +355,7 @@ mod tests {
             ),
             ("POST", "/session", Kind::Session),
             ("HEAD", "/_ping", Kind::Ping),
+            ("GET", "/_marsh/tag-events", Kind::TagEvents),
         ] {
             assert_eq!(route(m, t), Ok(k), "{m} {t}");
         }

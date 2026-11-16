@@ -1045,6 +1045,15 @@ fn write_services_lines(
                         .and_then(Value::as_str)
                         .map_or_else(String::new, |reason| format!("  ({reason})")),
                 )?;
+                let changed = project["image_tag_events"].as_array().map_or(0, |events| {
+                    events.iter().filter(|e| e["kind"] == "changed").count()
+                });
+                if changed > 0 {
+                    writeln!(
+                        stdout,
+                        "  {changed} image tag(s) of another workspace may have been moved by a build; `marsh docker status --json` (image_tag_events) says which and how to put each back"
+                    )?;
+                }
                 // Only a VM can be removed: a gone folder with none has nothing to suggest.
                 if project["folder_missing"].as_bool().unwrap_or(false) && project["vm"].is_string()
                 {
@@ -1941,6 +1950,33 @@ mod tests {
         assert!(!out.contains("rm --project /gone/no-vm"), "{out}");
         assert!(!out.contains("rm --project /here"), "{out}");
         assert_eq!(out.matches("the folder is gone").count(), 1, "{out}");
+    }
+
+    /// `status` says in one line that image tags were reported moved, with a count and
+    /// no text from the VM.
+    #[test]
+    fn status_notes_reported_image_tag_changes() {
+        let document = json!({
+            "enabled_projects": [],
+            "projects": [
+                {"root": "/p/a", "state": "ready", "vm": "v",
+                 "image_tag_events": [
+                    {"kind": "changed", "tag": "x\u{1b}[31m", "detail": "evil"},
+                    {"kind": "unchecked", "detail": "d"}]},
+                {"root": "/p/b", "state": "ready", "vm": "w"},
+            ],
+        });
+        let request = marsh_daemon::ServicesRequest::Status {
+            root: "/p/a".into(),
+        };
+        let mut out = Vec::new();
+        write_services(&mut out, &request, &document).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out.matches("image tag(s)").count(), 1, "{out}");
+        assert!(
+            out.contains("1 image tag(s)") && !out.contains("evil"),
+            "{out}"
+        );
     }
 
     /// `rm` says what it did: a VM removed, none to remove, and a setting

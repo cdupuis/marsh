@@ -2305,6 +2305,9 @@ fn handle_request(scope: &Arc<Scope>, conn: &mut Conn, head: &Head) -> io::Resul
     }
     // Not a volume create or delete after all: nothing here holds the lock.
     drop(volume_op.take());
+    if matches!(adm.post, Post::TagEvents) {
+        return Ok(tag_events_reply(svc, conn, head));
+    }
     let result = forward(scope, conn, head, &mut adm, m.kind);
     match result {
         Ok(keep) => Ok(keep),
@@ -2572,6 +2575,27 @@ fn forward(
     }
 
     respond(scope, conn, head, adm, kind, &mut upc, &resp)
+}
+
+/// `GET /_marsh/tag-events`: the agent's own answer, the events of `bk_watch`.
+fn tag_events_reply(svc: &Services, conn: &mut Conn, head: &Head) -> bool {
+    let events: Vec<serde_json::Value> = svc
+        .tag_events()
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({"at": e.at, "workspace": e.workspace, "kind": e.kind.word(),
+                "detail": e.detail, "tag": e.tag, "owner": e.owner, "previous": e.previous,
+                "current": e.current, "ambiguous": e.ambiguous, "overlapped": e.overlapped})
+        })
+        .collect();
+    let body = serde_json::json!({ "events": events }).to_string();
+    let close = head.close;
+    let reply = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n{body}",
+        body.len(),
+        if close { "Connection: close\r\n" } else { "" }
+    );
+    conn.stream.write_all(reply.as_bytes()).is_ok() && !close
 }
 
 /// The request failed before the engine answered: give back what admission took

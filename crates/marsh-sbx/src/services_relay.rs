@@ -31,6 +31,7 @@ pub use marsh_services::host::{
     AttemptScope, BASE_WORKSPACE, CaptureReply, DaemonBudget, Limits, PortsSubscription, Relay,
     RelayError, SnapshotEntry, Stats, Stream,
 };
+pub use marsh_services::policy::endpoint::TagEventKind;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::io::{BufReader, Read};

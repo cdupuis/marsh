@@ -69,6 +69,8 @@ pub enum ReqBody {
 #[derive(Debug, Clone)]
 pub enum Post {
     None,
+    /// The agent answers itself: `GET /_marsh/tag-events`.
+    TagEvents,
     ContainerCreate {
         name: Option<String>,
         /// Pins this create made.
@@ -654,6 +656,20 @@ pub fn admit(
         Kind::Ping => {
             q.only(&[])?;
             a.path = mk_path(m, &["_ping"]);
+        }
+        Kind::TagEvents => {
+            q.only(&[])?;
+            // Only the daemon's own status read (the host attests the authority,
+            // and refuses the attempt to every job, shell and lane).
+            let who = env.authority();
+            if who.workspace != crate::host::BASE_WORKSPACE
+                || who.attempt != crate::host::STATUS_ATTEMPT
+            {
+                return Err(Refusal::forbid(
+                    "image tag events are for the daemon's status read only",
+                ));
+            }
+            a.post = Post::TagEvents;
         }
         Kind::Version | Kind::Info => {
             q.only(&[])?;

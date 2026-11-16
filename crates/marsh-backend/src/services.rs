@@ -185,7 +185,7 @@ type ForwardKey = (PathBuf, String);
 /// The forwards one owner made: port to (`job` or `shell`, what happened).
 type Forwards = BTreeMap<u16, (String, marsh_worker::PortState)>;
 /// When a project's containers and ports were last read, and what they were.
-type ViewCache = (Instant, Vec<Value>, Vec<Value>);
+type ViewCache = (Instant, super::services_view::View);
 
 #[derive(Default)]
 pub(crate) struct Services {
@@ -206,6 +206,12 @@ pub(crate) struct Services {
     forwards: Mutex<BTreeMap<ForwardKey, Forwards>>,
     /// The last containers-and-ports read of each project, for a second.
     view_cache: Mutex<BTreeMap<PathBuf, ViewCache>>,
+    /// Tests: the relay the status read uses instead of a project's own.
+    #[cfg(test)]
+    test_relay: Mutex<Option<Arc<marsh_sbx::services_relay::Relay>>>,
+    /// Tests: what a project's status probe found, instead of probing a VM.
+    #[cfg(test)]
+    test_parts: Mutex<Option<ProjectParts>>,
     /// Snapshots for checkpoints (C12).
     pub snapshots: super::services_snapshots::Snapshots,
     /// The attempts whose services containers are still to be reaped (E4).
@@ -1026,6 +1032,22 @@ impl StockDaemonBackend {
 
     #[allow(clippy::too_many_lines)] // One entry of `services status`, field by field.
     fn services_project_json(&self, root: &Path, settings: &Settings, refresh: bool) -> Value {
+        let parts = self.probe_project(root, refresh);
+        self.project_json_with(root, settings, parts)
+    }
+
+    /// What is found out about a project: its state, VM, holders and exposure.
+    fn probe_project(&self, root: &Path, refresh: bool) -> ProjectParts {
+        #[cfg(test)]
+        if let Some(parts) = self
+            .services
+            .test_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return parts;
+        }
         let (holders, idle_left, starting, failure) = self.services.with_project(root, |project| {
             (
                 project.holders.keys().cloned().collect::<Vec<_>>(),
@@ -1095,13 +1117,48 @@ impl StockDaemonBackend {
                     Err(error) => json!({ "error": format!("marsh: {error}") }),
                 },
             );
-        // Display only (E2, N3's shape): the base workspace's containers and
-        // published ports, read through the same filter a job's requests use.
-        let (containers, ports, view_error) = if state == "ready" {
-            self.services_containers(root)
-        } else {
-            (Vec::new(), Vec::new(), None)
-        };
+        ProjectParts {
+            state,
+            reason,
+            cause,
+            vm,
+            holders,
+            idle_left,
+            exposure,
+            view: super::services_view::View::default(),
+            view_error: None,
+        }
+    }
+
+    /// The document of a project whose state is known: a ready one also gets the
+    /// engine view (`services_containers`), display only (E2, N3's shape): the base
+    /// workspace's containers, published ports and image tag events, read through
+    /// the same filter a job's requests use.
+    fn project_json_with(
+        &self,
+        root: &Path,
+        settings: &Settings,
+        mut parts: ProjectParts,
+    ) -> Value {
+        if parts.state == "ready" {
+            (parts.view, parts.view_error) = self.services_containers(root);
+        }
+        self.project_document(root, settings, parts)
+    }
+
+    /// A project's status document, from what was found out about it.
+    fn project_document(&self, root: &Path, settings: &Settings, parts: ProjectParts) -> Value {
+        let ProjectParts {
+            state,
+            reason,
+            cause,
+            vm,
+            holders,
+            idle_left,
+            exposure,
+            view,
+            view_error,
+        } = parts;
         let folder_missing = matches!(
             fs::symlink_metadata(root),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -1120,8 +1177,8 @@ impl StockDaemonBackend {
                 .map(generation_json),
             "holders": holders,
             "idle_seconds_remaining": idle_left.map(|left| left.as_secs()),
-            "containers": containers,
-            "ports": ports,
+            "containers": view.containers,
+            "ports": view.ports,
             "internet": self.services_internet_json(root, vm.as_ref()),
             "credential_exposure": exposure,
             "relay": self.relay_json(root),
@@ -1138,9 +1195,7 @@ impl StockDaemonBackend {
         if state == "off" {
             document["vm"] = Value::Null;
         }
-        if let Some(reason) = view_error {
-            document["containers_error"] = json!(reason);
-        }
+        add_view_notes(&mut document, &view, view_error);
         // What the job and shell forwards did (collisions, failures), by owner.
         let forwards = self.forwards_json(root);
         if !forwards.is_empty() {
@@ -1174,32 +1229,53 @@ impl StockDaemonBackend {
 
     /// The base workspace's containers and ports from the live relay, cached
     /// for a second so a polling client does not open a channel per call.
-    fn services_containers(&self, root: &Path) -> (Vec<Value>, Vec<Value>, Option<String>) {
-        let Some(relays) = &self.services.relays else {
-            return (Vec::new(), Vec::new(), None);
-        };
-        let Ok(entry) = relays.get(root) else {
-            return (Vec::new(), Vec::new(), None);
-        };
+    fn services_containers(&self, root: &Path) -> (super::services_view::View, Option<String>) {
+        self.cached_view(root, || {
+            // The one place a relay is read, whichever relay it is.
+            let read = |relay: &marsh_sbx::services_relay::Relay| super::services_view::read(relay);
+            #[cfg(test)]
+            if let Some(relay) = self
+                .services
+                .test_relay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return Some(read(&relay));
+            }
+            let entry = self.services.relays.as_ref()?.get(root).ok()?;
+            Some(read(entry.relay()))
+        })
+    }
+
+    /// The view `read` gives, kept for a second so a polling client does not
+    /// open a channel per call. Only a read that happened is kept: no relay to
+    /// read (`None`) gives an empty view that is not.
+    fn cached_view(
+        &self,
+        root: &Path,
+        read: impl FnOnce() -> Option<Result<super::services_view::View, String>>,
+    ) -> (super::services_view::View, Option<String>) {
         let mut cache = self
             .services
             .view_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((at, containers, ports)) = cache.get(root)
+        if let Some((at, view)) = cache.get(root)
             && at.elapsed() < Duration::from_secs(1)
         {
-            return (containers.clone(), ports.clone(), None);
+            return (view.clone(), None);
         }
-        match super::services_view::read(entry.relay()) {
-            Ok((containers, ports)) => {
-                cache.insert(
-                    root.to_owned(),
-                    (Instant::now(), containers.clone(), ports.clone()),
-                );
-                (containers, ports, None)
+        match read() {
+            Some(Ok(view)) => {
+                cache.insert(root.to_owned(), (Instant::now(), view.clone()));
+                (view, None)
             }
-            Err(reason) => (Vec::new(), Vec::new(), Some(format!("marsh: {reason}"))),
+            Some(Err(reason)) => (
+                super::services_view::View::default(),
+                Some(format!("marsh: {reason}")),
+            ),
+            None => (super::services_view::View::default(), None),
         }
     }
 
@@ -1706,6 +1782,19 @@ fn effective_internet(on: bool, governance: &Governance, gate: Option<&Gate>) ->
     }
 }
 
+/// What `services_project_json` found out about a project, for its document.
+struct ProjectParts {
+    state: &'static str,
+    reason: Option<String>,
+    cause: Option<Unavailable>,
+    vm: Option<ServicesVmView>,
+    holders: Vec<String>,
+    idle_left: Option<Duration>,
+    exposure: Option<Value>,
+    view: super::services_view::View,
+    view_error: Option<String>,
+}
+
 /// Why a project's services are unavailable, as `summary` says it.
 #[derive(Clone, Copy, Debug)]
 enum Unavailable {
@@ -1715,6 +1804,18 @@ enum Unavailable {
     SetupChanged,
     Quarantined,
     LostContact,
+}
+
+/// What the engine view adds to a project's status besides `containers` and
+/// `ports`: why they could not be read, and the image tags a `BuildKit` build
+/// changed that it may not (what the agent did about each), only when there are any.
+fn add_view_notes(document: &mut Value, view: &super::services_view::View, error: Option<String>) {
+    if let Some(reason) = error {
+        document["containers_error"] = json!(reason);
+    }
+    if !view.tag_events.is_empty() {
+        document["image_tag_events"] = json!(view.tag_events);
+    }
 }
 
 impl Unavailable {
@@ -1820,6 +1921,166 @@ fn keep_quiesced<P>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ready project's status gets the engine view (here the cached one, which is
+    /// what the live read leaves), events included; one that is not ready does not
+    /// get it; a ready one with nothing to read gets an empty view and no error.
+    #[test]
+    fn a_ready_project_gets_the_view_and_others_do_not() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let settings = backend.services_settings().unwrap();
+        let root = fs::canonicalize(home.path()).unwrap();
+        let parts = |state| ProjectParts {
+            state,
+            reason: None,
+            cause: None,
+            vm: None,
+            holders: Vec::new(),
+            idle_left: None,
+            exposure: None,
+            view: super::super::services_view::View::default(),
+            view_error: None,
+        };
+        let nothing = root.join("nothing-to-read");
+        let empty = backend.project_json_with(&nothing, &settings, parts("ready"));
+        assert_eq!(empty["containers"], json!([]));
+        assert!(empty.get("image_tag_events").is_none(), "{empty}");
+        let view = super::super::services_view::View {
+            containers: vec![json!({"name": "db"})],
+            tag_events: vec![json!({"at": 1, "kind": "changed"})],
+            ..Default::default()
+        };
+        backend.cached_view(&root, || Some(Ok(view.clone())));
+        let ready = backend.project_json_with(&root, &settings, parts("ready"));
+        assert_eq!(ready["image_tag_events"], json!(view.tag_events));
+        assert_eq!(ready["containers"], json!(view.containers));
+        let off = backend.project_json_with(&root, &settings, parts("off"));
+        assert!(off.get("image_tag_events").is_none(), "{off}");
+    }
+
+    /// The status read is kept for a second with its events, asked for once in
+    /// that time, and a failure is reported and not kept.
+    #[test]
+    fn the_view_cache_keeps_the_events_for_a_second() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let root = fs::canonicalize(home.path()).unwrap();
+        let view = super::super::services_view::View {
+            tag_events: vec![json!({"at": 1, "kind": "restored"})],
+            ..Default::default()
+        };
+        let reads = std::cell::Cell::new(0);
+        let read = |result: Result<_, String>| {
+            reads.set(reads.get() + 1);
+            result
+        };
+        let (first, error) = backend.cached_view(&root, || Some(read(Ok(view.clone()))));
+        assert_eq!((first.tag_events.len(), error), (1, None));
+        let (second, _) = backend.cached_view(&root, || Some(read(Err("asked again".into()))));
+        assert_eq!(second.tag_events, view.tag_events);
+        assert_eq!(reads.get(), 1);
+        let other = root.join("other");
+        let (none, error) = backend.cached_view(&other, || Some(read(Err("down".into()))));
+        assert_eq!(none.tag_events.len(), 0);
+        assert_eq!(error.as_deref(), Some("marsh: down"));
+        let (again, error) = backend.cached_view(&other, || Some(read(Ok(view.clone()))));
+        assert_eq!((again.tag_events.len(), error), (1, None));
+        assert_eq!(reads.get(), 3);
+        // After a second the view is read again (events do not go stale).
+        std::thread::sleep(Duration::from_millis(1100));
+        let (fresh, _) = backend.cached_view(&other, || {
+            Some(read(Ok(super::super::services_view::View::default())))
+        });
+        assert_eq!(fresh.tag_events.len(), 0);
+        assert_eq!(reads.get(), 4);
+    }
+
+    /// With no relay to read, the view is empty and is not kept: a read that
+    /// can happen a moment later is not hidden behind a cached empty one.
+    #[test]
+    fn an_empty_view_without_a_relay_is_not_cached() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let root = fs::canonicalize(home.path()).unwrap();
+        for _ in 0..2 {
+            let (view, error) = backend.cached_view(&root, || None);
+            assert_eq!((view.tag_events.len(), error), (0, None));
+        }
+        let view = super::super::services_view::View {
+            tag_events: vec![json!({"at": 1, "kind": "changed"})],
+            ..Default::default()
+        };
+        let (read, _) = backend.cached_view(&root, || Some(Ok(view.clone())));
+        assert_eq!(read.tag_events, view.tag_events);
+    }
+
+    /// The production status function on a ready project, with a real relay behind
+    /// a stand-in agent that answers the tag events on the status authority and a
+    /// cold cache: its final document carries them, and the containers.
+    #[test]
+    fn the_status_of_a_ready_project_carries_the_events_the_agent_gives() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let settings = backend.services_settings().unwrap();
+        let root = fs::canonicalize(home.path()).unwrap();
+        *backend.services.test_relay.lock().unwrap() = Some(Arc::new(
+            super::super::services_view::tests::relay_with_agent(),
+        ));
+        *backend.services.test_parts.lock().unwrap() = Some(ProjectParts {
+            state: "ready",
+            reason: None,
+            cause: None,
+            vm: None,
+            holders: Vec::new(),
+            idle_left: None,
+            exposure: None,
+            view: super::super::services_view::View::default(),
+            view_error: None,
+        });
+        let document = backend.services_project_json(&root, &settings, false);
+        assert_eq!(document["state"], "ready");
+        assert_eq!(document["containers"], json!([]));
+        let events = document["image_tag_events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{document}");
+        assert_eq!(events[0]["tag"], "t:1");
+    }
+
+    /// `marsh docker status --json`: a ready project's document carries the
+    /// engine view's image tag events (and nothing of the kind without any), and
+    /// the view's containers, through the real document builder.
+    #[test]
+    fn a_ready_projects_document_carries_the_views_image_tag_events() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let settings = backend.services_settings().unwrap();
+        let root = fs::canonicalize(home.path()).unwrap();
+        let parts = |view: super::super::services_view::View| ProjectParts {
+            state: "ready",
+            reason: None,
+            cause: None,
+            vm: None,
+            holders: Vec::new(),
+            idle_left: None,
+            exposure: None,
+            view,
+            view_error: None,
+        };
+        let mut view = super::super::services_view::View {
+            containers: vec![
+                json!({"name": "app-db-1", "service": "db", "state": "running", "health": null}),
+            ],
+            ..Default::default()
+        };
+        let quiet = backend.project_document(&root, &settings, parts(view.clone()));
+        assert!(quiet.get("image_tag_events").is_none(), "{quiet}");
+        view.tag_events = vec![json!({"at": 9, "workspace": "lane-b", "tag": "base-app:1",
+                                      "kind": "restored", "detail": "put back"})];
+        let document = backend.project_document(&root, &settings, parts(view.clone()));
+        assert_eq!(document["image_tag_events"], json!(view.tag_events));
+        assert_eq!(document["containers"], json!(view.containers));
+        assert_eq!(document["state"], "ready");
+    }
 
     /// The daemon-stop teardown defers a VM whose worker is not gone, and only
     /// that one; the decision is driven here with closures because a stuck

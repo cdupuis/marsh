@@ -1643,6 +1643,7 @@ dependencies = [
  "marsh-provenance",
  "marsh-runtime",
  "marsh-sbx",
+ "marsh-services",
  "marsh-worker",
  "nix",
  "rustix",

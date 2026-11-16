@@ -2585,7 +2585,7 @@ fn tag_events_reply(svc: &Services, conn: &mut Conn, head: &Head) -> bool {
         .map(|e| {
             serde_json::json!({"at": e.at, "workspace": e.workspace, "kind": e.kind.word(),
                 "detail": e.detail, "tag": e.tag, "owner": e.owner, "previous": e.previous,
-                "current": e.current, "ambiguous": e.ambiguous})
+                "current": e.current, "ambiguous": e.ambiguous, "overlapped": e.overlapped})
         })
         .collect();
     let body = serde_json::json!({ "events": events }).to_string();

@@ -1056,6 +1056,7 @@ fn only_the_daemons_status_read_gets_the_tag_events() {
     assert_eq!(events[0]["previous"], "sha256:a1");
     assert_eq!(events[0]["current"], "sha256:lane");
     assert_eq!(events[0]["ambiguous"], false);
+    assert_eq!(events[0]["overlapped"], false);
     assert!(
         events[0]["detail"]
             .as_str()
@@ -1084,6 +1085,23 @@ fn only_the_daemons_status_read_gets_the_tag_events() {
             .unwrap()
             .iter()
             .any(|e| e["ambiguous"] == true && e["current"] == "sha256:src"),
+        "{body}"
+    );
+    // So does the overlap flag.
+    let c3 = lane(&w.h, "lane-c");
+    let cc = open_stream(&c3, "/grpc");
+    let c = open_stream(&b, "/grpc");
+    w.build("postgres:16", "sha256:lane");
+    w.end(&c, B);
+    w.end(&cc, "lane-c");
+    let (_, body) = call(&status_read, "GET", "/_marsh/tag-events", None);
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        answer["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["tag"] == "postgres:16" && e["overlapped"] == true),
         "{body}"
     );
     // The route takes no parameters, nor does it answer other methods.

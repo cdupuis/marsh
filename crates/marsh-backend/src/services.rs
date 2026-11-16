@@ -1109,12 +1109,11 @@ impl StockDaemonBackend {
                 view: super::services_view::View::default(),
                 view_error: None,
             },
-            || self.services_containers(root),
         )
     }
 
     /// The document of a project whose state is known: a ready one also gets the
-    /// engine view (`read_view`), display only (E2, N3's shape): the base
+    /// engine view (`services_containers`), display only (E2, N3's shape): the base
     /// workspace's containers, published ports and image tag events, read through
     /// the same filter a job's requests use.
     fn project_json_with(
@@ -1122,10 +1121,9 @@ impl StockDaemonBackend {
         root: &Path,
         settings: &Settings,
         mut parts: ProjectParts,
-        read_view: impl FnOnce() -> (super::services_view::View, Option<String>),
     ) -> Value {
         if parts.state == "ready" {
-            (parts.view, parts.view_error) = read_view();
+            (parts.view, parts.view_error) = self.services_containers(root);
         }
         self.project_document(root, settings, parts)
     }
@@ -1214,14 +1212,16 @@ impl StockDaemonBackend {
     /// The base workspace's containers and ports from the live relay, cached
     /// for a second so a polling client does not open a channel per call.
     fn services_containers(&self, root: &Path) -> (super::services_view::View, Option<String>) {
-        let none = super::services_view::View::default;
-        let Some(relays) = &self.services.relays else {
-            return (none(), None);
-        };
-        let Ok(entry) = relays.get(root) else {
-            return (none(), None);
-        };
-        self.cached_view(root, || super::services_view::read(entry.relay()))
+        self.cached_view(root, || {
+            let none = super::services_view::View::default;
+            let Some(relays) = &self.services.relays else {
+                return Ok(none());
+            };
+            let Ok(entry) = relays.get(root) else {
+                return Ok(none());
+            };
+            super::services_view::read(entry.relay())
+        })
     }
 
     /// The view `read` gives, kept for a second so a polling client does not
@@ -1896,10 +1896,11 @@ fn keep_quiesced<P>(
 mod tests {
     use super::*;
 
-    /// A ready project's status gets the engine view the reader gives, events
-    /// included; one that is not ready does not ask for it.
+    /// A ready project's status gets the engine view (here the cached one, which is
+    /// what the live read leaves), events included; one that is not ready does not
+    /// get it; a ready one with nothing to read gets an empty view and no error.
     #[test]
-    fn a_ready_project_gets_the_view_and_others_do_not_ask() {
+    fn a_ready_project_gets_the_view_and_others_do_not() {
         let home = tempfile::tempdir().unwrap();
         let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
         let settings = backend.services_settings().unwrap();
@@ -1915,22 +1916,21 @@ mod tests {
             view: super::super::services_view::View::default(),
             view_error: None,
         };
+        let nothing = root.join("nothing-to-read");
+        let empty = backend.project_json_with(&nothing, &settings, parts("ready"));
+        assert_eq!(empty["containers"], json!([]));
+        assert!(empty.get("image_tag_events").is_none(), "{empty}");
         let view = super::super::services_view::View {
             containers: vec![json!({"name": "db"})],
             tag_events: vec![json!({"at": 1, "kind": "changed"})],
             ..Default::default()
         };
-        let asked = std::cell::Cell::new(0);
-        let read = || {
-            asked.set(asked.get() + 1);
-            (view.clone(), Some("marsh: late".to_owned()))
-        };
-        let ready = backend.project_json_with(&root, &settings, parts("ready"), read);
+        backend.cached_view(&root, || Ok(view.clone()));
+        let ready = backend.project_json_with(&root, &settings, parts("ready"));
         assert_eq!(ready["image_tag_events"], json!(view.tag_events));
         assert_eq!(ready["containers"], json!(view.containers));
-        assert_eq!(ready["containers_error"], "marsh: late");
-        let off = backend.project_json_with(&root, &settings, parts("off"), read);
-        assert_eq!((asked.get(), off.get("image_tag_events")), (1, None));
+        let off = backend.project_json_with(&root, &settings, parts("off"));
+        assert!(off.get("image_tag_events").is_none(), "{off}");
     }
 
     /// The status read is kept for a second with its events, asked for once in

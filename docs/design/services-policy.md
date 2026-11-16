@@ -502,7 +502,7 @@ has is checked.
      to give to any job, shell or lane (`AttemptScope::new` rejects it;
      `AttemptScope::status` is the daemon's). The daemon makes every string plain
      (control, direction and format characters dropped) and bounded (at most 64
-     events, kinds `changed`, `unchecked`). This is deliberately not a new relay frame:
+     events, kinds `changed`, `unchecked`; each carries `ambiguous` and `overlapped`). This is deliberately not a new relay frame:
      a frame or `Settings` field the peer does not know is a protocol violation on both
      sides (every message type is a closed set); an old agent refuses the unknown route
      (no events) and an old host never asks. "Unable to check" is kept once per

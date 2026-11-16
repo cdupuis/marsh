@@ -351,6 +351,7 @@ fn parse_tag_events(body: &[u8]) -> Vec<Value> {
                 "previous": text("previous", 128)?,
                 "current": text("current", 128),
                 "ambiguous": event.get("ambiguous").and_then(Value::as_bool).unwrap_or(false),
+                "overlapped": event.get("overlapped").and_then(Value::as_bool).unwrap_or(false),
             }))
         })
         .take(MAX_TAG_EVENTS)
@@ -393,7 +394,7 @@ mod tests {
         let ev = |at: u64, kind: &str| {
             json!({"at": at, "workspace": "lane-b", "tag": "t:1", "kind": kind, "detail": "x",
                    "owner": "lane-a", "previous": "sha256:a", "current": "sha256:b",
-                   "ambiguous": true})
+                   "ambiguous": true, "overlapped": true})
         };
         let many: Vec<Value> = (0..100).map(|at| ev(at, "changed")).collect();
         let body = json!({"events": many}).to_string();
@@ -406,7 +407,7 @@ mod tests {
         }
         let body = json!({"events": [
             {"at": 1, "workspace": "w\u{1b}[31m", "tag": "t:1", "kind": "changed", "detail": "a\nb",
-             "owner": null, "previous": "p", "current": null, "ambiguous": false},
+             "owner": null, "previous": "p", "current": null, "ambiguous": false, "overlapped": false},
             {"at": 2, "workspace": "w", "tag": "t:1", "kind": "restored", "detail": "", "previous": "p"},
             {"at": "x", "workspace": "w", "tag": "t:1", "kind": "changed", "detail": "", "previous": "p"},
             {"at": 3, "workspace": "w", "tag": "t:1", "kind": "unchecked", "previous": "p"}
@@ -417,7 +418,7 @@ mod tests {
             vec![
                 json!({"at": 1, "workspace": "w[31m", "tag": "t:1", "kind": "changed",
                         "detail": "ab", "owner": null, "previous": "p", "current": null,
-                        "ambiguous": false})
+                        "ambiguous": false, "overlapped": false})
             ]
         );
         assert_eq!(parse_tag_events(b"not json").len(), 0);

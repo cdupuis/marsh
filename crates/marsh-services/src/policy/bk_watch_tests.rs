@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use super::super::TagEventKind;
+use super::super::{Scope, TagEventKind};
 use super::*;
 
 #[derive(Default)]
@@ -18,6 +18,9 @@ struct Store {
     tag_posts: Vec<String>,
     deletes: usize,
     fail_list: bool,
+    lists: usize,
+    /// Put a tag back to an image right after the second list is answered.
+    heal: Option<(String, String)>,
 }
 
 type Shared = Arc<Mutex<Store>>;
@@ -91,6 +94,12 @@ fn bk_engine(st: Shared) -> Handler {
                 } else {
                     let all: Vec<String> = st.images.iter().map(|i| st.entry(i)).collect();
                     answer(s, 200, &format!("[{}]", all.join(",")));
+                    st.lists += 1;
+                    if st.lists == 2
+                        && let Some((tag, id)) = st.heal.take()
+                    {
+                        st.tags.insert(tag, id);
+                    }
                 }
             }
             ("GET", p) if p.starts_with("/images/") && p.ends_with("/json") => {
@@ -543,4 +552,221 @@ fn the_restore_holds_the_tag_lock_against_a_claim() {
     assert_eq!(receive.recv_timeout(Duration::from_secs(5)), Ok(403));
     w.settled(B);
     assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:a1"));
+}
+
+/// Two streams of one lane: the first one's end restores; the second's build
+/// moves the tag again afterwards, and its end restores that too (a restore is
+/// not a REST request and hides nothing).
+#[test]
+fn a_second_overwrite_after_a_restore_is_restored_too() {
+    let w = World::new("bk-second");
+    let b = lane(&w.h, B);
+    let c1 = open_stream(&b, "/session");
+    let c2 = open_stream(&b, "/session");
+    w.build("base-app:1", "sha256:lane");
+    w.close(&c1);
+    assert!(wait_for(Duration::from_secs(5), || w.events().len() == 1));
+    assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:a1"));
+    w.build("base-app:1", "sha256:lane2");
+    w.end(&c2, B);
+    assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:a1"));
+    assert_eq!(w.events().len(), 2);
+}
+
+/// A stream that begins after another's overwrite does not take the overwritten
+/// tag for the owner's: it restores the image the owner had, whichever stream
+/// ends first, and the first stream's end finds nothing left to do.
+#[test]
+fn a_stream_that_began_after_an_overwrite_restores_the_legitimate_image() {
+    let w = World::new("bk-late");
+    let (b, c3) = (lane(&w.h, B), lane(&w.h, "lane-c"));
+    let cb = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    let cc = open_stream(&c3, "/grpc");
+    w.build("base-app:1", "sha256:lane2");
+    w.end(&cc, "lane-c");
+    assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:a1"));
+    w.end(&cb, B);
+    assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:a1"));
+    assert_eq!(w.events().len(), 1);
+
+    // The other order: the first stream ends first and restores.
+    let w = World::new("bk-late2");
+    let (b, c3) = (lane(&w.h, B), lane(&w.h, "lane-c"));
+    let cb = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    let cc = open_stream(&c3, "/grpc");
+    w.end(&cb, B);
+    assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:a1"));
+    w.end(&cc, "lane-c");
+    assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:a1"));
+}
+
+/// A lane's many REST requests during its build (more than any log could hold)
+/// do not hide its overwrite.
+#[test]
+fn many_rest_requests_do_not_hide_an_overwrite() {
+    let w = World::new("bk-many");
+    let b = lane(&w.h, B);
+    let c = open_stream(&b, "/grpc");
+    for _ in 0..4100 {
+        assert_eq!(tag_call(&b, "mine", "1"), 201);
+    }
+    w.build("base-app:1", "sha256:lane");
+    w.end(&c, B);
+    assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:a1"));
+    assert_eq!(w.events(), [ev(B, "base-app:1", TagEventKind::Restored)]);
+}
+
+/// What the engine says between the list and the lock decides: a tag that is
+/// already back on its image is left alone.
+#[test]
+fn a_tag_that_is_back_when_it_is_read_again_is_left_alone() {
+    let w = World::new("bk-back");
+    let b = lane(&w.h, B);
+    let c = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.st.lock().unwrap().heal = Some(("base-app:1".into(), "sha256:a1".into()));
+    w.end(&c, B);
+    assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:a1"));
+    assert_eq!(w.st.lock().unwrap().tag_posts.len(), 0);
+    w.quiet();
+}
+
+/// The stream's own workspace pulling a name it also overwrote cannot be told
+/// from the build: said, not restored (and not hidden). Another workspace's
+/// request does not make the event.
+#[test]
+fn the_streams_own_pull_of_a_protected_name_is_reported() {
+    let w = World::new("bk-selfpull");
+    let b = lane(&w.h, B);
+    let c = open_stream(&b, "/grpc");
+    assert_eq!(
+        call(&b, "POST", "/images/create?fromImage=postgres&tag=16", None).0,
+        200
+    );
+    w.build("postgres:16", "sha256:lane");
+    w.end(&c, B);
+    assert_eq!(w.tag("postgres:16").as_deref(), Some("sha256:lane"));
+    assert_eq!(
+        w.events(),
+        [ev(B, "postgres:16", TagEventKind::NotRestored)]
+    );
+}
+
+/// With no record of what a tag legitimately is (a request of its owner dropped
+/// it while another stream ran, and this stream began then), a change is
+/// reported and the tag is not restored to what it was when the stream began.
+#[test]
+fn a_baseline_that_cannot_be_known_is_reported_not_restored() {
+    let w = World::new("bk-weak");
+    let (a, b, c3) = (lane(&w.h, A), lane(&w.h, B), lane(&w.h, "lane-c"));
+    let cc = open_stream(&c3, "/grpc");
+    assert_eq!(tag_as(&a, "src", "base-app"), 201);
+    let cb = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.end(&cb, B);
+    assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:lane"));
+    assert_eq!(w.events(), [ev(B, "base-app:1", TagEventKind::NotRestored)]);
+    w.end(&cc, "lane-c");
+}
+
+/// What is remembered is bounded: past the cap of legitimate images a tag is
+/// watched but not trusted (reported, not restored).
+#[test]
+fn a_full_table_of_legitimate_images_reports_instead_of_restoring() {
+    let w = World::new("bk-cap");
+    w.h.svc.bk_fill_legit(4096);
+    let b = lane(&w.h, B);
+    let c = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.end(&c, B);
+    assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:lane"));
+    assert_eq!(w.events(), [ev(B, "base-app:1", TagEventKind::NotRestored)]);
+}
+
+/// The event list keeps the latest 64.
+#[test]
+fn the_event_list_is_bounded() {
+    let w = World::new("bk-events");
+    let b = lane(&w.h, B);
+    for _ in 0..70 {
+        w.st.lock().unwrap().fail_list = true;
+        let c = open_stream(&b, "/grpc");
+        w.end(&c, B);
+    }
+    assert_eq!(w.h.svc.tag_events().len(), 64);
+}
+
+/// A stream leaves nothing behind: running, watched and per-workspace state go
+/// when it ends or is dropped, and a forgotten workspace's go with it.
+#[test]
+fn a_stream_leaves_no_state_behind() {
+    let w = World::new("bk-state");
+    let b = lane(&w.h, B);
+    let c = open_stream(&b, "/grpc");
+    assert_eq!(w.h.svc.bk_sizes(), [1, 2, 2, 0]);
+    w.end(&c, B);
+    // Entries stay (legitimate images), the running and watched ones go.
+    assert_eq!(w.h.svc.bk_sizes(), [0, 2, 0, 1]);
+    w.h.svc.forget_scope(B).unwrap();
+    assert_eq!(w.h.svc.bk_sizes()[3], 0);
+    w.h.svc.forget_scope(A).unwrap();
+    assert_eq!(w.h.svc.bk_sizes()[1], 1);
+
+    // A stream dropped without its check (the client write failed).
+    let scope = Scope {
+        svc: w.h.svc.clone(),
+        auth: Authority {
+            workspace: B.into(),
+            ..w.h.auth.clone()
+        },
+    };
+    let watch = scope.bk_begin();
+    assert_eq!(w.h.svc.bk_sizes()[0], 1);
+    drop(watch);
+    let sizes = w.h.svc.bk_sizes();
+    assert_eq!((sizes[0], sizes[2]), (0, 0));
+}
+
+/// What was recorded of a tag is dropped when its owner's build begins: the
+/// owner's build may move its own tag, and a later stream must not put the
+/// tag back to what it was before.
+#[test]
+fn an_owners_build_makes_what_was_recorded_stale() {
+    let w = World::new("bk-stale");
+    let (a, b, c3) = (lane(&w.h, A), lane(&w.h, B), lane(&w.h, "lane-c"));
+    let cc = open_stream(&c3, "/grpc");
+    let ca = open_stream(&a, "/grpc");
+    w.build("base-app:1", "sha256:a2");
+    w.end(&ca, A);
+    let cb = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.end(&cb, B);
+    assert_eq!(w.tag("base-app:1").as_deref(), Some("sha256:lane"));
+    assert_eq!(w.events(), [ev(B, "base-app:1", TagEventKind::NotRestored)]);
+    w.end(&cc, "lane-c");
+}
+
+/// A pull of an unrecorded name by another workspace during a stream makes what
+/// was recorded of it stale: a stream that begins then does not put the name
+/// back to the image from before the pull.
+#[test]
+fn a_pull_during_another_stream_makes_the_recorded_image_stale() {
+    let w = World::new("bk-pullstale");
+    let (a, b, c3) = (lane(&w.h, A), lane(&w.h, B), lane(&w.h, "lane-c"));
+    let cc = open_stream(&c3, "/grpc");
+    assert_eq!(
+        call(&a, "POST", "/images/create?fromImage=postgres&tag=16", None).0,
+        200
+    );
+    let cb = open_stream(&b, "/grpc");
+    w.build("postgres:16", "sha256:lane");
+    w.end(&cb, B);
+    assert_eq!(w.tag("postgres:16").as_deref(), Some("sha256:lane"));
+    assert_eq!(
+        w.events(),
+        [ev(B, "postgres:16", TagEventKind::NotRestored)]
+    );
+    w.end(&cc, "lane-c");
 }

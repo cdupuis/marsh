@@ -496,8 +496,10 @@ has is checked.
      image, not necessarily the previous one. The text says the change is not undone.
      Events are a line on the agent's standard error and an entry of
      `Services::tag_events()` (the last 64). "Unable to check" is kept once per
-     workspace and cause, and at the cap those go first, then later reports of a tag:
-     the oldest report of a tag is kept, it holds the owner's original image. Nothing
+     workspace and cause. At the cap the list gives up, in this order, a later report of
+     a tag that has several (the first report of a tag is kept: it holds the owner's
+     original image), then "unable to check" (never the one just added), then the oldest
+     report; a tag's only report goes only when nothing else can. Nothing
      expires: a report stays until the agent restarts, even after the owner put the tag
      back, and a repeated "unable to check" for the same workspace and cause is never
      shown again. Not persisted.

@@ -1066,3 +1066,84 @@ fn the_earlier_stream_reports_the_overlap_when_it_finishes_first() {
         events[0]
     );
 }
+
+/// At the cap a repeated report of one tag does not push out another tag's only
+/// report (the reviewer's reproduction): the repeat's own older duplicate or the
+/// repeat itself goes, never a tag's first report.
+#[test]
+fn a_repeated_report_does_not_evict_another_tags_only_report() {
+    let w = World::new("bk-dup-evict");
+    let b = lane(&w.h, B);
+    for i in 0..64 {
+        let tag = format!("t{i:02}:1");
+        w.build(&tag, &format!("sha256:t{i:02}"));
+        w.h.svc.ledger.set_tag(A, &tag).unwrap();
+    }
+    let c = open_stream(&b, "/grpc");
+    for i in 0..64 {
+        w.build(&format!("t{i:02}:1"), "sha256:lane");
+    }
+    w.end(&c, B);
+    assert_eq!(w.reports().len(), 64);
+    let c = open_stream(&b, "/grpc");
+    w.build("t63:1", "sha256:lane2");
+    w.end(&c, B);
+    let tags: Vec<String> = w.reports().into_iter().map(|r| r.0).collect();
+    assert_eq!(tags.len(), 64);
+    assert_eq!(
+        tags[0], "t00:1",
+        "a tag's only report was evicted: {tags:?}"
+    );
+    assert_eq!(tags.iter().filter(|t| *t == "t63:1").count(), 1);
+}
+
+/// A duplicate report goes before "unable to check", and "unable to check" before
+/// a tag's only report.
+#[test]
+fn eviction_takes_duplicates_then_unable_to_check_then_the_oldest() {
+    let w = World::new("bk-evict-order");
+    let b = lane(&w.h, B);
+    for i in 0..64 {
+        let tag = format!("t{i:02}:1");
+        w.build(&tag, &format!("sha256:t{i:02}"));
+        w.h.svc.ledger.set_tag(A, &tag).unwrap();
+    }
+    // 61 tags once, one "unable to check", t61 twice (a duplicate): 64 events.
+    let c = open_stream(&b, "/grpc");
+    for i in 0..61 {
+        w.build(&format!("t{i:02}:1"), "sha256:lane");
+    }
+    w.end(&c, B);
+    w.st.lock().unwrap().fail_list = true;
+    let c = open_stream(&b, "/grpc");
+    w.end(&c, B);
+    w.st.lock().unwrap().fail_list = false;
+    for image in ["sha256:lane", "sha256:lane2"] {
+        let c = open_stream(&b, "/grpc");
+        w.build("t61:1", image);
+        w.end(&c, B);
+    }
+    assert_eq!((w.unchecked(), w.reports().len()), (1, 63));
+    // One more tag: the duplicate goes, "unable to check" stays.
+    let c = open_stream(&b, "/grpc");
+    w.build("t62:1", "sha256:lane");
+    w.end(&c, B);
+    assert_eq!((w.unchecked(), w.reports().len()), (1, 63));
+    let tags: Vec<String> = w.reports().into_iter().map(|r| r.0).collect();
+    assert_eq!(tags.iter().filter(|t| *t == "t61:1").count(), 1);
+    // The first report of t61 is the one kept (it holds the original image).
+    assert_eq!(
+        w.reports()
+            .iter()
+            .find(|r| r.0 == "t61:1")
+            .unwrap()
+            .2
+            .as_deref(),
+        Some("sha256:lane")
+    );
+    // And with nothing to repeat, the next report takes "unable to check".
+    let c = open_stream(&b, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.end(&c, B);
+    assert_eq!((w.unchecked(), w.reports().len()), (0, 64));
+}

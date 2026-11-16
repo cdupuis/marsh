@@ -1913,6 +1913,13 @@ mod tests {
         let (again, error) = backend.cached_view(&other, || read(Ok(view.clone())));
         assert_eq!((again.tag_events.len(), error), (1, None));
         assert_eq!(reads.get(), 3);
+        // After a second the view is read again (events do not go stale).
+        std::thread::sleep(Duration::from_millis(1100));
+        let (fresh, _) = backend.cached_view(&other, || {
+            read(Ok(super::super::services_view::View::default()))
+        });
+        assert_eq!(fresh.tag_events.len(), 0);
+        assert_eq!(reads.get(), 4);
     }
 
     /// `marsh docker status --json`: a ready project's document carries the

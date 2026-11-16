@@ -1727,6 +1727,16 @@ impl Relay {
         self.open(scope, ChannelKind::Docker, None, "docker".to_owned())
     }
 
+    /// The daemon's own status channel: a docker channel with the reserved
+    /// [`STATUS_ATTEMPT`] of the base workspace, the one the agent answers
+    /// `GET /_marsh/tag-events` on.
+    ///
+    /// # Errors
+    /// As [`Self::open_docker`].
+    pub fn open_status_docker(&self) -> Result<Stream, RelayError> {
+        self.open_docker(&AttemptScope::status(self.project_path())?)
+    }
+
     /// A channel to a published port of the workspace's containers. The port
     /// must be in the workspace's published-port map the agent reported; that
     /// check is the daemon's own and happens before any frame is sent.
@@ -2597,6 +2607,9 @@ mod relay_tests {
         }
     }
 
+    /// The (workspace, attempt) of every docker channel a stand-in agent was asked to open.
+    static OPENED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quirk {
         Honest,
@@ -2709,7 +2722,13 @@ mod relay_tests {
                         };
                         let _ = write_frame(&mut writer, &Outbound::Control(frame));
                     }
-                    Ok(Some(Inbound::Control(HostFrame::Open { channel, .. }))) => {
+                    Ok(Some(Inbound::Control(HostFrame::Open {
+                        channel, authority, ..
+                    }))) => {
+                        OPENED
+                            .lock()
+                            .unwrap()
+                            .push((authority.workspace.clone(), authority.attempt.clone()));
                         channels.insert(channel, EchoChannel::new());
                         write_frame(
                             &mut writer,
@@ -2906,6 +2925,26 @@ mod relay_tests {
         assert!(
             matches!(&error, Some(RelayError::Hostile(why)) if why.contains("test break modes")),
             "{error:?}"
+        );
+    }
+
+    /// The daemon's status channel carries the base workspace and the reserved
+    /// attempt, as the agent sees it in the open frame (the one the route answers).
+    #[test]
+    fn the_status_channel_is_opened_with_the_status_authority() {
+        let relay = start(false, Limits::default());
+        let before = OPENED.lock().unwrap().len();
+        drop(relay.open_status_docker().unwrap());
+        let opened = OPENED.lock().unwrap().clone();
+        assert!(
+            opened[before..].contains(&(BASE_WORKSPACE.to_owned(), STATUS_ATTEMPT.to_owned())),
+            "{opened:?}"
+        );
+        let scope = AttemptScope::status("/p").unwrap();
+        let authority = scope.authority("docker".to_owned());
+        assert_eq!(
+            (authority.workspace.as_str(), authority.attempt.as_str()),
+            ("base", "status")
         );
     }
 

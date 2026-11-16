@@ -11,7 +11,7 @@
 //! health are reduced to plain bounded words, and nothing here names a VM,
 //! volume, snapshot, engine or sbx.
 
-use marsh_sbx::services_relay::{AttemptScope, Relay};
+use marsh_sbx::services_relay::{Relay, TagEventKind};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -69,10 +69,8 @@ pub(crate) trait Channel {
 
 impl Channel for Relay {
     fn open(&self) -> Result<Opened, String> {
-        let authority =
-            AttemptScope::status(self.project_path()).map_err(|error| error.to_string())?;
         let stream = self
-            .open_docker(&authority)
+            .open_status_docker()
             .map_err(|error| error.to_string())?;
         let closer = stream.clone();
         Ok((Box::new(stream), Box::new(move || closer.close())))
@@ -325,6 +323,7 @@ fn parse_tag_events(body: &[u8]) -> Vec<Value> {
     let Ok(answer) = serde_json::from_slice::<Value>(body) else {
         return Vec::new();
     };
+    let kinds = [TagEventKind::Changed, TagEventKind::Unchecked].map(TagEventKind::word);
     answer
         .get("events")
         .and_then(Value::as_array)
@@ -337,15 +336,17 @@ fn parse_tag_events(body: &[u8]) -> Vec<Value> {
                     .and_then(Value::as_str)
                     .map(|text| plain(text, limit))
             };
-            let kind = text("kind", 16).filter(|kind| {
-                matches!(kind.as_str(), "restored" | "not_restored" | "unchecked")
-            })?;
+            let kind = text("kind", 16).filter(|kind| kinds.contains(&kind.as_str()))?;
             Some(json!({
                 "at": event.get("at").and_then(Value::as_u64)?,
                 "workspace": text("workspace", MAX_NAME)?,
-                "tag": text("tag", 255)?,
                 "kind": kind,
-                "detail": text("detail", 512)?,
+                "detail": text("detail", 1024)?,
+                "tag": text("tag", 255)?,
+                "owner": text("owner", MAX_NAME),
+                "previous": text("previous", 128)?,
+                "current": text("current", 128),
+                "ambiguous": event.get("ambiguous").and_then(Value::as_bool).unwrap_or(false),
             }))
         })
         .take(MAX_TAG_EVENTS)
@@ -385,22 +386,34 @@ mod tests {
 
     #[test]
     fn tag_events_are_plain_bounded_and_only_the_kinds_the_agent_sends() {
-        let many: Vec<Value> = (0..100)
-            .map(|at| json!({"at": at, "workspace": "lane-b", "tag": "t:1", "kind": "restored", "detail": "x"}))
-            .collect();
+        let ev = |at: u64, kind: &str| {
+            json!({"at": at, "workspace": "lane-b", "tag": "t:1", "kind": kind, "detail": "x",
+                   "owner": "lane-a", "previous": "sha256:a", "current": "sha256:b",
+                   "ambiguous": true})
+        };
+        let many: Vec<Value> = (0..100).map(|at| ev(at, "changed")).collect();
         let body = json!({"events": many}).to_string();
         assert_eq!(parse_tag_events(body.as_bytes()).len(), 64);
+        // Every kind the agent has is accepted (the words are the agent's own),
+        // any other is dropped, and a gone tag and a pulled name keep their nulls.
+        for kind in [TagEventKind::Changed, TagEventKind::Unchecked] {
+            let body = json!({"events": [ev(1, kind.word())]}).to_string();
+            assert_eq!(parse_tag_events(body.as_bytes()), vec![ev(1, kind.word())]);
+        }
         let body = json!({"events": [
-            {"at": 1, "workspace": "w\u{1b}[31m", "tag": "t:1", "kind": "restored", "detail": "a\nb"},
-            {"at": 2, "workspace": "w", "tag": "t:1", "kind": "deleted", "detail": ""},
-            {"at": "x", "workspace": "w", "tag": "t:1", "kind": "restored", "detail": ""},
-            {"at": 3, "workspace": "w", "tag": "t:1", "kind": "unchecked"}
+            {"at": 1, "workspace": "w\u{1b}[31m", "tag": "t:1", "kind": "changed", "detail": "a\nb",
+             "owner": null, "previous": "p", "current": null, "ambiguous": false},
+            {"at": 2, "workspace": "w", "tag": "t:1", "kind": "restored", "detail": "", "previous": "p"},
+            {"at": "x", "workspace": "w", "tag": "t:1", "kind": "changed", "detail": "", "previous": "p"},
+            {"at": 3, "workspace": "w", "tag": "t:1", "kind": "unchecked", "previous": "p"}
         ]})
         .to_string();
         assert_eq!(
             parse_tag_events(body.as_bytes()),
             vec![
-                json!({"at": 1, "workspace": "w[31m", "tag": "t:1", "kind": "restored", "detail": "ab"})
+                json!({"at": 1, "workspace": "w[31m", "tag": "t:1", "kind": "changed",
+                        "detail": "ab", "owner": null, "previous": "p", "current": null,
+                        "ambiguous": false})
             ]
         );
         assert_eq!(parse_tag_events(b"not json").len(), 0);
@@ -426,7 +439,7 @@ mod tests {
             let body = exchange(&mut client, TAG_EVENTS_PATH);
             (handle.join().unwrap(), body)
         };
-        let json = r#"{"events":[{"at":5,"workspace":"lane-b","tag":"base-app:1","kind":"restored","detail":"d"}]}"#;
+        let json = r#"{"events":[{"at":5,"workspace":"lane-b","tag":"base-app:1","kind":"changed","detail":"d","previous":"p"}]}"#;
         let (request, body) = serve(Box::leak(
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{json}",
@@ -494,8 +507,7 @@ mod tests {
         }
     }
 
-    const EVENTS: &str =
-        r#"{"events":[{"at":5,"workspace":"b","tag":"t:1","kind":"unchecked","detail":"d"}]}"#;
+    const EVENTS: &str = r#"{"events":[{"at":5,"workspace":"b","tag":"t:1","kind":"unchecked","detail":"d","previous":""}]}"#;
 
     /// The real read over a stream: the containers first and then the events
     /// (both as `GET`s the agent can route); an agent that refuses the events

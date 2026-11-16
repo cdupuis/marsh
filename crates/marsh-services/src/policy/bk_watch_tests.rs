@@ -689,7 +689,17 @@ fn only_the_daemons_status_read_gets_the_tag_events() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["tag"], "base-app:1");
     assert_eq!(events[0]["workspace"], B);
-    assert_eq!(events[0]["kind"], "restored");
+    assert_eq!(events[0]["kind"], "changed");
+    assert_eq!(events[0]["owner"], A);
+    assert_eq!(events[0]["previous"], "sha256:a1");
+    assert_eq!(events[0]["current"], "sha256:lane");
+    assert_eq!(events[0]["ambiguous"], false);
+    assert!(
+        events[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("docker tag sha256:a1 base-app:1")
+    );
     for (who, sock) in [
         ("a lane's job", b.clone()),
         ("a base job", as_attempt("base", "job1")),
@@ -699,6 +709,21 @@ fn only_the_daemons_status_read_gets_the_tag_events() {
         let (status, body) = call(&sock, "GET", "/_marsh/tag-events", None);
         assert_eq!(status, 403, "{who} read the events: {body}");
     }
+    // The ambiguity flag travels too.
+    let a = lane(&w.h, A);
+    let c = open_stream(&b, "/grpc");
+    assert_eq!(tag_as(&a, "src", "base-app"), 201);
+    w.end(&c, B);
+    let (_, body) = call(&status_read, "GET", "/_marsh/tag-events", None);
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        answer["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["ambiguous"] == true && e["current"] == "sha256:src"),
+        "{body}"
+    );
     // The route takes no parameters, nor does it answer other methods.
     for (method, target) in [
         ("GET", "/_marsh/tag-events?since=1"),

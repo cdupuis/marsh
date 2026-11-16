@@ -2583,13 +2583,9 @@ fn tag_events_reply(svc: &Services, conn: &mut Conn, head: &Head) -> bool {
         .tag_events()
         .into_iter()
         .map(|e| {
-            let kind = match e.kind {
-                TagEventKind::Restored => "restored",
-                TagEventKind::NotRestored => "not_restored",
-                TagEventKind::Unchecked => "unchecked",
-            };
-            serde_json::json!({"at": e.at, "workspace": e.workspace, "tag": e.tag,
-                               "kind": kind, "detail": e.detail})
+            serde_json::json!({"at": e.at, "workspace": e.workspace, "kind": e.kind.word(),
+                "detail": e.detail, "tag": e.tag, "owner": e.owner, "previous": e.previous,
+                "current": e.current, "ambiguous": e.ambiguous})
         })
         .collect();
     let body = serde_json::json!({ "events": events }).to_string();

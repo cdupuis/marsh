@@ -291,10 +291,18 @@ fn a_refused_services_vm_says_how_to_recover() {
         .unwrap_err();
     let text = error.to_string();
     assert!(matches!(error, SbxError::UnreadableVm { .. }), "{text}");
-    assert!(
-        text.contains("sandbox failed to start: boom; if this keeps happening, "),
-        "{text}"
-    );
-    assert!(text.contains(DOCKER_RM_REMEDY), "{text}");
+    // An sbx outage looks the same: check sbx and retry first, the deletion
+    // is the last resort and says what it deletes.
+    let order = [
+        "sandbox failed to start: boom; check that `sbx ls` works and try again (`marsh docker stop`, then the command); only as a last resort, ",
+        DOCKER_RM_REMEDY,
+    ];
+    let mut at = 0;
+    for part in order {
+        let found = text[at..]
+            .find(part)
+            .unwrap_or_else(|| panic!("{part}: {text}"));
+        at += found + part.len();
+    }
     assert_eq!(model.count("rm"), 0);
 }

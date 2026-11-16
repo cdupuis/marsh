@@ -55,14 +55,18 @@ impl CommandRunner for ExecDown {
 }
 
 /// The user-facing text of a refused owned shell or Kit VM names `marsh reset`
-/// and what it keeps (`docs/man/marsh.1.md`, `reset`).
+/// with its real reach and what it keeps, and the narrower `marsh workers
+/// reset KIT` (`docs/man/marsh.1.md`, `reset` and `workers reset`).
 fn assert_names_reset(error: &SbxError, prefix: &str) {
     let text = error.to_string();
     assert!(text.contains(prefix), "{text}");
-    assert!(
-        text.contains("run `marsh reset` to remove it (your project files, the guest home and results are kept)"),
-        "{text}"
-    );
+    for part in [
+        "run `marsh reset` to remove it: that removes every idle Kit and shell VM of this scope and the software installed in them (your project files, the guest home and results are kept)",
+        "it refuses while a shell or job is running",
+        "for a Kit VM, `marsh workers reset KIT` (the Kit's name in `marsh status`) removes only that Kit's idle VM",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
 }
 
 /// Host temp root with symlinked ancestry resolved (macOS `/var` ->

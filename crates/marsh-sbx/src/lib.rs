@@ -120,10 +120,15 @@ const KEEPALIVE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCAL_SCRATCH_STALE_AFTER: Duration = Duration::from_hours(1);
 const NO_MARKER_DETAIL: &str = "it has no marsh worker marker";
 /// What to tell the user about an owned shell or Kit VM marsh refuses to
-/// reuse. Mirrors `marsh reset` in `docs/man/marsh.1.md`: it removes the VMs,
-/// not the guest home, the results or the project folders on the Mac.
-const RESET_REMEDY: &str =
-    "run `marsh reset` to remove it (your project files, the guest home and results are kept)";
+/// reuse. Mirrors `reset` and `workers reset` in `docs/man/marsh.1.md`:
+/// `reset` removes every idle Kit and shell VM of the scope (and what is
+/// installed in them) but not the guest home, the results or the project
+/// folders on the Mac, and refuses while a shell or job is running;
+/// `workers reset KIT` removes one idle Kit VM.
+const RESET_REMEDY: &str = "run `marsh reset` to remove it: that removes every idle Kit and shell VM of this scope and the software installed in them (your project files, the guest home and results are kept), and it refuses while a shell or job is running; for a Kit VM, `marsh workers reset KIT` (the Kit's name in `marsh status`) removes only that Kit's idle VM";
+/// Said first when stock SBX could not start or exec in an owned VM: that is
+/// as likely an `sbx` outage as a bad VM.
+const CHECK_SBX_FIRST: &str = "check that `sbx ls` works and try again; if it keeps happening, ";
 const PREPARATION_SBX_TIMEOUT: Duration = Duration::from_mins(5);
 /// `sbx create` pulls the VM's image: on a slow link that alone takes many
 /// minutes, and stock SBX reports success or failure on its own. This only
@@ -7189,10 +7194,7 @@ impl StockSbx {
                     } else {
                         SbxError::UnreadableVm {
                             vm: vm.to_owned(),
-                            detail: format!(
-                                "{}; if this keeps happening, {RESET_REMEDY}",
-                                stderr.trim()
-                            ),
+                            detail: format!("{}; {CHECK_SBX_FIRST}{RESET_REMEDY}", stderr.trim()),
                         }
                     });
                 }

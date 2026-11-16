@@ -779,7 +779,7 @@ fn a_refused_owned_shell_vm_says_how_to_recover() {
     assert!(matches!(error, SbxError::UnreadableVm { .. }), "{error}");
     assert_names_reset(
         &error,
-        "could not be read (stock SBX could not start or exec in it): Error: sandbox failed to start: boom; if this keeps happening, ",
+        "could not be read (stock SBX could not start or exec in it): Error: sandbox failed to start: boom; check that `sbx ls` works and try again; if it keeps happening, ",
     );
     assert_eq!(model.count("rm"), 0);
 }

@@ -1053,5 +1053,16 @@ fn only_the_daemons_status_read_gets_the_tag_events() {
         let (status, body) = call(&sock, "GET", "/_marsh/tag-events", None);
         assert_eq!(status, 403, "{who} read the events: {body}");
     }
+    // The route takes no parameters, nor does it answer other methods.
+    for (method, target) in [
+        ("GET", "/_marsh/tag-events?since=1"),
+        ("POST", "/_marsh/tag-events"),
+    ] {
+        let (status, _) = call(&status_read, method, target, None);
+        assert!(
+            status == 403 || status == 405 || status == 400,
+            "{method} {target} answered {status}"
+        );
+    }
     assert_eq!(w.h.engine.saw("GET", "/_marsh"), 0);
 }

@@ -1192,6 +1192,16 @@ impl StockDaemonBackend {
         let Ok(entry) = relays.get(root) else {
             return (none(), None);
         };
+        self.cached_view(root, || super::services_view::read(entry.relay()))
+    }
+
+    /// The view `read` gives, kept for a second so a polling client does not
+    /// open a channel per call.
+    fn cached_view(
+        &self,
+        root: &Path,
+        read: impl FnOnce() -> Result<super::services_view::View, String>,
+    ) -> (super::services_view::View, Option<String>) {
         let mut cache = self
             .services
             .view_cache
@@ -1202,12 +1212,15 @@ impl StockDaemonBackend {
         {
             return (view.clone(), None);
         }
-        match super::services_view::read(entry.relay()) {
+        match read() {
             Ok(view) => {
                 cache.insert(root.to_owned(), (Instant::now(), view.clone()));
                 (view, None)
             }
-            Err(reason) => (none(), Some(format!("marsh: {reason}"))),
+            Err(reason) => (
+                super::services_view::View::default(),
+                Some(format!("marsh: {reason}")),
+            ),
         }
     }
 
@@ -1875,6 +1888,36 @@ fn keep_quiesced<P>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status read is kept for a second with its events, asked for once in
+    /// that time, and a failure is reported and not kept.
+    #[test]
+    fn the_view_cache_keeps_the_events_for_a_second() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let root = fs::canonicalize(home.path()).unwrap();
+        let view = super::super::services_view::View {
+            tag_events: vec![json!({"at": 1, "kind": "restored"})],
+            ..Default::default()
+        };
+        let reads = std::cell::Cell::new(0);
+        let read = |result: Result<_, String>| {
+            reads.set(reads.get() + 1);
+            result
+        };
+        let (first, error) = backend.cached_view(&root, || read(Ok(view.clone())));
+        assert_eq!((first.tag_events.len(), error), (1, None));
+        let (second, _) = backend.cached_view(&root, || read(Err("asked again".into())));
+        assert_eq!(second.tag_events, view.tag_events);
+        assert_eq!(reads.get(), 1);
+        let other = root.join("other");
+        let (none, error) = backend.cached_view(&other, || read(Err("down".into())));
+        assert_eq!(none.tag_events.len(), 0);
+        assert_eq!(error.as_deref(), Some("marsh: down"));
+        let (again, error) = backend.cached_view(&other, || read(Ok(view.clone())));
+        assert_eq!((again.tag_events.len(), error), (1, None));
+        assert_eq!(reads.get(), 3);
+    }
 
     /// `marsh docker status --json`: a ready project's document carries the
     /// engine view's image tag events (and nothing of the kind without any), and

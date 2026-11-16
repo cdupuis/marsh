@@ -528,10 +528,9 @@ has is checked.
   stream's overwrite that lands between the request's engine call and the agent's
   read of the name (a few milliseconds) is taken for the request's. Tests: the
   `bk_watch_tests` module of `endpoint_tests.rs`; each rule above was removed once
-  and a test failed, except the choice between a record and the image the stream
-  began with when both agree (no outcome differs) and the `accepted` gate on the
-  observe-at-release step for requests the engine answered with an error when no
-  overwrite coincides (see the report of the review round).
+  and a test failed, except the choice between the record and the image the stream began
+  with when they agree (no outcome differs), and that the end check names a tag only
+  when it differs from the record (an optimisation: the settle step re-reads it).
 - Names are not forced under `<workspace>/` (that would refuse `docker build -t app`
   and Compose's default names); the cost is that two workspaces cannot both build the
   same tag over REST, such as an `image:` plus `build:` stack.

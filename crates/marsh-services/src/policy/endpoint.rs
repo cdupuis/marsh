@@ -1269,7 +1269,7 @@ impl Scope {
         for tag in tags {
             res.entry(tag.clone()).or_default().add(ws, kind);
         }
-        self.svc.lock_bk().touch(tags);
+        self.svc.lock_bk().touch(tags, ws);
         for (id, k) in &images {
             res.entry(id.clone()).or_default().add(ws, *k);
         }

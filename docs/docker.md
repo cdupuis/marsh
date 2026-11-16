@@ -692,22 +692,26 @@ In plain words:
   under [Builds and the cache](#builds-and-the-cache), which the filter does not
   read, so a lane can still build an image under a tag the base runs (`docker
   buildx build --load -t base-app:1 .` in a lane moved the base's `base-app:1`).
-  What marsh does instead is **detect it afterwards and put the tag back**: when a
-  build's stream ends, the agent looks again at the tags the stream's workspace may not
-  move (tags another workspace created, and names on pulled images such as
-  `postgres:16`), moves back any whose image changed, with a plain `docker tag` of the old
-  image ID (never forced; nothing is deleted), and says so on the services agent's
-  standard error. It does not do
+  What marsh does instead is **detect it afterwards and put the tag back**: it keeps
+  what each tag another workspace created (and each name on a pulled image such as
+  `postgres:16`) legitimately is; when a build's stream ends it moves back any whose
+  image changed, with a plain `docker tag` of the old image ID (never forced; nothing
+  is deleted), and says so on the services agent's standard error. It does not do
   that when another explanation exists: the tag's owner pulled, tagged or deleted it
-  meanwhile, or the owner had a build running too. Then it only reports the change
-  (so a lane's own legitimate build of its own tag is never touched). **What stays
-  open:** the overwrite is seen when the build's stream ends, not stopped: from the
-  moment the build moves the tag until then (the whole build, for `buildx`), the
-  base's tag points at the lane's image, and a `docker run base-app:1` in that time runs the lane's image.
-  A change made after a stream ended, or one that cannot be put back (the old
-  image is gone), is not repaired. At most 256 protected tags are watched per
-  stream, and a stream whose image list could not be read runs unwatched, with an
-  event. The BuildKit cache and history are as exposed as before. Where
+  meanwhile (silent), the lane itself also pulled it, or the owner had a build
+  running too (reported, not undone, so a lane's own legitimate build of its own
+  tag is never touched). **What stays open:** the overwrite is seen when the
+  build's stream ends, not stopped: from the moment the build moves the tag until
+  then (the whole build, for `buildx`), the base's tag points at the lane's image, and
+  a `docker run base-app:1` in that time runs the lane's image. The tag is put back
+  as the build's connection closes, so the lane's own next command (`docker build -t
+  X && docker run X`) may run either image. A change made after a stream ended is
+  not repaired; nor is a tag whose old image is gone. A tag a `docker build` in one
+  lane creates is not recorded to that lane (only tags made over the REST API and
+  pulled names are), so another lane's build can still take it without a trace.
+  At most 256 protected tags are watched per stream, and a stream whose image list
+  could not be read runs unwatched, with an event. The BuildKit cache and history
+  are as exposed as before. Where
   it applies, the workspace that creates a tag may move it; a name stays free until
   an image has it (another workspace can create it first), and it is free again
   after `docker rmi`. Two lanes cannot both build `-t app` over the REST API; give

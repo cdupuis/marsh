@@ -151,7 +151,9 @@ impl EngineConfig {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FailureKind {
-    /// The Docker disk cannot hold the configured pool.
+    /// The Docker disk's free space is below what the configured pool and the
+    /// reserve need (`check_pool_fits`), and nothing else: the daemon removes a
+    /// VM its start just created on this kind alone.
     DiskTooSmall,
     /// The pool image is not the pool this VM created.
     PoolIdentity,
@@ -637,6 +639,17 @@ pub fn without_remove_advice(message: &str) -> String {
         .to_owned()
 }
 
+/// `fallocate` of the pool failed after the space check passed. That is not
+/// the disk being too small for the pool (it can be a full host disk, or a
+/// filesystem that cannot allocate), so it is not `DiskTooSmall`: the daemon
+/// removes a new VM only for that kind.
+fn pool_allocation_failure(message: &str) -> Failure {
+    failure(
+        FailureKind::Setup,
+        format!("marsh: cannot allocate the pool (disk full?): {message}"),
+    )
+}
+
 fn ensure_pool_image(pool_bytes: u64, breaks: &Breaks) -> Result<(), Failure> {
     let directory = Path::new(POOL_DIR);
     let image = directory.join(POOL_IMAGE);
@@ -674,10 +687,7 @@ fn ensure_pool_image(pool_bytes: u64, breaks: &Breaks) -> Result<(), Failure> {
             &["-l", &pool_bytes.to_string(), &temporary.to_string_lossy()],
         ) {
             let _ = fs::remove_file(&temporary);
-            return Err(failure(
-                FailureKind::DiskTooSmall,
-                format!("marsh: cannot allocate the pool (disk full?): {message}"),
-            ));
+            return Err(pool_allocation_failure(&message));
         }
     }
     let uuid = fs::read_to_string("/proc/sys/kernel/random/uuid")
@@ -1331,6 +1341,19 @@ mod tests {
         assert!(error.contains("marsh config services-disk-size"), "{error}");
         assert!(!error.contains("poolSize"), "{error}");
         assert!(check_pool_fits(4 << 30, 8 << 30).is_ok());
+    }
+
+    /// Only the space check is `DiskTooSmall`: a pool that cannot be allocated
+    /// after it passed is a setup failure, which never gets a new VM removed.
+    #[test]
+    fn a_failed_allocation_is_not_a_disk_too_small_failure() {
+        let failure = pool_allocation_failure("fallocate: No space left on device");
+        assert_eq!(failure.kind, FailureKind::Setup);
+        assert!(
+            failure.message.contains("cannot allocate the pool"),
+            "{}",
+            failure.message
+        );
     }
 
     #[test]

@@ -168,7 +168,13 @@ the same override) before it records a name or creates the VM (`ServicesVmSpec::
 the engine's own check still runs on the disk's real free space at start. When it refuses (`failed` with
 `FailureKind::DiskTooSmall`, kept by the handle as `failure_kind()`) for a VM that this very start created
 (`ReadyServicesVm::cold_started`), `services_start` removes that VM by its recorded UUID, as `marsh docker rm`
-does, and drops the "remove the VM first" advice from the message; no other failure, and no existing VM, is removed. `EngineSettings::internet_open` is the project's Internet grant
+does, and drops the "remove the VM first" advice from the message; no other failure, and no existing VM, is removed,
+and an existing VM's refusal keeps that advice, since removing the VM is then what the user must do. The engine sends
+`DiskTooSmall` for the space check only (a failed `fallocate` of the pool is `Setup`). The cleanup does not clear what
+`services_remove` clears (last capture, reap records, Internet grant): a VM whose engine never became ready has none of
+the first two, and the grant is the user's own choice, which a failed start must not undo. The configured size
+is checked first (`USABLE_DISK_PERCENT`), and the message names the least size that passes the same arithmetic, or says
+that none of 1g to 4096g can. `EngineSettings::internet_open` is the project's Internet grant
 (`InternetGrants::is_on`), passed to `engine-up` as `--internet on|off` at every start. The Docker disk size is S1's `services.diskSize`.
 
 ## Break modes and holds (test builds only)

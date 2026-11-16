@@ -419,3 +419,38 @@ fn a_vm_created_again_beside_a_foreign_one_is_checked_against_the_pool() {
     assert_eq!(model.vm(&name).unwrap().id, IMPOSTOR);
     assert_eq!(adapter.recorded_services_vm(&project), Some(name));
 }
+
+/// The size a refusal recommends is one that passes, also for a pool the
+/// override sets a byte over what a size gives; and a pool no disk can hold
+/// says so instead of overflowing.
+#[test]
+fn the_recommended_disk_size_passes_and_the_largest_pool_is_refused_plainly() {
+    let shell = ShellFixture::new();
+    let project = directory(shell.dir.path(), "project");
+    // A byte over what 28g gives: 29g is needed.
+    let pool = 26_220_775_279_u64;
+    let model = StockModel::new();
+    let refused = model
+        .adapter()
+        .ensure_services_vm(&pooled(spec(&shell, &project, "28g"), Some(pool)))
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("at least 29g"), "{refused}");
+    let model = StockModel::new();
+    let _ = model
+        .adapter()
+        .ensure_services_vm(&pooled(spec(&shell, &project, "29g"), Some(pool)));
+    assert_eq!(model.count("create"), 1, "the recommended size creates");
+    // Nothing can hold the largest pool, and that is said.
+    let model = StockModel::new();
+    let refused = model
+        .adapter()
+        .ensure_services_vm(&pooled(spec(&shell, &project, "4096g"), Some(u64::MAX)))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("4096g") && refused.contains("MARSH_SERVICES_POOL_BYTES"),
+        "{refused}"
+    );
+    assert!(model.calls().is_empty());
+}

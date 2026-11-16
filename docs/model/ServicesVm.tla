@@ -16,6 +16,9 @@
 (*                              and data of exactly the CONFIRMED projects *)
 (*   Rm(p)                      `marsh services rm`: one project's VM+data *)
 (*   Restart                    daemon restart: holders gone, VMs stay     *)
+(*   FailStart(p)               a start whose engine refuses the pool for  *)
+(*                              want of disk: the VM THIS start created is *)
+(*                              removed again, one that was there is kept  *)
 (* `held` (who really uses a VM) and `data` (a project's data exists) are  *)
 (* ghosts: `data` is cleared only by a confirmed removal, so a break that  *)
 (* destroys a VM leaves it set. `last`, `po` and `ps` record the latest    *)
@@ -27,7 +30,8 @@ CONSTANTS Projects, Ids, Holders, MaxRestarts, Bug
 
 Bugs == {"none", "vmPerScope", "leaseNone", "idleRemoves", "gcServices", "idleStopOff",
          "stopDeletesData", "resetSkipConfirmation", "resetIncludeNoop",
-         "rmRemovesAll", "disableIgnoresHolders", "enablePerHome"}
+         "rmRemovesAll", "disableIgnoresHolders", "enablePerHome",
+         "failStartRemovesExisting"}
 ASSUME Bug \in Bugs
 
 VARIABLES
@@ -210,6 +214,24 @@ Rm(p) ==
   /\ UNCHANGED <<enabled, restarts>>
   /\ Step("rm", {p})
 
+\* `marsh docker start` whose engine then refuses the pool because the disk is
+\* too small (`services_start`, `settle_failed_engine_start`). The VM this call
+\* created holds nothing, and is removed again by its recorded UUID; a VM that
+\* existed before is kept as it was. Either way the state is what it was before
+\* the call (a failed start sets no `data`). The break removes the existing
+\* VM too, and its data with it.
+FailStart(p) ==
+  /\ OnFor(p)
+  /\ IF Bug = "failStartRemovesExisting" /\ Exists(p)
+     THEN /\ stock' = [stock EXCEPT ![own[p]] = "none"]
+          /\ own' = [own EXCEPT ![p] = 0]
+          /\ holders' = [holders EXCEPT ![p] = {}]
+          /\ held' = [held EXCEPT ![p] = {}]
+          /\ idle' = [idle EXCEPT ![p] = FALSE]
+     ELSE UNCHANGED <<own, stock, holders, held, idle>>
+  /\ UNCHANGED <<data, enabled, restarts>>
+  /\ Step("failStart", {p})
+
 \* Garbage collection removes a stopped VM only through this break.
 Gc(p) ==
   /\ Bug = "gcServices"
@@ -232,7 +254,7 @@ Restart ==
   /\ Step("restart", {})
 
 Next ==
-  \/ \E p \in Projects : Start(p) \/ IdleExpire(p) \/ Rm(p) \/ Gc(p)
+  \/ \E p \in Projects : Start(p) \/ IdleExpire(p) \/ Rm(p) \/ Gc(p) \/ FailStart(p)
   \/ \E p \in Projects, h \in Holders : Acquire(p, h) \/ Release(p, h)
   \/ \E c \in SUBSET Projects : ResetAll(c)
   \/ \E p \in Projects : Disable(p) \/ Enable(p)
@@ -272,6 +294,10 @@ RmRemovesOne ==
     \A p \in Projects :
       IF p \in last.arg THEN own[p] = 0
       ELSE (po[p] # 0 /\ po[p] # po[CHOOSE q \in last.arg : TRUE]) => own[p] = po[p]
+
+\* A start whose engine refused the pool leaves every VM as it was: the one it
+\* created is gone again (it was not there before), and an existing one stays.
+FailedStartKeepsExisting == last.tag = "failStart" => (own = po /\ stock = ps)
 
 \* Turning services off for a project leaves it no holder and no running VM.
 OffStopsProject ==

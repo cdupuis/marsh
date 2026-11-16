@@ -445,13 +445,22 @@ pub struct RelayView {
 pub struct EstablishError {
     pub message: String,
     /// The engine itself refused to start because the VM's Docker disk cannot
-    /// hold its pool (`FailureKind::DiskTooSmall`): the same start can never
-    /// succeed on this VM, and `message` is the refusal without its advice to
-    /// remove the VM first. False for every other failure.
+    /// hold its pool (`FailureKind::DiskTooSmall`, which the engine sends for
+    /// the fit check only): starting again on this VM meets the same disk.
+    /// `message` is the engine's refusal as it sent it, advice to remove the
+    /// VM included; whoever removes the VM takes that advice off. False for
+    /// every other failure.
     pub pool_too_small: bool,
 }
 
 impl EstablishError {
+    /// The message without the engine's advice to remove the VM first, for a
+    /// caller that has removed it.
+    #[must_use]
+    pub fn message_without_remove_advice(&self) -> String {
+        marsh_services::engine::without_remove_advice(&self.message)
+    }
+
     fn other(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -774,7 +783,7 @@ impl ServicesRelays {
                 self.detach_owned(root, &handle);
                 if handle.failure_kind() == Some(FailureKind::DiskTooSmall) {
                     return Err(EstablishError {
-                        message: marsh_services::engine::without_remove_advice(&reason),
+                        message: reason,
                         pool_too_small: true,
                     });
                 }
@@ -1246,21 +1255,24 @@ mod tests {
         }
     }
 
-    /// The engine refusing the pool for want of disk is typed, and its message
-    /// loses the advice to remove a VM that is about to be removed anyway.
+    /// The engine refusing the pool for want of disk is typed. Its message
+    /// is kept as the engine sent it, advice to remove the VM included: only
+    /// whoever removes the VM may take that off.
     #[test]
-    fn a_pool_that_does_not_fit_is_a_typed_failure_without_the_remove_advice() {
+    fn a_pool_that_does_not_fit_is_a_typed_failure_with_the_engines_message() {
         let refusal = marsh_services::engine::check_pool_fits(24 << 30, 22_930 << 20).unwrap_err();
         let error = start_reporting(&[failed(FailureKind::DiskTooSmall, &refusal)]).unwrap_err();
         assert!(error.pool_too_small, "{error}");
-        assert!(error.message.contains("22930 MiB free"), "{error}");
+        assert_eq!(error.message, refusal);
+        let trimmed = error.message_without_remove_advice();
+        assert!(trimmed.contains("22930 MiB free"), "{trimmed}");
         assert!(
-            error.message.contains("marsh config services-disk-size"),
-            "{error}"
+            trimmed.contains("marsh config services-disk-size"),
+            "{trimmed}"
         );
         assert!(
-            !error.message.contains("docker rm") && !error.message.contains("remove"),
-            "{error}"
+            !trimmed.contains("docker rm") && !trimmed.contains("remove"),
+            "{trimmed}"
         );
     }
 

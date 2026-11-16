@@ -64,24 +64,31 @@ impl ApiError {
 /// What a lane drop's `DELETE /images/<name>` came to, told apart by who spoke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Untag {
-    /// The name is gone: a 2xx, or a 404 (it was not there).
+    /// The name is gone: a 2xx, or the engine's 404 (it was not there).
     Confirmed,
-    /// The engine answered and refused (a 409 conflict, a 403 from the filter's
-    /// own rules, a 500): the same request will probably be refused again.
+    /// The engine answered and refused (a 409 conflict, a 500): the same
+    /// request will probably be refused again.
     Refused(u16),
-    /// No answer, or one the filter made up for a lost one (502, 503, 504): the
-    /// delete may or may not have happened. Never counted against the record.
+    /// No answer, or an answer that is not the engine's word on this name: the
+    /// filter's own reply (a full connection cap, a hold, a lost reply it made up
+    /// a 502 for), or a busy or unavailable engine (429, 502 to 504). The delete
+    /// may or may not have happened. Never counted against the record.
     Unknown,
 }
 
 impl Untag {
-    /// The filter answers 502 when the engine's reply never came, and 503/504
-    /// when it could not ask; the engine does not send these for an image delete.
+    /// Classify a reply. The filter's own replies are recognised by their body
+    /// (`policy::http::refusal_body`), whatever their status; the statuses a
+    /// real engine rarely sends for a delete (429, 502 to 504) are treated the
+    /// same way, so the split is safe even when the engine does send them: the
+    /// cost is a retry, never a release.
     #[must_use]
-    pub fn from_status(code: u16) -> Self {
+    pub fn from_reply(code: u16, body: &str) -> Self {
         match code {
-            200..=299 | 404 => Self::Confirmed,
-            502..=504 => Self::Unknown,
+            200..=299 => Self::Confirmed,
+            _ if crate::policy::http::is_refusal_body(body) => Self::Unknown,
+            404 => Self::Confirmed,
+            429 | 502..=504 => Self::Unknown,
             other => Self::Refused(other),
         }
     }
@@ -93,7 +100,7 @@ impl Untag {
 pub fn untag_outcome(result: &Result<Vec<u8>, ApiError>) -> Untag {
     match result {
         Ok(_) => Untag::Confirmed,
-        Err(ApiError::Status { code, .. }) => Untag::from_status(*code),
+        Err(ApiError::Status { code, body }) => Untag::from_reply(*code, body),
         Err(_) => Untag::Unknown,
     }
 }
@@ -587,21 +594,30 @@ impl Engine {
 mod tests {
     use super::*;
 
-    /// Only the engine's own refusals are refusals: a lost reply (the filter's
-    /// 502, a broken transport) is unknown, and a 404 means the name is gone.
+    /// Only the engine's own refusals are refusals: anything the filter made
+    /// up (marked by its body, whatever the status), a busy or unavailable
+    /// answer (429, 502 to 504) and a transport error are unknown, and a 404
+    /// from the engine means the name is gone.
     #[test]
     fn a_delete_is_confirmed_refused_or_unknown() {
-        let status = |code| ApiError::Status {
+        let engine = |code| ApiError::Status {
             code,
-            body: String::new(),
+            body: r#"{"message":"conflict: unable to delete"}"#.into(),
+        };
+        let filter = |code| ApiError::Status {
+            code,
+            body: crate::policy::http::refusal_body("too many connections"),
         };
         assert_eq!(untag_outcome(&Ok(Vec::new())), Untag::Confirmed);
-        assert_eq!(untag_outcome(&Err(status(404))), Untag::Confirmed);
+        assert_eq!(untag_outcome(&Err(engine(404))), Untag::Confirmed);
         for code in [403, 409, 500] {
-            assert_eq!(untag_outcome(&Err(status(code))), Untag::Refused(code));
+            assert_eq!(untag_outcome(&Err(engine(code))), Untag::Refused(code));
         }
-        for code in [502, 503, 504] {
-            assert_eq!(untag_outcome(&Err(status(code))), Untag::Unknown, "{code}");
+        for code in [429, 502, 503, 504] {
+            assert_eq!(untag_outcome(&Err(engine(code))), Untag::Unknown, "{code}");
+        }
+        for code in [400, 403, 404, 413, 429, 431, 500, 502, 503] {
+            assert_eq!(untag_outcome(&Err(filter(code))), Untag::Unknown, "{code}");
         }
         let io = std::io::Error::from(std::io::ErrorKind::TimedOut);
         assert_eq!(untag_outcome(&Err(ApiError::Io(io))), Untag::Unknown);

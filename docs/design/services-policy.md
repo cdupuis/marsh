@@ -397,19 +397,30 @@ has is checked.
     it from the services timer (every 5 s), printing `marshd: dropping lane <id>
     left image tag <name>; will retry` on its stderr; an unknown outcome is
     settled by the retry (a delete that did apply answers 404). The outcome of
-    each delete is one of `engine_api::Untag`: `Confirmed` (2xx, 404), `Refused`
-    (the engine's own refusal: a 409, the last tag of an image another lane's
-    container uses; a 403; a 500) and `Unknown` (no answer, or the 502, 503 or 504
-    the filter itself makes up for a lost reply or a failed ask: the delete may
-    have happened). Only `Refused` is counted in the record
-    (`TagRec.untag_refused`); after `MAX_UNTAG_REFUSALS` (12, about a minute) the
-    record is released and that round's `left` says `<name> (the engine refused to
-    untag it N times, last answer C; it stays in the engine, and `marsh docker rm`
-    removes it)`, so the next retry finds nothing and the journal entry ends. What
-    is given up is a tag that stays in the engine: on a pulled image it is again
-    protected and unrecorded. A run of lost replies never gives up. (The filter's
-    status is the only signal: `Engine::call` does not expose headers. No answer
-    the engine sends for an image delete is a 502 to 504.)
+    each delete is one of `engine_api::Untag`: `Confirmed` (2xx, the engine's 404),
+    `Refused` (the engine's own refusal: a 409, the last tag of an image another
+    lane's container uses; a 500) and `Unknown` (no answer; **any reply the filter
+    made itself**, whatever its status: a full connection cap (429), a hold by
+    another workspace (403), the 502 it makes up for a lost engine reply, a 503
+    when it could not ask; and, conservatively, a 429 or 502 to 504 from the
+    engine). The filter's replies are recognised by their body, which every one of
+    them has (`policy::http::refusal_body`, `{"message":"marsh: ..."}`, the only
+    place the filter writes a status of its own; pinned by
+    `a_refusal_body_is_what_the_cleanup_recognises`). Only `Refused` is counted in
+    the record (`TagRec.untag_refused`); after `MAX_UNTAG_REFUSALS` (12, about a
+    minute) the record is released and that round's `left` says `<name> (the
+    engine refused to untag it N times, last answer C; it stays in the engine, and
+    `marsh docker rm` removes it)`, so the next retry finds nothing and the journal
+    entry ends. What is given up is a tag that stays in the engine: on a pulled
+    image it is again protected and unrecorded. A run of lost replies, busy caps
+    or holds never gives up (a real engine that answers 503 for ever is retried
+    for ever: fail closed, the old behaviour).
+  - **A newer claim during the cleanup.** The drop runs after the lane's
+    containers are gone, but a leftover client of the lane can still talk to its
+    socket. If the workspace claims a name again while the cleanup's delete of the
+    older claim is in flight, the confirmation releases only the older claim; the
+    newer record is still the workspace's tag in the engine, so the cleanup reports
+    it in `left` and the retry untags it.
   - **Not covered:** tags whose records were lost when the ledger was quarantined
     as corrupt are unrecorded and, on a pulled image, are protected like any pulled
     tag; only `marsh docker rm` (which removes the whole Docker VM) clears them.
@@ -429,7 +440,8 @@ has is checked.
     `only_a_2xx_or_a_404_confirms_an_untag`, `a_failed_untag_keeps_the_claim_until_it_is_confirmed`,
     `a_permanent_refusal_is_given_up_with_a_message`, `the_relays_endpoint_runs_the_cleanup`,
     `a_claim_during_the_untag_is_refused`, `released_and_stale_records_free_the_tag_table`,
-    `a_delete_is_confirmed_refused_or_unknown`, `a_lost_engine_reply_is_not_counted_as_a_refusal`,
+    `a_delete_is_confirmed_refused_or_unknown`, `a_busy_project_cap_is_not_counted_as_an_engine_refusal`,
+    `a_late_confirmation_of_the_cleanup_reports_a_newer_claim`, `a_lost_engine_reply_is_not_counted_as_a_refusal`,
     `a_late_rmi_answer_keeps_the_same_workspaces_newer_claim`, `pulling_over_your_own_stale_record_releases_it`,
     `dropping_a_workspace_untags_its_tags_after_its_objects` (Linux).
 - **Not covered.** The default `docker build -t` and `docker buildx build -t` send no

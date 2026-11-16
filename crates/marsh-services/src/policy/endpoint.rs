@@ -1110,12 +1110,22 @@ impl Services {
                     .is_some_and(|r| r.scope == scope)
             };
             match outcome {
-                Untag::Confirmed => {
-                    if let Err(e) = self.ledger.release_tag(scope, &name, rec.claim) {
+                Untag::Confirmed => match self.ledger.release_tag(scope, &name, rec.claim) {
+                    Ok(true) => {}
+                    // Not released: the delete's own commit did it already, or the
+                    // scope claimed the name again meanwhile (a client of the closing
+                    // lane). The newer claim is the scope's tag, still in the engine:
+                    // report it, so the drop is retried and untags it.
+                    Ok(false) => {
+                        if ours() {
+                            left.push(name);
+                        }
+                    }
+                    Err(e) => {
                         self.log(&format!("image tag record not released: {e}"));
                         left.push(name);
                     }
-                }
+                },
                 Untag::Unknown => {
                     if ours() {
                         left.push(name);

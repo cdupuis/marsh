@@ -23,7 +23,7 @@ pub const SHELL_VARIABLE: &str = "MARSH_SHELL";
 /// Exported to the chosen shell: the session's registered-command directory.
 pub const BIN_VARIABLE: &str = "MARSH_SESSION_BIN";
 /// Per-home default, beside (never inside) the guest home.
-pub const CONFIG_FILE: &str = "config.json";
+pub const CONFIG_FILE: &str = marsh_daemon::config_file::CONFIG_FILE;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ShellChoice {
@@ -291,7 +291,7 @@ pub fn config_command(arguments: &[OsString], scope_root: &Path) -> Result<i32, 
                     2,
                 ));
             }
-            write_config(scope_root, SERVICES_DISK_SIZE_KEY, (*size).into())
+            write_config(scope_root, SERVICES_DISK_SIZE_KEY, &(*size).into())
                 .map_err(|error| config_write_error(scope_root, &error))?;
             println!("{size}");
             Ok(0)
@@ -314,7 +314,7 @@ pub fn config_command(arguments: &[OsString], scope_root: &Path) -> Result<i32, 
                         2,
                     )
                 })?;
-            write_config(scope_root, SERVICES_IDLE_KEY, seconds.into())
+            write_config(scope_root, SERVICES_IDLE_KEY, &seconds.into())
                 .map_err(|error| config_write_error(scope_root, &error))?;
             println!("{seconds}");
             Ok(0)
@@ -345,7 +345,7 @@ pub fn config_command(arguments: &[OsString], scope_root: &Path) -> Result<i32, 
                 "skills-mirror" => SKILLS_MIRROR_KEY,
                 _ => CLOUD_DELEGATE_KEY,
             };
-            write_config(scope_root, key, (*value == "on").into()).map_err(|error| {
+            write_config(scope_root, key, &(*value == "on").into()).map_err(|error| {
                 (
                     format!(
                         "cannot write {}: {error}",
@@ -360,7 +360,7 @@ pub fn config_command(arguments: &[OsString], scope_root: &Path) -> Result<i32, 
         ["shell", name] => {
             let choice =
                 ShellChoice::parse(name).ok_or_else(|| (invalid("marsh config shell", name), 2))?;
-            write_config(scope_root, "shell", choice.name().into()).map_err(|error| {
+            write_config(scope_root, "shell", &choice.name().into()).map_err(|error| {
                 (
                     format!(
                         "cannot write {}: {error}",
@@ -411,7 +411,16 @@ fn config_value(scope_root: &Path) -> Result<serde_json::Value, String> {
 
 /// A list of canonical project roots in `config.json`.
 fn project_list(scope_root: &Path, key: &str) -> Result<Vec<String>, String> {
-    match config_value(scope_root)?.get(key) {
+    project_roots(config_value(scope_root)?.get(key), key, scope_root)
+}
+
+/// `value`, the entry `key` of the document, as a list of project roots.
+fn project_roots(
+    value: Option<&serde_json::Value>,
+    key: &str,
+    scope_root: &Path,
+) -> Result<Vec<String>, String> {
+    match value {
         None | Some(serde_json::Value::Null) => Ok(Vec::new()),
         Some(serde_json::Value::Array(roots)) => roots
             .iter()
@@ -497,20 +506,31 @@ fn services_config(
             }
         }
         Some(value) => {
-            let mut on = project_list(scope_root, SERVICES_PROJECTS_KEY).map_err(fail)?;
-            let mut off = project_list(scope_root, DOCKER_OFF_KEY).map_err(fail)?;
-            on.retain(|root| root != &key);
-            off.retain(|root| root != &key);
-            if value == "on" {
-                on.push(key);
-            } else {
-                off.push(key);
-            }
-            on.sort();
-            off.sort();
-            write_config(scope_root, SERVICES_PROJECTS_KEY, on.into())
-                .and_then(|()| write_config(scope_root, DOCKER_OFF_KEY, off.into()))
-                .map_err(|error| config_write_error(scope_root, &error))?;
+            // Both lists are read, changed and written in one locked
+            // transaction: the daemon's forget of a gone project and another
+            // `marsh config` run cannot slip between the read and the write.
+            marsh_daemon::config_file::update(scope_root, |document| {
+                let mut on = project_roots(
+                    document.get(SERVICES_PROJECTS_KEY),
+                    SERVICES_PROJECTS_KEY,
+                    scope_root,
+                )?;
+                let mut off =
+                    project_roots(document.get(DOCKER_OFF_KEY), DOCKER_OFF_KEY, scope_root)?;
+                on.retain(|root| root != &key);
+                off.retain(|root| root != &key);
+                if value == "on" {
+                    on.push(key.clone());
+                } else {
+                    off.push(key.clone());
+                }
+                on.sort();
+                off.sort();
+                document.insert(SERVICES_PROJECTS_KEY.into(), on.into());
+                document.insert(DOCKER_OFF_KEY.into(), off.into());
+                Ok(())
+            })
+            .map_err(|error| config_update_error(scope_root, error))?;
             println!("{value}");
         }
     }
@@ -530,12 +550,24 @@ fn docker_default_config(word: Option<&str>, scope_root: &Path) -> Result<i32, (
             }
         ),
         Some(value) => {
-            write_config(scope_root, DOCKER_DEFAULT_KEY, (value == "on").into())
+            write_config(scope_root, DOCKER_DEFAULT_KEY, &(value == "on").into())
                 .map_err(|error| config_write_error(scope_root, &error))?;
             println!("{value}");
         }
     }
     Ok(0)
+}
+
+/// A refused change keeps its own message; a lock or write failure is a write
+/// error.
+fn config_update_error(
+    scope_root: &Path,
+    error: marsh_daemon::config_file::ConfigError,
+) -> (String, i32) {
+    match error {
+        marsh_daemon::config_file::ConfigError::Rejected(message) => (message, 1),
+        marsh_daemon::config_file::ConfigError::Io(error) => config_write_error(scope_root, &error),
+    }
 }
 
 fn config_write_error(scope_root: &Path, error: &io::Error) -> (String, i32) {
@@ -589,7 +621,7 @@ fn vm_idle_days_command(value: Option<&str>, scope_root: &Path) -> Result<i32, (
                 )
             })?,
     };
-    write_config(scope_root, VM_IDLE_DAYS_KEY, days.into()).map_err(|error| {
+    write_config(scope_root, VM_IDLE_DAYS_KEY, &days.into()).map_err(|error| {
         (
             format!(
                 "cannot write {}: {error}",
@@ -602,40 +634,21 @@ fn vm_idle_days_command(value: Option<&str>, scope_root: &Path) -> Result<i32, (
     Ok(0)
 }
 
+/// Set one key of `config.json`, under the lock every writer of that file
+/// takes (`marsh_daemon::config_file`).
 pub(crate) fn write_config(
     scope_root: &Path,
     key: &str,
-    value: serde_json::Value,
+    value: &serde_json::Value,
 ) -> io::Result<()> {
-    if !scope_root.exists() {
-        std::fs::create_dir_all(scope_root)?;
-        std::fs::set_permissions(scope_root, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let path = scope_root.join(CONFIG_FILE);
-    let mut document = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => serde_json::Map::new(),
-        Err(error) => return Err(error),
-    };
-    document.insert(key.into(), value);
-    let mut encoded = serde_json::to_vec_pretty(&document)?;
-    encoded.push(b'\n');
-    let temporary = scope_root.join(format!(".{CONFIG_FILE}.{}", std::process::id()));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        io::Write::write_all(&mut file, &encoded)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, &path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    marsh_daemon::config_file::update(scope_root, |document| {
+        document.insert(key.into(), value.clone());
+        Ok(())
+    })
+    .map_err(|error| match error {
+        marsh_daemon::config_file::ConfigError::Io(error) => error,
+        marsh_daemon::config_file::ConfigError::Rejected(message) => io::Error::other(message),
+    })
 }
 
 // ---- guest launch ---------------------------------------------------------
@@ -929,6 +942,145 @@ mod tests {
             Ok(0)
         );
         assert!(!marsh_daemon::cloud_delegate::configured(&config));
+    }
+
+    /// Every `marsh config` setter changes `config.json` under the lock the
+    /// daemon takes for its own changes: with another writer holding it, the
+    /// setter waits, and writes only after the other lets go.
+    #[test]
+    fn every_config_setter_waits_for_the_shared_config_lock() {
+        type Setter = Box<dyn Fn(&Path) -> Result<i32, (String, i32)> + Send + Sync>;
+        let words =
+            |words: &[&str]| -> Vec<OsString> { words.iter().map(OsString::from).collect() };
+        let setters: Vec<(&str, Setter)> = vec![
+            (
+                "a plain key",
+                Box::new(move |root| config_command(&words(&["services-disk-size", "50g"]), root)),
+            ),
+            (
+                "a per-project docker setting (two lists)",
+                Box::new(|root| services_config(Some("off"), root, Path::new("/Users/a/one"))),
+            ),
+            (
+                "the docker default",
+                Box::new(|root| docker_default_config(Some("off"), root)),
+            ),
+            (
+                "a job limit",
+                Box::new(move |root| {
+                    config_command(&words(&["limit", "tree-launch-rate", "default"]), root)
+                }),
+            ),
+        ];
+        for (what, setter) in setters {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("home");
+            std::fs::create_dir(&root).unwrap();
+            let lock = std::fs::File::create(root.join("config.json.lock")).unwrap();
+            let held =
+                nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap();
+            let writer = {
+                let root = root.clone();
+                std::thread::spawn(move || setter(&root))
+            };
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!writer.is_finished(), "{what} did not wait for the lock");
+            drop(held);
+            assert!(writer.join().unwrap().is_ok(), "{what}");
+        }
+    }
+
+    /// `marsh config docker on|off` reads both project lists after it has the
+    /// lock: an update another writer makes while it waits is kept.
+    #[test]
+    fn docker_on_reads_its_lists_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("home");
+        std::fs::create_dir(&root).unwrap();
+        let lock = std::fs::File::create(root.join("config.json.lock")).unwrap();
+        let held =
+            nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap();
+        let writer = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                services_config(Some("on"), &root, Path::new("/Users/a/one"))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Another writer's change, made while this one waits.
+        std::fs::write(
+            root.join(CONFIG_FILE),
+            r#"{"services_projects": ["/Users/a/two"], "shell": "zsh"}"#,
+        )
+        .unwrap();
+        drop(held);
+        assert_eq!(writer.join().unwrap(), Ok(0));
+        assert_eq!(
+            services_projects(&root),
+            Ok(vec!["/Users/a/one".to_owned(), "/Users/a/two".to_owned()])
+        );
+        assert!(
+            std::fs::read_to_string(root.join(CONFIG_FILE))
+                .unwrap()
+                .contains("\"zsh\"")
+        );
+    }
+
+    /// `marsh config docker on|off` moves a project between the two lists in
+    /// one transaction: a reader of the file never sees the project in both
+    /// lists or in neither (two separate writes would show one of those between
+    /// them).
+    #[test]
+    fn docker_on_and_off_change_both_lists_in_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("home");
+        std::fs::create_dir(&root).unwrap();
+        let project = "/Users/a/one";
+        std::fs::write(
+            root.join(CONFIG_FILE),
+            serde_json::json!({
+                SERVICES_PROJECTS_KEY: [project],
+                DOCKER_OFF_KEY: [],
+                // A large value makes each write slow enough to be seen.
+                "pad": "x".repeat(4 << 20),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let (torn, reads) = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let (mut torn, mut reads) = (0_u32, 0_u32);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let Ok(bytes) = std::fs::read(root.join(CONFIG_FILE)) else {
+                        continue;
+                    };
+                    let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    let listed = |key: &str| {
+                        document[key]
+                            .as_array()
+                            .is_some_and(|roots| roots.iter().any(|root| root == project))
+                    };
+                    reads += 1;
+                    if listed(SERVICES_PROJECTS_KEY) == listed(DOCKER_OFF_KEY) {
+                        torn += 1;
+                    }
+                }
+                (torn, reads)
+            });
+            for _ in 0..15 {
+                for word in ["off", "on"] {
+                    assert_eq!(
+                        services_config(Some(word), &root, Path::new(project)),
+                        Ok(0)
+                    );
+                }
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            reader.join().unwrap()
+        });
+        assert!(reads > 0);
+        assert_eq!(torn, 0, "{torn} of {reads} reads saw a half-made change");
     }
 
     #[test]

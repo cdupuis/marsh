@@ -7699,7 +7699,7 @@ mod tests {
         assert_eq!(models(&backend), ["claude", "codex"]);
     }
 
-    fn test_stock(runner: Arc<dyn marsh_runtime::CommandRunner>) -> StockSbx {
+    pub(crate) fn test_stock(runner: Arc<dyn marsh_runtime::CommandRunner>) -> StockSbx {
         static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         let root = ROOT.get_or_init(|| {
             tempfile::Builder::new()
@@ -7723,13 +7723,22 @@ mod tests {
         commands: BTreeMap<String, RegisteredKit>,
         runner: Arc<dyn marsh_runtime::CommandRunner>,
     ) -> StockDaemonBackend {
+        backend_with_stock(daemon_home, commands, test_stock(runner))
+    }
+
+    /// The same backend over a chosen stock adapter.
+    pub(crate) fn backend_with_stock(
+        daemon_home: &std::path::Path,
+        commands: BTreeMap<String, RegisteredKit>,
+        stock: StockSbx,
+    ) -> StockDaemonBackend {
         let shell_image = marsh_contracts::OciImage::parse(format!(
             "dhi.example/shell@sha256:{}",
             "f".repeat(64)
         ))
         .unwrap();
         StockDaemonBackend::new(
-            Arc::new(test_stock(runner)),
+            Arc::new(stock),
             commands,
             BackendConfig {
                 worker_binary: daemon_home.join("worker"),

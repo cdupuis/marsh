@@ -285,7 +285,7 @@ Network create takes no options. `docker commit` may only name a repository unde
 schema (the `moby` exporter; local attributes only; no `push`), rebuilt before
 it is forwarded.
 
-**Image tags have an owner, for the REST routes only (DA1-02 is partly fixed).**
+**Image tags have an owner on the REST routes; a BuildKit stream that moves one is detected afterwards and put back (DA1-02 is partly fixed).**
 Every name a REST request would give an image is reserved first, in one spelling
 (`repo:tag`, the default registry and `library/` dropped; a `tag` parameter replaces
 a `:tag` in `repo`): `POST /images/<id>/tag`, each build `t`, each name of a
@@ -377,8 +377,10 @@ has is checked.
     ledger): a delete begun before the workspace claimed the same name again, or
     this cleanup, cannot retire the newer record.
     **Gap:** a build over `/grpc` (not filtered, see below) can put an image under
-    a name without any of these seeing it, and that name's record can be one that
-    went stale or a live one of another lane (lane A `docker tag x N`, lane B
+    a name without any of these seeing it. The detection below puts a protected
+    name back when the stream ends, but not when the owner was building too or the
+    change came after the stream, so a record can still be a live one of another
+    lane (lane A `docker tag x N`, lane B
     `docker build -t N`): closing A would then untag B's image. The damage is a
     rebuildable tag, never a container, volume or data. Storing the source image ID
     at claim time and deleting only a name still on it was considered and not done:
@@ -444,13 +446,60 @@ has is checked.
     `a_late_confirmation_of_the_cleanup_reports_a_newer_claim`, `a_lost_engine_reply_is_not_counted_as_a_refusal`,
     `a_late_rmi_answer_keeps_the_same_workspaces_newer_claim`, `pulling_over_your_own_stale_record_releases_it`,
     `dropping_a_workspace_untags_its_tags_after_its_objects` (Linux).
-- **Not covered.** The default `docker build -t` and `docker buildx build -t` send no
-  `POST /build`: they use `/grpc` and `/session` only (recorded e3 traffic,
-  `e3/corpus/cli.jsonl`), and the tag names are inside the opaque BuildKit solve.
-  Until `/grpc` is gated (DA1-04), a lane can still build over another workspace's
-  tag that way. A REST `/build` (the legacy builder, `DOCKER_BUILDKIT=0`, or a
-  hand-made call) is covered. A scope can also create a name nobody has yet and
-  build it first (the rule above).
+- **A BuildKit stream is detected, not gated** (DA1-02, DA1-04; `bk_watch.rs`). The
+  default `docker build -t` and `docker buildx build -t` send no `POST /build`: they
+  use `/grpc` and `/session` only (recorded e3 traffic, `e3/corpus/cli.jsonl`), and
+  the tag names are inside the opaque BuildKit solve, which is not decoded (no HTTP/2
+  or protobuf reader). A REST `/build` (the legacy builder, `DOCKER_BUILDKIT=0`, or a
+  hand-made call) is covered by the rules above. For a stream, the agent checks
+  afterwards:
+  1. When a `/grpc` or `/session` stream of workspace S switches protocols, before any
+     byte is relayed, the agent registers it and lists the engine's images as
+     itself (not through the filter). Every tag S may not move is kept with its image
+     ID: tags the ledger records to another workspace (with the record's claim serial),
+     and unrecorded names on an image with a registry digest (`postgres:16`).
+     At most 256 are kept, recorded ones first; more is an event ("not fully
+     checked"). A tag recorded to S, and an unrecorded name on a local image, are
+     S's to move. A list that fails is an event, and the stream runs unwatched
+     (fail open).
+  2. When the stream ends (the relay's pump returns, whoever closed it), the images are
+     listed again. A watched tag whose image changed (or that went) is settled under
+     the tag lock (`tag_res`, the one claims decide under), which is held across the
+     re-check and the engine call, so a claim of the name waits for it:
+     - **not touched:** no REST request held that name since the stream began (a
+       bounded log of holds by sequence number; a log that overflowed counts as
+       touched), and none held it when the stream began (its engine call could land
+       later). Any REST claim, pull or delete of a name is such a hold. Otherwise
+       the change is that request's, and nothing is said.
+     - **same claim:** the ledger still records the name to the same owner with the
+       same claim serial (an owner's `tag` replaces it, a delete or a dropped lane
+       releases it). Otherwise nothing is said.
+     - **owner idle:** the owner had no `/grpc` or `/session` stream of its own
+       running at any time since this stream began (running now, or ended after
+       it began). An owner's build legitimately moves its own tag, and with
+       overlapping streams the agent cannot tell whose it was: the event is raised
+       ("not restored") and nothing is changed.
+     - Then the name is read once more; if it is back on the old image nothing
+       is done, otherwise `POST /images/<old id>/tag` puts it back (a plain tag, never
+       forced, never a delete) and the restore counts as a hold itself, so that a
+       stream that began before it does not take the restored tag for a change. A
+       refusal (the old image is gone) is an event, "not restored".
+     An unrecorded pulled name has no owner: only the first two rules apply.
+  3. An event is a line on the agent's standard error (`marsh-services: BuildKit
+     stream of workspace ...`) and an entry of `Services::tag_events()` (the last 64).
+     The offending workspace's next REST call is unaffected: no state is kept
+     against it.
+  Not done, and said so in `docs/docker.md`: **the overwrite is detected after the
+  stream, not prevented**: while the build runs, and from its export until its stream
+  ends, the other workspace's tag points at the lane's image (a `docker run` of it
+  then runs the lane's image); a tag moved after its stream ended, or not back-able
+  because its old image went, is not repaired; a long-lived stream is checked only
+  when it ends (the 5 s reconcile tick does not look at open streams); the cache,
+  `buildx prune`/`du` and history stay as exposed as before (below). Tests: the
+  `bk_watch_tests` module of `endpoint_tests.rs` (restore, own tag, pulled name,
+  owner's own tag/pull/in-flight request/released record, owner building, two
+  streams, failed list at the start and the end, engine refusal, the 256 bound, the
+  lock), each checked to fail with its rule removed.
 - Names are not forced under `<workspace>/` (that would refuse `docker build -t app`
   and Compose's default names); the cost is that two workspaces cannot both build the
   same tag over REST, such as an `image:` plus `build:` stack.
@@ -581,7 +630,9 @@ witness and nothing else; `e3/witness.sh` runs the in-process rows
   recorded e3 traffic (`e3/corpus/cli.jsonl`) shows both use `/grpc` and `/session`
   and send no REST `/build`. Neither is done. This is also the piece DA1-02 (image
   tag ownership) needs: the tag names of a normal build are inside the same stream,
-  so gating `/grpc` is one piece of follow-up work for both. The behaviors above
+  so gating `/grpc` is one piece of follow-up work for both (until then a tag a
+  stream moved is detected and put back, see "A BuildKit stream is detected, not
+  gated" above). The behaviors above
   are BuildKit's and were traced from its API, not run through the filter.
 - **A `/grpc` push is a residual** (DECISIONS 21): a BuildKit solve may export to
   a registry (`type=image,push=true`) inside the opaque gRPC stream, where the
@@ -604,6 +655,6 @@ witness and nothing else; `e3/witness.sh` runs the in-process rows
 - Images are shared by every scope of a project: any scope may run an image
   another created. Only the tag names are owned, and only on the REST routes
   (above); a BuildKit build over `/grpc`, which is what `docker build` and `docker
-  buildx build` use, can still name any tag.
+  buildx build` use, can still name any tag, and is detected afterwards (above).
 - Network and volume names are global in the engine; a name used by another
   scope is refused.

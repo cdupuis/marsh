@@ -688,10 +688,26 @@ In plain words:
   `postgres:16`, and `docker rmi` refuses to remove one (pulling it again is
   allowed). A build sent over Docker's REST API (the legacy
   builder, `DOCKER_BUILDKIT=0`) is checked the same way. **A normal `docker build -t` or `docker buildx
-  build -t` is not covered**: those talk to BuildKit over the stream described
+  build -t` is not prevented**: those talk to BuildKit over the stream described
   under [Builds and the cache](#builds-and-the-cache), which the filter does not
-  read, so a lane can still build an image under a tag the base runs. Do not rely
-  on tag ownership to keep lanes' images apart until that stream is filtered. Where
+  read, so a lane can still build an image under a tag the base runs (`docker
+  buildx build --load -t base-app:1 .` in a lane moved the base's `base-app:1`).
+  What marsh does instead is **detect it afterwards and put the tag back**: when a
+  build's stream ends, the agent looks again at the tags the stream's workspace may not
+  move (tags another workspace created, and names on pulled images such as
+  `postgres:16`), moves back any whose image changed, with a plain `docker tag` of the old
+  image ID (never forced; nothing is deleted), and says so on the services agent's
+  standard error. It does not do
+  that when another explanation exists: the tag's owner pulled, tagged or deleted it
+  meanwhile, or the owner had a build running too. Then it only reports the change
+  (so a lane's own legitimate build of its own tag is never touched). **What stays
+  open:** the overwrite is seen when the build's stream ends, not stopped: from the
+  moment the build moves the tag until then (the whole build, for `buildx`), the
+  base's tag points at the lane's image, and a `docker run base-app:1` in that time runs the lane's image.
+  A change made after a stream ended, or one that cannot be put back (the old
+  image is gone), is not repaired. At most 256 protected tags are watched per
+  stream, and a stream whose image list could not be read runs unwatched, with an
+  event. The BuildKit cache and history are as exposed as before. Where
   it applies, the workspace that creates a tag may move it; a name stays free until
   an image has it (another workspace can create it first), and it is free again
   after `docker rmi`. Two lanes cannot both build `-t app` over the REST API; give

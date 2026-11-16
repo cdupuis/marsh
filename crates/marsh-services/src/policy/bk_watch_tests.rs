@@ -946,7 +946,7 @@ fn streams_beginning_during_the_first_list_are_not_remembered_by_name() {
     );
 }
 
-/// A name too long for a tag is said to be unwatched, never skipped in silence; an
+/// A name that cannot be a tag (too long, or one the filter does not accept) is said to be unwatched, never skipped in silence; an
 /// untagged image (`<none>:<none>`) is not a name.
 #[test]
 fn a_name_too_long_to_watch_is_reported_and_an_untagged_image_is_not() {
@@ -963,7 +963,7 @@ fn a_name_too_long_to_watch_is_reported_and_an_untagged_image_is_not() {
     let c = open_stream(&b, "/grpc");
     w.end(&c, B);
     assert_eq!(w.unchecked(), 1);
-    assert!(w.h.svc.tag_events()[0].detail.contains("too long to watch"));
+    assert!(w.h.svc.tag_events()[0].detail.contains("cannot be watched"));
 }
 
 /// At the cap "unable to check" is the first to go, as the docs say (not the oldest
@@ -994,6 +994,30 @@ fn unable_to_check_goes_first_at_the_cap() {
     assert_eq!(w.reports()[0].0, "t00:1");
 }
 
+/// A new "unable to check" is not the first thing to go when the list is full of
+/// reports: it stays, and one report of a tag that has more than one goes instead
+/// (or, with every tag once, the oldest).
+#[test]
+fn a_new_unable_to_check_is_not_evicted_at_once() {
+    let w = World::new("bk-cap-new");
+    let b = lane(&w.h, B);
+    for i in 0..64 {
+        let tag = format!("t{i:02}:1");
+        w.build(&tag, &format!("sha256:t{i:02}"));
+        w.h.svc.ledger.set_tag(A, &tag).unwrap();
+    }
+    let c = open_stream(&b, "/grpc");
+    for i in 0..64 {
+        w.build(&format!("t{i:02}:1"), "sha256:lane");
+    }
+    w.end(&c, B);
+    assert_eq!((w.unchecked(), w.reports().len()), (0, 64));
+    w.st.lock().unwrap().fail_list = true;
+    let c = open_stream(&b, "/grpc");
+    w.end(&c, B);
+    assert_eq!((w.unchecked(), w.reports().len()), (1, 63));
+}
+
 /// Reports say when several builds ran at once (the workspace named may not be the
 /// one that moved the tag), in a field and in the text.
 #[test]
@@ -1020,6 +1044,26 @@ fn a_report_says_when_builds_overlapped() {
     assert!(
         together.overlapped && together.detail.contains("Several builds ran at once"),
         "{together:?}"
+    );
+}
+
+/// The stream that began first and ends first says several builds ran at once
+/// too (a later stream's beginning marks the windows already running).
+#[test]
+fn the_earlier_stream_reports_the_overlap_when_it_finishes_first() {
+    let w = World::new("bk-overlap3");
+    let (b, c3) = (lane(&w.h, B), lane(&w.h, "lane-c"));
+    let cb = open_stream(&b, "/grpc");
+    let cc = open_stream(&c3, "/grpc");
+    w.build("base-app:1", "sha256:lane");
+    w.end(&cb, B);
+    w.end(&cc, "lane-c");
+    let events = w.h.svc.tag_events();
+    assert_eq!(events.len(), 1);
+    assert!(
+        events[0].overlapped && events[0].detail.contains("Several builds ran at once"),
+        "{:?}",
+        events[0]
     );
 }
 

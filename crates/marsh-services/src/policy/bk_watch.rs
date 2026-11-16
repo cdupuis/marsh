@@ -142,11 +142,11 @@ impl Bk {
                         p.kind == TagEventKind::Changed && p.tag == self.events[i].1.tag
                     })
                 };
-            let drop = self
-                .events
-                .iter()
-                .position(|(_, e)| e.kind == TagEventKind::Unchecked)
-                .or_else(|| (0..self.events.len()).find(|&i| !first_of_tag(i)))
+            // Never the event just added: "unable to check" must show up.
+            let last = self.events.len() - 1;
+            let drop = (0..last)
+                .find(|&i| self.events[i].1.kind == TagEventKind::Unchecked)
+                .or_else(|| (0..last).find(|&i| !first_of_tag(i)))
                 .unwrap_or(0);
             self.events.remove(drop);
         }
@@ -348,7 +348,7 @@ impl Scope {
                     );
                 }
                 if skipped {
-                    svc.unchecked(&ws, "some image names are too long to watch");
+                    svc.unchecked(&ws, "some image names cannot be watched (too long, or not a name the filter accepts)");
                 }
             }
         }

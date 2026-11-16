@@ -723,11 +723,12 @@ In plain words:
   `FROM alpine` with no change) makes its tag count as a pulled name, and a later build
   of that tag in the same lane is reported. At most 256 protected tags are watched
   per stream, and a stream whose image list could not be read runs unwatched, with an
-  "unable to check" report (so does an image name too long to watch). A pulled name stops
+  "unable to check" report (so does an image name that cannot be watched: too long, or not a name the filter accepts). A pulled name stops
   being watched once a local image holds it, and a name created after a build began is
   not watched by that build. Each build costs two image lists, the first before the
   build starts, and can wait for another workspace's tag claim that is in the engine
-  (up to 30 s). Reports are kept in the agent's memory until it restarts: none expires,
+  (up to 30 s for each claim ahead of it: they queue). Reports are kept in the agent's
+  memory until it restarts: none expires,
   also not after you put the tag back, and a repeated "unable to check" for the same
   workspace and cause is shown once. The BuildKit cache and history are as exposed as
   before. Where

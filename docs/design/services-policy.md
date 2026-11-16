@@ -467,13 +467,15 @@ has is checked.
      local image, are its to move. Any REST request during the list counts for every
      tag, and streams that begin during it are all remembered until it is done (then
      only owners of noted tags are kept, so a long stream cannot accumulate
-     workspaces). Image names the agent cannot make into a tag (over the 255 characters a
-     tag may have, as a long pulled name can) are not watched, and that is an "unable
+     workspaces). Image names the agent cannot make into a tag (over the 255 characters a tag may
+     have, as a long pulled name can, or not a name the filter accepts, such as an
+     IPv6 registry host) are not watched, and that is an "unable
      to check" event, not a silent skip; a list that fails is one too, and the stream
      runs (fail open). No lock is held across the list, but the tag table is locked briefly before
      it (to read the held names and open the window, as one step): a claim of another
      workspace that holds it across an engine inspect delays the start of a build by
-     up to the engine's progress timeout (30 s), on top of the list's own time.
+     up to the engine's progress timeout (30 s) for each claim ahead of it (claims queue
+     on the table), on top of the list's own time.
   2. **A stream ends** (the relay's pump returns, whoever closed it). The names are
      read again and each that has another image, or has gone, is reported once:
      time, tag, owner (`None`: a pulled name), previous and current image ID, a

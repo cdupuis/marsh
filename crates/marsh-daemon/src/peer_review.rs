@@ -156,6 +156,8 @@ pub const RETIRED: &str = "retired";
 pub struct ClassTable {
     entries: Vec<Entry>,
     bands: Bands,
+    /// The compiled-in snapshot; a test builds a table over another one.
+    snapshot: &'static Snapshot,
 }
 
 const BUILTIN: &str = "model-classes";
@@ -173,6 +175,17 @@ impl ClassTable {
         Self {
             entries: entries(file.retired, file.rules, BUILTIN),
             bands: file.bands.expect("data/model-classes.yaml has bands"),
+            snapshot: snapshot(),
+        }
+    }
+
+    /// marsh's curated table over `snapshot` instead of the compiled-in one
+    /// (the seam that lets a test add a model the snapshot lacks).
+    #[cfg(test)]
+    fn with_snapshot(snapshot: Snapshot) -> Self {
+        Self {
+            snapshot: Box::leak(Box::new(snapshot)),
+            ..Self::builtin()
         }
     }
 
@@ -246,7 +259,7 @@ impl ClassTable {
         if name.is_empty() {
             return None;
         }
-        let row = lookup(model);
+        let row = self.snapshot.lookup(model);
         let family = row.map_or_else(String::new, |row| row.family.to_ascii_lowercase());
         let by_name = self.entry_for(&name);
         let by_family = (by_name.is_none() && !family.is_empty())
@@ -315,10 +328,10 @@ impl ClassTable {
     #[must_use]
     pub fn newest(&self, vendor: &str, class: ModelClass) -> Option<String> {
         let mut best: Option<&SnapshotModel> = None;
-        for row in snapshot()
-            .models
-            .iter()
-            .filter(|row| row.vendor == vendor && row.first_party() && plain_chat_model(&row.id))
+        for row in
+            self.snapshot.models.iter().filter(|row| {
+                row.vendor == vendor && row.first_party() && plain_chat_model(&row.id)
+            })
         {
             let name = normalize(&row.id);
             let family = row.family.to_ascii_lowercase();
@@ -350,7 +363,7 @@ impl ClassTable {
         let mut picked = Vec::<(String, &SnapshotModel, ModelClass, String)>::new();
         for vendor in vendors {
             let mut families = BTreeMap::<String, (&SnapshotModel, ModelClass)>::new();
-            for row in snapshot().models.iter().filter(|row| {
+            for row in self.snapshot.models.iter().filter(|row| {
                 row.vendor == *vendor && row.first_party() && plain_chat_model(&row.id)
             }) {
                 let name = normalize(&row.id);
@@ -688,45 +701,48 @@ struct SnapshotFile {
     models: Vec<SnapshotModel>,
 }
 
+#[derive(Debug)]
 struct Snapshot {
     models: Vec<SnapshotModel>,
     by_name: BTreeMap<String, Vec<usize>>,
 }
 
-fn snapshot() -> &'static Snapshot {
-    static SNAPSHOT_INDEX: OnceLock<Snapshot> = OnceLock::new();
-    SNAPSHOT_INDEX.get_or_init(|| {
-        // Rows are positional arrays (`fields`); serde reads them as structs.
-        let file: SnapshotFile =
-            serde_json::from_str(SNAPSHOT).expect("data/models-dev.json parses");
+impl Snapshot {
+    /// Rows are positional arrays (`fields`); serde reads them as structs.
+    fn parse(text: &str) -> Result<Self, serde_json::Error> {
+        let file: SnapshotFile = serde_json::from_str(text)?;
         let mut by_name = BTreeMap::<String, Vec<usize>>::new();
         for (index, row) in file.models.iter().enumerate() {
             by_name.entry(name_key(&row.id)).or_default().push(index);
         }
-        Snapshot {
+        Ok(Self {
             models: file.models,
             by_name,
-        }
-    })
+        })
+    }
+
+    /// The row for `model`: the named provider's (`provider/model`), else the
+    /// one its vendor serves itself, else the first.
+    fn lookup(&self, model: &str) -> Option<&SnapshotModel> {
+        let rows = self.by_name.get(&name_key(model))?;
+        let rows = rows.iter().map(|index| &self.models[*index]);
+        let provider = model
+            .trim()
+            .split_once('/')
+            .map(|(provider, _)| provider.to_ascii_lowercase());
+        let rows = rows.collect::<Vec<_>>();
+        rows.iter()
+            .find(|row| provider.as_deref() == Some(row.provider.as_str()))
+            .or_else(|| rows.iter().find(|row| row.first_party()))
+            .or_else(|| rows.iter().find(|row| !row.vendor.is_empty()))
+            .or_else(|| rows.first())
+            .copied()
+    }
 }
 
-/// The snapshot row for `model`: the named provider's (`provider/model`),
-/// else the one its vendor serves itself, else the first.
-fn lookup(model: &str) -> Option<&'static SnapshotModel> {
-    let snapshot = snapshot();
-    let rows = snapshot.by_name.get(&name_key(model))?;
-    let rows = rows.iter().map(|index| &snapshot.models[*index]);
-    let provider = model
-        .trim()
-        .split_once('/')
-        .map(|(provider, _)| provider.to_ascii_lowercase());
-    let rows = rows.collect::<Vec<_>>();
-    rows.iter()
-        .find(|row| provider.as_deref() == Some(row.provider.as_str()))
-        .or_else(|| rows.iter().find(|row| row.first_party()))
-        .or_else(|| rows.iter().find(|row| !row.vendor.is_empty()))
-        .or_else(|| rows.first())
-        .copied()
+fn snapshot() -> &'static Snapshot {
+    static SNAPSHOT_INDEX: OnceLock<Snapshot> = OnceLock::new();
+    SNAPSHOT_INDEX.get_or_init(|| Snapshot::parse(SNAPSHOT).expect("data/models-dev.json parses"))
 }
 
 fn valid_vendor(vendor: &str) -> Result<(), String> {
@@ -1248,6 +1264,133 @@ mod tests {
             .map(|found| (found.class.unwrap(), found.vendor.unwrap_or_default()))
     }
 
+    /// One snapshot row: provider, id, family, vendor, output price, released.
+    type Row = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        f64,
+        &'static str,
+    );
+
+    fn table_over(models: &[serde_json::Value]) -> ClassTable {
+        let text = serde_json::json!({"fields": [], "models": models}).to_string();
+        ClassTable::with_snapshot(Snapshot::parse(&text).unwrap())
+    }
+
+    fn rows(extra: &[Row]) -> Vec<serde_json::Value> {
+        extra
+            .iter()
+            .map(|(provider, id, family, vendor, output, released)| {
+                serde_json::json!([provider, id, family, vendor, output, false, released])
+            })
+            .collect()
+    }
+
+    /// The compiled-in snapshot with `extra` rows added: the models a refresh
+    /// of it may bring, which the product code must take in its stride.
+    fn builtin_plus(extra: &[Row]) -> ClassTable {
+        let mut file: serde_json::Value = serde_json::from_str(SNAPSHOT).unwrap();
+        file["models"].as_array_mut().unwrap().extend(rows(extra));
+        let table = ClassTable::with_snapshot(Snapshot::parse(&file.to_string()).unwrap());
+        assert_eq!(
+            table.snapshot.models.len(),
+            snapshot().models.len() + extra.len()
+        );
+        table
+    }
+
+    type Families = [(&'static str, ModelClass); 4];
+
+    /// The families of the two vendors' agents (`family_nickname` of each
+    /// rule), with the class the curated table gives each.
+    const FAMILIES: [(&str, &str, Families); 2] = [
+        (
+            "codex",
+            "openai",
+            [
+                ("luna", ModelClass::Small),
+                ("terra", ModelClass::Mid),
+                ("sol", ModelClass::Large),
+                ("astra", ModelClass::Large),
+            ],
+        ),
+        (
+            "claude",
+            "anthropic",
+            [
+                ("haiku", ModelClass::Small),
+                ("sonnet", ModelClass::Mid),
+                ("fable", ModelClass::Large),
+                ("opus", ModelClass::Large),
+            ],
+        ),
+    ];
+
+    fn released<'a>(table: &'a ClassTable, model: &str) -> &'a str {
+        let row = table
+            .snapshot
+            .models
+            .iter()
+            .find(|row| row.id == model && row.first_party());
+        row.unwrap_or_else(|| panic!("{model} is not in the snapshot"))
+            .released
+            .as_str()
+    }
+
+    /// The newest model of `family` that `vendor` serves itself, read off the
+    /// table's snapshot by release date (a shorter id wins a tie), not through
+    /// `newest` or `choices`: the expectation the two must agree with. It
+    /// knows nothing of retired models, so only a snapshot where no retired
+    /// model is newer than a current one may use it.
+    fn newest_of_family(table: &ClassTable, vendor: &str, family: &str) -> Option<String> {
+        let key = |row: &SnapshotModel| (row.released.clone(), std::cmp::Reverse(row.id.len()));
+        table
+            .snapshot
+            .models
+            .iter()
+            .filter(|row| row.vendor == vendor && row.first_party() && plain_chat_model(&row.id))
+            .filter(|row| normalize(&row.id).contains(&format!("-{family}")))
+            .max_by_key(|row| key(row))
+            .map(|row| row.id.clone())
+    }
+
+    /// What the `task` tool lists for `vendor`'s own agent: each family's
+    /// newest model, except a family more than `CHOICE_RECENT_DAYS` behind the
+    /// vendor's newest; small before mid before large, newest first within a
+    /// class.
+    fn expected_list(
+        table: &ClassTable,
+        vendor: &str,
+        families: &[(&str, ModelClass)],
+    ) -> Vec<(String, ModelClass, String)> {
+        let found = families
+            .iter()
+            .filter_map(|(family, class)| {
+                let model = newest_of_family(table, vendor, family)?;
+                Some((model, *class, (*family).to_owned()))
+            })
+            .collect::<Vec<_>>();
+        let latest = found
+            .iter()
+            .map(|(model, ..)| day_number(released(table, model)))
+            .max()
+            .unwrap_or(0);
+        let mut found = found
+            .into_iter()
+            .filter(|(model, ..)| day_number(released(table, model)) + CHOICE_RECENT_DAYS >= latest)
+            .collect::<Vec<_>>();
+        found.sort_by(|a, b| {
+            (a.1, std::cmp::Reverse(released(table, &a.0)), &a.0).cmp(&(
+                b.1,
+                std::cmp::Reverse(released(table, &b.0)),
+                &b.0,
+            ))
+        });
+        found
+    }
+
     #[test]
     fn the_curated_table_pairs_the_vendors_families() {
         let table = ClassTable::builtin();
@@ -1409,21 +1552,205 @@ mod tests {
         assert_eq!(vendor_name("openai"), "openai");
     }
 
+    const FABLE_A_MONTH_ON: Row = (
+        "anthropic",
+        "claude-fable-5-9",
+        "claude-fable",
+        "anthropic",
+        40.0,
+        "2026-12-16",
+    );
+
+    /// A model so much newer than the vendor's other families that they fall
+    /// out of the `task` tool's list (a family over half a year behind).
+    #[rustfmt::skip]
+    const FABLE_A_YEAR_ON: Row = ("anthropic", "claude-fable-6-0", "claude-fable", "anthropic", 40.0, "2027-12-16");
+
+    /// A newer model in every family, the vendor's large families in the
+    /// opposite order to today's, and a year on from the snapshot.
+    const EVERY_FAMILY_NEWER: [Row; 8] = [
+        (
+            "anthropic",
+            "claude-haiku-7-1",
+            "claude-haiku",
+            "anthropic",
+            0.5,
+            "2031-01-02",
+        ),
+        (
+            "anthropic",
+            "claude-sonnet-7-1",
+            "claude-sonnet",
+            "anthropic",
+            10.0,
+            "2031-01-03",
+        ),
+        (
+            "anthropic",
+            "claude-fable-7-1",
+            "claude-fable",
+            "anthropic",
+            40.0,
+            "2031-01-04",
+        ),
+        (
+            "anthropic",
+            "claude-opus-7-1",
+            "claude-opus",
+            "anthropic",
+            20.0,
+            "2031-01-05",
+        ),
+        (
+            "openai",
+            "gpt-7-luna",
+            "gpt-luna",
+            "openai",
+            0.5,
+            "2031-01-02",
+        ),
+        (
+            "openai",
+            "gpt-7.1-terra",
+            "gpt-terra",
+            "openai",
+            5.0,
+            "2031-01-03",
+        ),
+        (
+            "openai",
+            "gpt-7.1-astra",
+            "gpt-astra",
+            "openai",
+            50.0,
+            "2031-01-04",
+        ),
+        (
+            "openai",
+            "gpt-7.2-sol",
+            "gpt-sol",
+            "openai",
+            10.0,
+            "2031-01-05",
+        ),
+    ];
+
+    /// The compiled-in snapshot, and it with the models a refresh may bring.
+    /// Every test of what is newest and how it is listed runs on each.
+    fn refreshed_tables() -> Vec<(&'static str, ClassTable)> {
+        vec![
+            ("compiled-in snapshot", ClassTable::builtin()),
+            ("a newer fable", builtin_plus(&[FABLE_A_MONTH_ON])),
+            ("a fable a year on", builtin_plus(&[FABLE_A_YEAR_ON])),
+            ("every family newer", builtin_plus(&EVERY_FAMILY_NEWER)),
+        ]
+    }
+
+    /// Models no listing may reach for, though they are newer than every
+    /// current model: retired generations, ids that are not plain chat models,
+    /// and another host's listing of a maker's model.
+    const NEWER_BUT_NEVER_OFFERED: [Row; 8] = [
+        (
+            "anthropic",
+            "claude-opus-4-9",
+            "claude-opus",
+            "anthropic",
+            25.0,
+            "2032-01-01",
+        ),
+        (
+            "anthropic",
+            "claude-sonnet-4-9",
+            "claude-sonnet",
+            "anthropic",
+            15.0,
+            "2032-01-01",
+        ),
+        (
+            "anthropic",
+            "claude-haiku-5-9-preview",
+            "claude-haiku",
+            "anthropic",
+            0.5,
+            "2032-01-01",
+        ),
+        (
+            "anthropic",
+            "claude-haiku-5-9-20320101",
+            "claude-haiku",
+            "anthropic",
+            0.5,
+            "2032-01-01",
+        ),
+        ("openai", "gpt-5.9", "gpt-5", "openai", 10.0, "2032-01-01"),
+        (
+            "openai",
+            "gpt-6.3-terra-latest",
+            "gpt-terra",
+            "openai",
+            5.0,
+            "2032-01-01",
+        ),
+        (
+            "openai",
+            "gpt-6.3-luna-codex",
+            "gpt-luna",
+            "openai",
+            0.5,
+            "2032-01-01",
+        ),
+        (
+            "openrouter",
+            "anthropic/claude-opus-7-9",
+            "claude-opus",
+            "anthropic",
+            20.0,
+            "2032-01-01",
+        ),
+    ];
+
     #[test]
     fn newest_picks_the_vendors_current_model_in_a_class() {
-        let table = ClassTable::builtin();
+        for (what, table) in refreshed_tables() {
+            for (_, vendor, families) in FAMILIES {
+                for class in ModelClass::ALL {
+                    let named = families
+                        .iter()
+                        .filter(|(_, family_class)| *family_class == class)
+                        .filter_map(|(family, _)| newest_of_family(&table, vendor, family))
+                        .max_by_key(|model| {
+                            (released(&table, model), std::cmp::Reverse(model.len()))
+                        });
+                    assert!(
+                        named.is_some(),
+                        "{what}: no {vendor} {class:?} in the snapshot"
+                    );
+                    assert_eq!(
+                        table.newest(vendor, class),
+                        named,
+                        "{what}: {vendor} {class:?}"
+                    );
+                }
+            }
+        }
+        // The expectation moves with the snapshot: a model added to it is the
+        // answer, and the product does not go on naming the one it replaced.
+        let table = builtin_plus(&[FABLE_A_MONTH_ON]);
         assert_eq!(
-            table.newest("openai", ModelClass::Mid).as_deref(),
-            Some("gpt-6.1-terra")
+            table.newest("anthropic", ModelClass::Large).as_deref(),
+            Some("claude-fable-5-9")
         );
-        assert_eq!(
-            table.newest("anthropic", ModelClass::Mid).as_deref(),
-            Some("claude-sonnet-5-5")
-        );
-        assert_eq!(
-            table.newest("anthropic", ModelClass::Small).as_deref(),
-            Some("claude-haiku-5-5")
-        );
+        let table = builtin_plus(&EVERY_FAMILY_NEWER);
+        for (vendor, class, model) in [
+            ("anthropic", ModelClass::Small, "claude-haiku-7-1"),
+            ("anthropic", ModelClass::Mid, "claude-sonnet-7-1"),
+            ("anthropic", ModelClass::Large, "claude-opus-7-1"),
+            ("openai", ModelClass::Small, "gpt-7-luna"),
+            ("openai", ModelClass::Mid, "gpt-7.1-terra"),
+            ("openai", ModelClass::Large, "gpt-7.2-sol"),
+        ] {
+            assert_eq!(table.newest(vendor, class).as_deref(), Some(model));
+        }
     }
 
     fn agents(entries: &[(&str, bool)]) -> BTreeMap<String, AgentFacts> {
@@ -1595,9 +1922,13 @@ mod tests {
             .filter(|r| r.class == Some(ModelClass::Mid))
             .map(|r| (r.agent.as_str(), r.model.as_str()))
             .collect::<Vec<_>>();
+        let newest = |vendor| table.newest(vendor, ModelClass::Mid).unwrap();
         assert_eq!(
             mid,
-            [("claude", "claude-sonnet-5-5"), ("codex", "gpt-6.1-terra")]
+            [
+                ("claude", newest("anthropic").as_str()),
+                ("codex", newest("openai").as_str())
+            ]
         );
         assert!(!found.ready.iter().any(|r| r.agent == "pix"));
         let rendered = DropIn {
@@ -1717,60 +2048,209 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_agents_models_are_each_familys_newest_and_nicknames_resolve() {
-        let table = ClassTable::builtin();
+    /// The shape of what the `task` tool lists for each vendor's own agent, on
+    /// any snapshot: a row per family, each family's newest model, small, mid,
+    /// then large, newest first within a class, nicknames that resolve, every
+    /// model eligible in the class its row says.
+    fn assert_the_lists_have_their_shape(what: &str, table: &ClassTable) {
         let none = BTreeMap::new();
-        let describe = |agent: &str, services: &[&str], reaches: &BTreeMap<String, Vec<String>>| {
-            let services = services.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-            describe_choices(&BTreeMap::from([(
-                agent.to_owned(),
-                agent_choices(&table, agent, &services, reaches),
-            )]))
-        };
-        assert_eq!(
-            describe("codex", &["openai"], &none),
-            "codex: gpt-6-luna (small, luna), gpt-6.1-terra (mid, terra), \
-             gpt-6.1-sol (large, sol), gpt-6-astra (large, astra)"
-        );
-        assert_eq!(
-            describe("claude", &["anthropic"], &none),
-            "claude: claude-haiku-5-5 (small, haiku), claude-sonnet-5-5 (mid, sonnet), \
-             claude-fable-5-2 (large, fable), claude-opus-5-5 (large, opus)"
-        );
+        for (agent, vendor, families) in FAMILIES {
+            let at = format!("{what}: {agent}");
+            let choices = agent_choices(table, agent, &[vendor.to_owned()], &none);
+            let expected = expected_list(table, vendor, &families);
+            assert!(!expected.is_empty(), "{at}: {expected:?}");
+            assert_eq!(
+                choices
+                    .iter()
+                    .map(|c| (c.model.clone(), c.class.clone(), c.family.clone()))
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|(model, class, family)| (
+                        model.clone(),
+                        class.name().to_owned(),
+                        family.clone()
+                    ))
+                    .collect::<Vec<_>>(),
+                "{at}"
+            );
+            assert_eq!(
+                describe_choices(&BTreeMap::from([(agent.to_owned(), choices.clone())])),
+                format!(
+                    "{agent}: {}",
+                    choices
+                        .iter()
+                        .map(|c| format!("{} ({}, {})", c.model, c.class, c.family))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "{at}"
+            );
+            for choice in &choices {
+                let found = table.classify(&choice.model).unwrap();
+                assert!(found.eligible, "{at}: {choice:?} {found:?}");
+                assert_eq!(
+                    found.class.map(ModelClass::name),
+                    Some(choice.class.as_str())
+                );
+                assert_eq!(found.vendor.as_deref(), Some(vendor), "{at}: {choice:?}");
+                // A nickname, in any case and with spaces, is the family's row;
+                // the id itself is no nickname.
+                let spelled = format!(" {} ", choice.family.to_ascii_uppercase());
+                assert_eq!(
+                    resolve_family(&choices, &spelled),
+                    Ok(Some(choice.clone())),
+                    "{at}"
+                );
+                assert_eq!(resolve_family(&choices, &choice.model), Ok(None), "{at}");
+            }
+            // The first row of each class is the vendor's newest of it.
+            for class in ModelClass::ALL {
+                let first = choices.iter().find(|c| c.class == class.name());
+                assert_eq!(
+                    first.map(|c| c.model.clone()),
+                    table.newest(vendor, class).filter(|_| first.is_some()),
+                    "{at}: {class:?}"
+                );
+            }
+            assert_eq!(resolve_family(&choices, "mystery"), Ok(None));
+        }
         // A multi-provider agent lists only the vendors its Kit reaches, with
         // qualified ids, within the row cap.
         let reaches = BTreeMap::from([("openai".to_owned(), vec!["api.openai.com".to_owned()])]);
-        let pi = agent_choices(&table, "pi", &[ANY_PROVIDER.to_owned()], &reaches);
-        assert!(!pi.is_empty() && pi.len() <= CHOICE_ROWS);
-        assert!(
-            pi.iter()
-                .all(|choice| choice.model.starts_with("openai/gpt-")),
-            "{pi:?}"
-        );
-        let unreached = agent_choices(&table, "pi", &[ANY_PROVIDER.to_owned()], &none);
-        assert_eq!(unreached.len(), 0);
-
-        let codex = agent_choices(&table, "codex", &["openai".to_owned()], &none);
-        let astra = resolve_family(&codex, " Astra ").unwrap().unwrap();
+        let pi = agent_choices(table, "pi", &[ANY_PROVIDER.to_owned()], &reaches);
+        let codex = agent_choices(table, "codex", &["openai".to_owned()], &none);
+        assert!(!pi.is_empty() && pi.len() <= CHOICE_ROWS, "{what}: {pi:?}");
         assert_eq!(
-            (astra.model.as_str(), astra.class.as_str()),
-            ("gpt-6-astra", "large")
+            pi.iter().map(|c| c.model.clone()).collect::<Vec<_>>(),
+            codex
+                .iter()
+                .map(|c| format!("openai/{}", c.model))
+                .collect::<Vec<_>>(),
+            "{what}"
         );
-        assert_eq!(resolve_family(&codex, "gpt-6-astra"), Ok(None));
-        assert_eq!(resolve_family(&codex, "mystery"), Ok(None));
+        let unreached = agent_choices(table, "pi", &[ANY_PROVIDER.to_owned()], &none);
+        assert_eq!(unreached.len(), 0);
+        // Two vendors with one family name: the candidates, by id.
         let sol = ModelChoice {
             model: "x/sol".into(),
             class: "large".into(),
             family: "sol".into(),
         };
+        let first = codex
+            .iter()
+            .find(|c| c.family == "sol")
+            .unwrap()
+            .model
+            .clone();
         let error = resolve_family(&[codex, vec![sol]].concat(), "sol").unwrap_err();
-        assert!(error.contains("gpt-6.1-sol, x/sol"), "{error}");
+        assert!(
+            error.contains(&format!("{first}, x/sol")),
+            "{what}: {error}"
+        );
+    }
+
+    #[test]
+    fn an_agents_models_are_each_familys_newest_and_nicknames_resolve() {
+        for (what, table) in refreshed_tables() {
+            assert_the_lists_have_their_shape(what, &table);
+        }
+        // The compiled-in snapshot lists every family of both vendors.
+        let table = ClassTable::builtin();
+        for (agent, vendor, families) in FAMILIES {
+            let choices = agent_choices(&table, agent, &[vendor.to_owned()], &BTreeMap::new());
+            let mut listed = choices
+                .iter()
+                .map(|c| c.family.as_str())
+                .collect::<Vec<_>>();
+            listed.sort_unstable();
+            let mut named = families.map(|(family, _)| family);
+            named.sort_unstable();
+            assert_eq!(listed, named, "{agent}");
+        }
+        // A model added to the snapshot is the row, in release order.
+        let table = builtin_plus(&EVERY_FAMILY_NEWER);
+        let codex = agent_choices(&table, "codex", &["openai".to_owned()], &BTreeMap::new());
+        assert_eq!(
+            describe_choices(&BTreeMap::from([("codex".to_owned(), codex)])),
+            "codex: gpt-7-luna (small, luna), gpt-7.1-terra (mid, terra), \
+             gpt-7.2-sol (large, sol), gpt-7.1-astra (large, astra)"
+        );
+        let table = builtin_plus(&[FABLE_A_MONTH_ON]);
+        let claude = agent_choices(
+            &table,
+            "claude",
+            &["anthropic".to_owned()],
+            &BTreeMap::new(),
+        );
+        assert_eq!(claude[2].model, "claude-fable-5-9");
         assert_eq!(family_nickname("gpt-*luna*"), "luna");
         assert_eq!(family_nickname("claude-*-haiku*"), "haiku");
         assert_eq!(family_nickname("gpt-oss-20b*"), "oss");
         assert_eq!(family_nickname("mistral-large*"), "mistral-large");
         assert_eq!(family_nickname("haiku"), "haiku");
+    }
+
+    #[rustfmt::skip]
+    const OWN_SNAPSHOT: [Row; 16] = [
+        ("openai", "gpt-6-luna", "gpt-luna", "openai", 0.5, "2030-03-01"),
+        ("openai", "gpt-7-luna", "gpt-luna", "openai", 0.5, "2030-06-01"),
+        ("openai", "gpt-7-terra-2", "gpt-terra", "openai", 5.0, "2030-06-10"),
+        ("openai", "gpt-7-terra", "gpt-terra", "openai", 5.0, "2030-06-10"),
+        ("openai", "gpt-7-sol", "gpt-sol", "openai", 10.0, "2030-06-20"),
+        ("openai", "gpt-7-astra", "gpt-astra", "openai", 50.0, "2030-06-05"),
+        ("openai", "gpt-7-sol-preview", "gpt-sol", "openai", 10.0, "2030-07-01"),
+        ("openai", "gpt-7-astra-20300801", "gpt-astra", "openai", 50.0, "2030-08-01"),
+        ("openai", "gpt-5.9", "gpt-5", "openai", 10.0, "2030-08-01"),
+        ("azure", "gpt-7-luna", "gpt-luna", "openai", 0.5, "2030-09-01"),
+        ("anthropic", "claude-haiku-6-0", "claude-haiku", "anthropic", 0.5, "2029-01-01"),
+        ("anthropic", "claude-sonnet-6-0", "claude-sonnet", "anthropic", 10.0, "2030-05-01"),
+        ("anthropic", "claude-opus-6-0", "claude-opus", "anthropic", 20.0, "2030-06-01"),
+        ("anthropic", "claude-fable-6-0", "claude-fable", "anthropic", 40.0, "2030-04-01"),
+        ("anthropic", "claude-opus-4-9", "claude-opus", "anthropic", 25.0, "2030-09-01"),
+        ("openrouter", "anthropic/claude-sonnet-9", "claude-sonnet", "anthropic", 10.0, "2030-09-01"),
+    ];
+
+    /// The same logic on a snapshot written out here, so nothing but the code
+    /// decides the answer: the newest by release date, not by id; a shorter id
+    /// on a tie; a family more than half a year behind left out; a retired,
+    /// preview, dated, `-latest`, codex or re-hosted model never offered even
+    /// when it is the newest.
+    #[test]
+    fn the_lists_follow_release_dates_on_a_snapshot_of_their_own() {
+        let table = table_over(&rows(&OWN_SNAPSHOT));
+        let list = |agent: &str, service: &str| {
+            describe_choices(&BTreeMap::from([(
+                agent.to_owned(),
+                agent_choices(&table, agent, &[service.to_owned()], &BTreeMap::new()),
+            )]))
+        };
+        assert_eq!(
+            list("codex", "openai"),
+            "codex: gpt-7-luna (small, luna), gpt-7-terra (mid, terra), \
+             gpt-7-sol (large, sol), gpt-7-astra (large, astra)"
+        );
+        assert_eq!(
+            list("claude", "anthropic"),
+            "claude: claude-sonnet-6-0 (mid, sonnet), claude-opus-6-0 (large, opus), \
+             claude-fable-6-0 (large, fable)"
+        );
+        for (vendor, class, model) in [
+            ("openai", ModelClass::Small, Some("gpt-7-luna")),
+            ("openai", ModelClass::Mid, Some("gpt-7-terra")),
+            ("openai", ModelClass::Large, Some("gpt-7-sol")),
+            // Newest by date even where its family is too old to be listed.
+            ("anthropic", ModelClass::Small, Some("claude-haiku-6-0")),
+            ("anthropic", ModelClass::Mid, Some("claude-sonnet-6-0")),
+            ("anthropic", ModelClass::Large, Some("claude-opus-6-0")),
+            ("google", ModelClass::Large, None),
+        ] {
+            assert_eq!(
+                table.newest(vendor, class).as_deref(),
+                model,
+                "{vendor} {class:?}"
+            );
+        }
     }
 
     #[test]
@@ -1847,54 +2327,100 @@ mod tests {
         }
     }
 
-    #[test]
-    fn detection_and_the_task_tools_model_lists_never_reach_for_retired_models() {
-        let table = ClassTable::builtin();
-        let retired = [
-            "o3-pro", "o3", "o1", "o4-mini", "gpt-4", "gpt-4o", "gpt-4.1", "gpt-5",
-        ];
-        let services = VENDOR_HOSTS
-            .iter()
-            .map(|(vendor, _)| (*vendor).to_owned())
-            .collect::<Vec<_>>();
+    /// Every model detection, the `task` tool's lists and `newest` offer.
+    fn offered(table: &ClassTable) -> Vec<String> {
         let reaches = VENDOR_HOSTS
             .iter()
             .map(|(vendor, host)| ((*vendor).to_owned(), vec![(*host).to_owned()]))
             .collect::<BTreeMap<_, _>>();
-        let mut offered = agent_choices(&table, "pi", &[ANY_PROVIDER.to_owned()], &reaches)
+        let mut offered = agent_choices(table, "pi", &[ANY_PROVIDER.to_owned()], &reaches)
             .into_iter()
             .map(|choice| choice.model)
             .collect::<Vec<_>>();
         for (name, service) in [("codex", "openai"), ("claude", "anthropic")] {
             offered.extend(
-                agent_choices(&table, name, &[service.to_owned()], &BTreeMap::new())
+                agent_choices(table, name, &[service.to_owned()], &BTreeMap::new())
                     .into_iter()
                     .map(|choice| choice.model),
             );
         }
-        for vendor in &services {
+        for (vendor, _) in VENDOR_HOSTS {
             for class in ModelClass::ALL {
                 offered.extend(table.newest(vendor, class));
             }
         }
-        assert!(offered.len() > 8, "{offered:?}");
-        for model in &offered {
-            let found = table.classify(model).unwrap();
-            assert!(found.eligible, "{model}: {found:?}");
-            assert_ne!(found.how, RETIRED, "{model}");
-            assert!(!retired.contains(&normalize(model).as_str()), "{model}");
-        }
-        let both = BTreeMap::from([("claude".to_owned(), agent(&["anthropic"], &[]))]);
-        let detected = detect(&table, &both, &set(&["anthropic"]));
-        let models = detected
+        offered
+    }
+
+    /// What detection picks for an agent that has only Anthropic's key.
+    fn detected(table: &ClassTable) -> Vec<String> {
+        let claude = BTreeMap::from([("claude".to_owned(), agent(&["anthropic"], &[]))]);
+        detect(table, &claude, &set(&["anthropic"]))
             .ready
-            .iter()
-            .map(|r| r.model.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            models,
-            ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-fable-5-2"]
+            .into_iter()
+            .map(|r| r.model)
+            .collect()
+    }
+
+    #[test]
+    fn detection_and_the_task_tools_model_lists_never_reach_for_retired_models() {
+        let retired = [
+            "o3-pro", "o3", "o1", "o4-mini", "gpt-4", "gpt-4o", "gpt-4.1", "gpt-5",
+        ];
+        let never = NEWER_BUT_NEVER_OFFERED.map(|(_, id, ..)| id);
+        let current = refreshed_tables().into_iter().chain([(
+            "retired and unlisted models newer than all",
+            builtin_plus(&NEWER_BUT_NEVER_OFFERED),
+        )]);
+        for (what, table) in current {
+            let offered = offered(&table);
+            assert!(offered.len() > 8, "{what}: {offered:?}");
+            for model in &offered {
+                let found = table.classify(model).unwrap();
+                assert!(found.eligible, "{what}: {model}: {found:?}");
+                assert_ne!(found.how, RETIRED, "{what}: {model}");
+                assert!(
+                    !retired.contains(&normalize(model).as_str()),
+                    "{what}: {model}"
+                );
+                assert!(
+                    !never.contains(&normalize(model).as_str()),
+                    "{what}: {model}"
+                );
+                assert!(
+                    !never.iter().any(|id| model.ends_with(id)),
+                    "{what}: {model}"
+                );
+            }
+            // Small, mid, large: each class's newest, whatever the snapshot is.
+            let newest = |class| table.newest("anthropic", class).unwrap();
+            assert_eq!(
+                detected(&table),
+                [
+                    newest(ModelClass::Small),
+                    newest(ModelClass::Mid),
+                    newest(ModelClass::Large)
+                ],
+                "{what}"
+            );
+        }
+        // Offering the newest never needs the retired models: the same lists
+        // as without them, though they are the newest of all.
+        let (with, without) = (
+            builtin_plus(&NEWER_BUT_NEVER_OFFERED),
+            ClassTable::builtin(),
         );
+        assert_eq!(offered(&with), offered(&without));
+        assert_eq!(detected(&with), detected(&without));
+        // And every model of the compiled-in snapshot a retired glob names
+        // is refused, whatever its date.
+        for model in ["claude-opus-4-8", "claude-sonnet-4-6", "gpt-5.5"] {
+            let found = ClassTable::builtin().classify(model).unwrap();
+            assert!(
+                !found.eligible && found.how == RETIRED,
+                "{model}: {found:?}"
+            );
+        }
     }
 
     #[test]

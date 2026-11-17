@@ -491,10 +491,16 @@ mod tests {
         let path = scope.path().join(DROPIN_DIR).join(MARSH_DROPIN);
         let file = DropIn::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(file.enabled, Some(true));
+        // codex gets openai's newest mid model, whichever the snapshot has.
+        let terra = ClassTable::builtin()
+            .newest("openai", ModelClass::Mid)
+            .unwrap();
         assert!(
             file.reviewers
                 .iter()
-                .any(|r| r.agent == "codex" && r.model == "gpt-6.1-terra")
+                .any(|r| r.agent == "codex" && r.model == terra),
+            "{:?}",
+            file.reviewers
         );
         write_switch(scope.path(), false, &agents, &credentials).unwrap();
         let off = DropIn::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();

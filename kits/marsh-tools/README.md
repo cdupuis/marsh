@@ -107,7 +107,8 @@ so it keeps the network policy, credentials and home declaration.
   own `/tmp`. The project stays mounted, so gog's downloads, exports and file
   inputs work as usual, including a project under your home, which is mounted
   on its own. A job started from the home itself or from a dot-directory of it
-  (`~/.config`, `~/.claude`) is refused.
+  (`~/.config`, `~/.claude`) is refused. A lane of `marsh split` counts as
+  its project.
 
 ## How `gog` stays safe
 

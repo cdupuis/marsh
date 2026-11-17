@@ -12,7 +12,7 @@ docker run --rm \
   -v "$HOME/.cargo/registry":/usr/local/cargo/registry \
   -v "$HOME/.cargo/config.toml":/usr/local/cargo/config.toml:ro \
   -w /src -e CARGO_TARGET_DIR=/target -e CARGO_INCREMENTAL=0 \
-  rust:1.99-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 \
+  rust:1.100-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea \
   sh -c '
     rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$(rustc --print sysroot)/lib/rustlib/aarch64-unknown-linux-gnu/bin/rust-lld" \

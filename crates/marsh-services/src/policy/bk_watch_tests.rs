@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use super::super::TagEventKind;
+use super::super::bk_watch::{Refused, shown_name};
 use super::*;
 
 #[derive(Default)]
@@ -49,7 +50,7 @@ impl Store {
             .tags
             .iter()
             .filter(|(_, i)| *i == id)
-            .map(|(t, _)| format!("\"{t}\""))
+            .map(|(t, _)| serde_json::to_string(t).unwrap())
             .collect();
         let digests = if self.pulled.contains(id) {
             r#"["x@sha256:aa"]"#
@@ -963,7 +964,81 @@ fn a_name_too_long_to_watch_is_reported_and_an_untagged_image_is_not() {
     let c = open_stream(&b, "/grpc");
     w.end(&c, B);
     assert_eq!(w.unchecked(), 1);
-    assert!(w.h.svc.tag_events()[0].detail.contains("cannot be watched"));
+    let detail = w.h.svc.tag_events()[0].detail.clone();
+    assert!(detail.contains("cannot be watched"));
+    // It names the one it could not watch, cut to 64 characters.
+    assert!(
+        detail.ends_with(&format!(": \"{}…\"", &long[..64])),
+        "{detail}"
+    );
+}
+
+/// On the containerd image store the list holds names that are not tags anyone can
+/// claim (`moby-dangling@sha256:...`, `name@sha256:...`): that is no event.
+#[test]
+fn dangling_and_digest_names_raise_no_event() {
+    let w = World::new("bk-dangling");
+    {
+        let mut st = w.st.lock().unwrap();
+        st.add("<none>:<none>", "sha256:d0", false);
+        st.add("moby-dangling@sha256:abcdef0123", "sha256:d1", false);
+        st.add(
+            "docker.io/library/alpine@sha256:abcdef0123",
+            "sha256:d2",
+            true,
+        );
+        st.add("busybox:1", "sha256:b1", true);
+    }
+    let b = lane(&w.h, B);
+    for path in ["/grpc", "/session"] {
+        let c = open_stream(&b, path);
+        w.end(&c, B);
+    }
+    w.quiet();
+}
+
+/// A refused name is named in the event: at most three, then "+N more"; the
+/// names are cleaned of control and direction characters.
+#[test]
+fn refused_names_are_named_cleaned_and_counted() {
+    let w = World::new("bk-refused");
+    {
+        let mut st = w.st.lock().unwrap();
+        for (i, n) in [
+            "bad name",
+            "evil\u{1b}[2J\u{202e}x",
+            "UP PER",
+            "four 4",
+            "five 5",
+        ]
+        .iter()
+        .enumerate()
+        {
+            st.add(n, &format!("sha256:r{i}"), true);
+        }
+    }
+    let b = lane(&w.h, B);
+    let c = open_stream(&b, "/grpc");
+    w.end(&c, B);
+    assert_eq!(w.unchecked(), 1);
+    let detail = w.h.svc.tag_events()[0].detail.clone();
+    assert!(detail.contains(" +2 more"), "{detail}");
+    assert_eq!(detail.matches('"').count(), 6, "{detail}");
+    assert!(!detail.chars().any(char::is_control), "{detail}");
+    assert!(!detail.contains('\u{202e}'), "{detail}");
+}
+
+#[test]
+fn a_shown_name_drops_control_and_direction_characters_and_is_cut() {
+    assert_eq!(
+        shown_name("a\u{1b}[b\u{202e}c\u{2066}d\u{200b}e\n"),
+        "a[bcde"
+    );
+    assert_eq!(shown_name(&"é".repeat(64)), "é".repeat(64));
+    assert_eq!(shown_name(&"é".repeat(65)), format!("{}…", "é".repeat(64)));
+    let mut r = Refused::default();
+    r.note("one");
+    assert_eq!(r.describe(), "\"one\"");
 }
 
 /// At the cap "unable to check" is the first to go, as the docs say (not the oldest

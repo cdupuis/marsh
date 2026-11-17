@@ -727,7 +727,7 @@ In plain words:
   `FROM alpine` with no change) makes its tag count as a pulled name, and a later build
   of that tag in the same lane is reported. At most 256 protected tags are watched
   per stream, and a stream whose image list could not be read runs unwatched, with an
-  "unable to check" report (so does an image name that cannot be watched: too long, or not a name the filter accepts). A pulled name stops
+  "unable to check" report (so does an image name that cannot be watched: too long, or not a name the filter accepts; the report names up to three of them, cleaned and cut to 64 characters, and "+N more". An untagged image or a digest reference such as `moby-dangling@sha256:...`, which the containerd image store lists, is not a tag and raises nothing). A pulled name stops
   being watched once a local image holds it, and a name created after a build began is
   not watched by that build. Each build costs two image lists, the first before the
   build starts, and can wait for another workspace's tag claim that is in the engine

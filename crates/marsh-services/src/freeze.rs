@@ -424,13 +424,11 @@ mod tests {
     }
 
     fn settled_ids(dir: &Path) -> Vec<String> {
-        let mut ids: Vec<String> = std::fs::read_dir(dir.join(SETTLED))
-            .map(|entries| {
-                entries
-                    .map(|e| e.unwrap().file_name().into_string().unwrap())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut ids: Vec<String> = std::fs::read_dir(dir.join(SETTLED)).map_or_default(|entries| {
+            entries
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect()
+        });
         ids.sort();
         ids
     }

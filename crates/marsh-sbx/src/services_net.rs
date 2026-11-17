@@ -219,8 +219,7 @@ pub fn assess(document: &Value, sandbox: Option<&str>) -> Governance {
         let resources: Vec<&str> = rule
             .get("resources")
             .and_then(Value::as_array)
-            .map(|list| list.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
+            .map_or_default(|list| list.iter().filter_map(Value::as_str).collect());
         let describe = || {
             format!(
                 "{decision} {} (rule {id}, scope {})",

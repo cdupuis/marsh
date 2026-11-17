@@ -2304,8 +2304,7 @@ impl PortsSubscription {
             .ports
             .scopes
             .get(&self.workspace)
-            .map(|ports| ports.iter().copied().collect())
-            .unwrap_or_default()
+            .map_or_default(|ports| ports.iter().copied().collect())
     }
 
     /// Waits until the agent reports a port state different from the last one
@@ -2325,8 +2324,7 @@ impl PortsSubscription {
                         .ports
                         .scopes
                         .get(&self.workspace)
-                        .map(|ports| ports.iter().copied().collect())
-                        .unwrap_or_default(),
+                        .map_or_default(|ports| ports.iter().copied().collect()),
                 );
             }
             let now = Instant::now();

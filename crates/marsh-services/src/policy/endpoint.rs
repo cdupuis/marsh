@@ -791,14 +791,11 @@ impl Services {
             Ok((200, body)) => {
                 let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                 let list = |key: &str| -> Vec<String> {
-                    v.get(key)
-                        .and_then(|l| l.as_array())
-                        .map(|l| {
-                            l.iter()
-                                .filter_map(|x| x.as_str().map(str::to_owned))
-                                .collect()
-                        })
-                        .unwrap_or_default()
+                    v.get(key).and_then(|l| l.as_array()).map_or_default(|l| {
+                        l.iter()
+                            .filter_map(|x| x.as_str().map(str::to_owned))
+                            .collect()
+                    })
                 };
                 let image = if list("RepoDigests").is_empty() {
                     TagImage::Local
@@ -1703,8 +1700,7 @@ impl Env for Scope {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
         v.pointer("/Config/Volumes")
             .and_then(|m| m.as_object())
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|m| m.keys().cloned().collect())
     }
 
     fn current_limits(&self, container_id: &str) -> Result<CurrentLimits, Refusal> {

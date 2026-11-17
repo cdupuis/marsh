@@ -986,7 +986,7 @@ impl Forest<'_> {
             "node": "split",
             "split_id": id,
             "session_id": split.map_or_else(
-                || first_job().map(|job| job.session_id.clone()).unwrap_or_default(),
+                || first_job().map_or_default(|job| job.session_id.clone()),
                 |split| split.session.clone(),
             ),
             "state": split.map(|split| split.state.clone()),
@@ -1081,7 +1081,7 @@ fn fanout_node(
     serde_json::json!({
         "node": "fanout",
         "fanout_id": id,
-        "session_id": jobs.first().map(|(_, job)| job.session_id.clone()).unwrap_or_default(),
+        "session_id": jobs.first().map_or_default(|(_, job)| job.session_id.clone()),
         "state": if running { "running" } else { "finished" },
         "status": status,
         "created_unix_ms": jobs.iter().map(|(_, job)| job.created_unix_ms).min(),

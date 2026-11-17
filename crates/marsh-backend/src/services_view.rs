@@ -42,9 +42,7 @@ pub(crate) struct View {
 /// it, and that, like any failure to read them, is no events.
 pub(crate) fn read(channel: &dyn Channel) -> Result<View, String> {
     let (containers, ports) = parse(&get(channel, "/containers/json?all=1")?)?;
-    let tag_events = get(channel, TAG_EVENTS_PATH)
-        .map(|body| parse_tag_events(&body))
-        .unwrap_or_default();
+    let tag_events = get(channel, TAG_EVENTS_PATH).map_or_default(|body| parse_tag_events(&body));
     Ok(View {
         containers,
         ports,
@@ -580,10 +578,7 @@ pub(crate) mod tests {
         let (_, refused) = serve("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
         assert!(refused.is_err());
         assert_eq!(
-            refused
-                .map(|body| parse_tag_events(&body))
-                .unwrap_or_default()
-                .len(),
+            refused.map_or_default(|body| parse_tag_events(&body)).len(),
             0
         );
     }

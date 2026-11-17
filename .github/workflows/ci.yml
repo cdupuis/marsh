@@ -113,7 +113,7 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
       - name: Rust toolchain
-        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
       - name: Compiler cache (content-addressed, reusable across source changes)
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -156,7 +156,7 @@ jobs:
         with:
           node-version: '24'
       - name: Rust toolchain
-        run: rustup toolchain install 1.99.1 --profile minimal
+        run: rustup toolchain install 1.100.0 --profile minimal
       - name: Compiler cache (content-addressed, reusable across source changes)
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -224,7 +224,7 @@ jobs:
         with:
           node-version: '24'
       - name: Rust toolchain
-        run: rustup toolchain install 1.99.1 --profile minimal
+        run: rustup toolchain install 1.100.0 --profile minimal
       - name: Compiler cache (content-addressed, reusable across source changes)
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -261,7 +261,7 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
       - name: Rust toolchain
-        run: rustup toolchain install 1.99.1 --profile minimal
+        run: rustup toolchain install 1.100.0 --profile minimal
       - name: Compiler cache (content-addressed, reusable across source changes)
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -349,7 +349,7 @@ jobs:
         with:
           node-version: '24'
       - name: Rust toolchain
-        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
       - name: Compiler cache (content-addressed, reusable across source changes)
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -414,7 +414,7 @@ jobs:
         with:
           node-version: '24'
       - name: Rust toolchain
-        run: rustup toolchain install 1.99.1 --profile minimal
+        run: rustup toolchain install 1.100.0 --profile minimal
       - name: Compiler cache (content-addressed, reusable across source changes)
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -474,7 +474,7 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
       - name: Rust toolchain
-        run: rustup toolchain install 1.99.1 --profile minimal
+        run: rustup toolchain install 1.100.0 --profile minimal
       - name: cargo-deny
         run: |
           mkdir -p "$HOME/.cargo/bin"

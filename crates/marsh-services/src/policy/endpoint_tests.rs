@@ -138,8 +138,7 @@ impl Engine {
             .iter()
             .rev()
             .find(|r| r.method == method && r.target.starts_with(prefix))
-            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
-            .unwrap_or_default()
+            .map_or_default(|r| String::from_utf8_lossy(&r.body).into_owned())
     }
 
     fn saw(&self, method: &str, prefix: &str) -> usize {
@@ -3906,8 +3905,7 @@ fn delete_target(h: &H, prefix: &str) -> String {
         .unwrap()
         .iter()
         .find(|r| r.method == "DELETE" && r.target.starts_with(prefix))
-        .map(|r| r.target.clone())
-        .unwrap_or_default()
+        .map_or_default(|r| r.target.clone())
 }
 
 /// A delete by ID, short ID or digest never carries `force` to the engine (the

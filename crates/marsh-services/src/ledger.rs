@@ -473,12 +473,7 @@ impl Ledger {
     /// The pins a container holds (its own and those it inherited).
     #[must_use]
     pub fn container_pins(&self, id: &str) -> Vec<String> {
-        self.with(|s| {
-            s.containers
-                .get(id)
-                .map(|c| c.pins.clone())
-                .unwrap_or_default()
-        })
+        self.with(|s| s.containers.get(id).map_or_default(|c| c.pins.clone()))
     }
 
     /// Containers that hold `pin`.

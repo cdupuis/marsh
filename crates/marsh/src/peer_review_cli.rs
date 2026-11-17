@@ -512,7 +512,9 @@ mod tests {
         assert_eq!(found.vendor.as_deref(), Some("openai"));
         let data: serde_json::Value =
             serde_json::from_str(include_str!("../../marsh-daemon/data/models-dev.json")).unwrap();
-        let latest_terra = data["models"]
+        // Several terra rows may tie for the latest (same date, same id
+        // length): the product keeps one of them, and any is right.
+        let terras = data["models"]
             .as_array()
             .unwrap()
             .iter()
@@ -524,9 +526,21 @@ mod tests {
                     .iter()
                     .any(|w| id.contains(w))
             })
-            .max_by_key(|(id, released)| (*released, std::cmp::Reverse(id.len())))
-            .map(|(id, _)| id);
-        assert_eq!(latest_terra, Some(model.as_str()));
+            .map(|(id, released)| (released, std::cmp::Reverse(id.len()), id))
+            .collect::<Vec<_>>();
+        let best = terras
+            .iter()
+            .map(|(released, len, _)| (*released, *len))
+            .max();
+        let latest = terras
+            .iter()
+            .filter(|(released, len, _)| Some((*released, *len)) == best)
+            .map(|(_, _, id)| *id)
+            .collect::<Vec<_>>();
+        assert!(
+            latest.contains(&model.as_str()),
+            "{model} is not one of {latest:?}"
+        );
         write_switch(scope.path(), false, &agents, &credentials).unwrap();
         let off = DropIn::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!((off.enabled, off.reviewers), (Some(false), file.reviewers));

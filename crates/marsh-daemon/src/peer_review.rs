@@ -1430,56 +1430,93 @@ mod tests {
             .unwrap_or_else(|| panic!("{model} is not in the snapshot"))
     }
 
-    /// The newest model of `family` that `vendor` itself lists, read off the
-    /// table's snapshot by release date (a shorter id wins a tie): the
-    /// expectation `newest` and `choices` must agree with. Written without the
-    /// product's `first_party`, `normalize` and `day_number`; only
-    /// `plain_chat_model` (which ids are chat models) is shared. It knows
-    /// nothing of retired models, so only a snapshot where no retired model is
-    /// newer than a current one may use it.
-    fn newest_of_family(table: &ClassTable, vendor: &str, family: &str) -> Option<String> {
-        let needle = format!("-{family}");
-        table
+    /// The newest models of `families` that `vendor` itself lists, read off
+    /// the table's snapshot by release date, a shorter id winning a tie: ALL
+    /// the models tied for it. The product keeps whichever tied row comes
+    /// first, which is no promise, so a test accepts any member of the set.
+    /// Written without the product's `first_party`, `normalize` and
+    /// `day_number`; only `plain_chat_model` (which ids are chat models) is
+    /// shared. It knows nothing of retired models, so only a snapshot where no
+    /// retired model is newer than a current one may use it.
+    fn newest_models(table: &ClassTable, vendor: &str, families: &[&str]) -> Vec<String> {
+        let needles = families.iter().map(|f| format!("-{f}")).collect::<Vec<_>>();
+        let rows = table
             .snapshot
             .models
             .iter()
             .filter(|row| row.vendor == vendor && row.provider == vendor)
             .filter(|row| plain_chat_model(&row.id))
-            .filter(|row| row.id.to_ascii_lowercase().contains(&needle))
-            .max_by_key(|row| (row.released.clone(), std::cmp::Reverse(row.id.len())))
-            .map(|row| row.id.clone())
+            .filter(|row| {
+                let id = row.id.to_ascii_lowercase();
+                needles.iter().any(|needle| id.contains(needle))
+            })
+            .map(|row| {
+                (
+                    row.released.clone(),
+                    std::cmp::Reverse(row.id.len()),
+                    &row.id,
+                )
+            })
+            .collect::<Vec<_>>();
+        let Some(best) = rows.iter().map(|(released, len, _)| (released, len)).max() else {
+            return Vec::new();
+        };
+        let mut tied = rows
+            .iter()
+            .filter(|(released, len, _)| (released, len) == best)
+            .map(|(_, _, id)| (*id).clone())
+            .collect::<Vec<_>>();
+        tied.sort();
+        tied.dedup();
+        tied
+    }
+
+    /// One family the `task` tool should list.
+    #[derive(Debug)]
+    struct Expected {
+        family: String,
+        class: ModelClass,
+        released: String,
+        /// Any of these is a correct row (tied for the family's newest).
+        models: Vec<String>,
     }
 
     /// What the `task` tool lists for `vendor`'s own agent: each family's
     /// newest model, except a family more than `OWN_RECENT_DAYS` behind the
     /// vendor's newest; small before mid before large, newest first within a
-    /// class.
+    /// class (the order of families released on one day is not promised).
     fn expected_list(
         table: &ClassTable,
         vendor: &str,
         families: &[(&str, ModelClass)],
-    ) -> Vec<(String, ModelClass, String)> {
+    ) -> Vec<Expected> {
         let found = families
             .iter()
             .filter_map(|(family, class)| {
-                let model = newest_of_family(table, vendor, family)?;
-                Some((model, *class, (*family).to_owned()))
+                let models = newest_models(table, vendor, &[family]);
+                let released = released(table, models.first()?);
+                Some(Expected {
+                    family: (*family).to_owned(),
+                    class: *class,
+                    released,
+                    models,
+                })
             })
             .collect::<Vec<_>>();
         let latest = found
             .iter()
-            .map(|(model, ..)| own_days(&released(table, model)))
+            .map(|e| own_days(&e.released))
             .max()
             .unwrap_or(0);
         let mut found = found
             .into_iter()
-            .filter(|(model, ..)| own_days(&released(table, model)) + OWN_RECENT_DAYS >= latest)
+            .filter(|e| own_days(&e.released) + OWN_RECENT_DAYS >= latest)
             .collect::<Vec<_>>();
-        found.sort_by_key(|(model, class, _)| {
+        found.sort_by_key(|e| {
             (
-                *class,
-                std::cmp::Reverse(released(table, model)),
-                model.clone(),
+                e.class,
+                std::cmp::Reverse(e.released.clone()),
+                e.family.clone(),
             )
         });
         found
@@ -1725,21 +1762,20 @@ mod tests {
         for (what, table) in refreshed_tables() {
             for (_, vendor, families) in FAMILIES {
                 for class in ModelClass::ALL {
-                    let named = families
+                    let in_class = families
                         .iter()
                         .filter(|(_, family_class)| *family_class == class)
-                        .filter_map(|(family, _)| newest_of_family(&table, vendor, family))
-                        .max_by_key(|model| {
-                            (released(&table, model), std::cmp::Reverse(model.len()))
-                        });
+                        .map(|(family, _)| *family)
+                        .collect::<Vec<_>>();
+                    let named = newest_models(&table, vendor, &in_class);
                     assert!(
-                        named.is_some(),
+                        !named.is_empty(),
                         "{what}: no {vendor} {class:?} in the snapshot"
                     );
-                    assert_eq!(
-                        table.newest(vendor, class),
-                        named,
-                        "{what}: {vendor} {class:?}"
+                    let newest = table.newest(vendor, class);
+                    assert!(
+                        newest.as_ref().is_some_and(|model| named.contains(model)),
+                        "{what}: {vendor} {class:?}: {newest:?} is not one of {named:?}"
                     );
                 }
             }
@@ -2072,21 +2108,33 @@ mod tests {
             let choices = agent_choices(table, agent, &[vendor.to_owned()], &none);
             let expected = expected_list(table, vendor, &families);
             assert!(!expected.is_empty(), "{at}: {expected:?}");
+            // The same families, each listed with one of its tied newest
+            // models, in class order and newest first within a class.
+            let listed = |c: &ModelChoice| (c.class.clone(), released(table, &c.model));
             assert_eq!(
-                choices
-                    .iter()
-                    .map(|c| (c.model.clone(), c.class.clone(), c.family.clone()))
-                    .collect::<Vec<_>>(),
+                choices.iter().map(listed).collect::<Vec<_>>(),
                 expected
                     .iter()
-                    .map(|(model, class, family)| (
-                        model.clone(),
-                        class.name().to_owned(),
-                        family.clone()
-                    ))
+                    .map(|e| (e.class.name().to_owned(), e.released.clone()))
                     .collect::<Vec<_>>(),
-                "{at}"
+                "{at}: {choices:?} against {expected:?}"
             );
+            let mut families = choices.iter().map(|c| c.family.clone()).collect::<Vec<_>>();
+            families.sort();
+            let mut wanted = expected
+                .iter()
+                .map(|e| e.family.clone())
+                .collect::<Vec<_>>();
+            wanted.sort();
+            assert_eq!(families, wanted, "{at}");
+            for choice in &choices {
+                let one = expected.iter().find(|e| e.family == choice.family).unwrap();
+                assert_eq!(choice.class, one.class.name(), "{at}: {choice:?}");
+                assert!(
+                    one.models.contains(&choice.model),
+                    "{at}: {choice:?} is not one of {one:?}"
+                );
+            }
             assert_eq!(
                 describe_choices(&BTreeMap::from([(agent.to_owned(), choices.clone())])),
                 format!(
@@ -2136,8 +2184,14 @@ mod tests {
             }
             assert_eq!(resolve_family(&choices, "mystery"), Ok(None));
         }
-        // A multi-provider agent lists only the vendors its Kit reaches, with
-        // qualified ids, within the row cap.
+        assert_the_multi_provider_list_has_its_shape(what, table);
+    }
+
+    /// A multi-provider agent lists only the vendors its Kit reaches, with
+    /// qualified ids, within the row cap; one nickname of two vendors is
+    /// ambiguous.
+    fn assert_the_multi_provider_list_has_its_shape(what: &str, table: &ClassTable) {
+        let none = BTreeMap::new();
         let reaches = BTreeMap::from([("openai".to_owned(), vec!["api.openai.com".to_owned()])]);
         let pi = agent_choices(table, "pi", &[ANY_PROVIDER.to_owned()], &reaches);
         let codex = agent_choices(table, "codex", &["openai".to_owned()], &none);

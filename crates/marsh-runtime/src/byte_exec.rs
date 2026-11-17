@@ -451,7 +451,7 @@ pub fn exec(payload: Payload) -> Result<std::convert::Infallible, ExecError> {
         candidate.extend(command);
         let candidate = CString::new(candidate).map_err(|_| invalid())?;
         match image_execve(&candidate, &argv, &env, helper_identity) {
-            Ok(never) => return Ok(never),
+            Ok(never) => match never {},
             Err(Errno::EACCES) => denied = true,
             Err(Errno::ENOENT | Errno::ENOTDIR) => {}
             Err(error) => return Err(exec_error(error)),

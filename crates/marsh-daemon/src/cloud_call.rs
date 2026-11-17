@@ -1466,14 +1466,11 @@ pub fn apply_report(stdout: &[u8], ok: bool, diagnostic: &str) -> Result<String,
         created: count("created"),
         modified: count("modified"),
         deleted: count("deleted"),
-        kept: report["kept"]
-            .as_array()
-            .map(|kept| {
-                kept.iter()
-                    .filter_map(|k| k.as_str().map(ToOwned::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        kept: report["kept"].as_array().map_or_default(|kept| {
+            kept.iter()
+                .filter_map(|k| k.as_str().map(ToOwned::to_owned))
+                .collect()
+        }),
         ignored: 0,
         listings: std::collections::BTreeSet::new(),
     };

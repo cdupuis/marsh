@@ -105,8 +105,8 @@ pub fn wait_for_exit(child: impl Into<Guarded>, what: &str, budget: Duration) ->
         child.child = None;
         return Output {
             status,
-            stdout: stdout.map(|d| d.taken()).unwrap_or_default(),
-            stderr: stderr.map(|d| d.taken()).unwrap_or_default(),
+            stdout: stdout.map_or_default(|d| d.taken()),
+            stderr: stderr.map_or_default(|d| d.taken()),
         };
     }
     let killed = child.kill_and_reap();

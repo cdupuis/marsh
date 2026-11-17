@@ -772,7 +772,7 @@ impl StockDaemonBackend {
             Ok(bytes) => super::hex(&Sha256::digest(&bytes)),
             Err(error) => return failed(settle, format!("base manifest: {error}")),
         };
-        let cursor = store.job(&job_id).map(|job| job.cursor).unwrap_or_default();
+        let cursor = store.job(&job_id).map_or_default(|job| job.cursor);
         let mut record = Record {
             version: RECORD_VERSION,
             job_id: job_id.clone(),
@@ -1415,10 +1415,7 @@ impl StockDaemonBackend {
         } else {
             CleanupState::Uncertain
         };
-        let mut timing = store
-            .job(&record.job_id)
-            .map(|job| job.timing)
-            .unwrap_or_default();
+        let mut timing = store.job(&record.job_id).map_or_default(|job| job.timing);
         // The job's time is the run's, not its start step's.
         if let Some(finished) = record.finished_unix_ms {
             timing.wall_ms = finished.saturating_sub(record.created_unix_ms);

@@ -985,7 +985,7 @@ impl Checkpoints {
             lane: lane.map(|lane| lane.name.clone()),
             services,
             ignored,
-            lane_ports: lane.map(|lane| lane.ports.clone()).unwrap_or_default(),
+            lane_ports: lane.map_or_default(|lane| lane.ports.clone()),
         };
         self.lock().records.insert(id, checkpoint.clone());
         drop(pending);

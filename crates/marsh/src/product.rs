@@ -1580,7 +1580,7 @@ fn recorded_shell_vms(control_home: &std::path::Path) -> Vec<String> {
     value
         .get("vms")
         .and_then(serde_json::Value::as_object)
-        .map(|vms| {
+        .map_or_default(|vms| {
             vms.iter()
                 .filter(|(_, entry)| {
                     entry.get("purpose").and_then(serde_json::Value::as_str) == Some("shell")
@@ -1589,7 +1589,6 @@ fn recorded_shell_vms(control_home: &std::path::Path) -> Vec<String> {
                 .map(|(name, _)| name.clone())
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 fn write_job_defaults(
@@ -1675,15 +1674,14 @@ fn write_result(writer: &mut impl Write, value: serde_json::Value) -> Result<(),
     let children = value
         .get("children")
         .and_then(serde_json::Value::as_array)
-        .map(|children| {
+        .map_or_default(|children| {
             children
                 .iter()
                 .filter_map(serde_json::Value::as_str)
                 .map(display_safe)
                 .collect::<Vec<_>>()
                 .join(" ")
-        })
-        .unwrap_or_default();
+        });
     let receipt: marsh_daemon::JobReceipt = serde_json::from_value(value).map_err(|error| {
         ProductError::Operation(format!("cannot decode daemon result: {error}"))
     })?;

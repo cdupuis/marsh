@@ -1503,7 +1503,7 @@ impl StockDaemonBackend {
             store.cancel_tree(&job_id, true);
         }
         // A block from the session can sync while it runs (`marsh cloud sync`).
-        let cursor = store.job(&job_id).map(|job| job.cursor).unwrap_or_default();
+        let cursor = store.job(&job_id).map_or_default(|job| job.cursor);
         let sync_target = origin.is_none().then(|| {
             Arc::new(sync::SyncTarget {
                 job_id: job_id.clone(),

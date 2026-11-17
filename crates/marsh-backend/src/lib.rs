@@ -778,18 +778,14 @@ impl StockDaemonBackend {
                                 .iter()
                                 .any(|service| service == marsh_contracts::kit_assets::ANY_PROVIDER)
                         }),
-                        reaches: verbs
-                            .reaches
-                            .get(name)
-                            .map(|reaches| {
-                                reaches
-                                    .iter()
-                                    .map(|(service, hosts)| {
-                                        (service.clone(), hosts.iter().cloned().collect())
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
+                        reaches: verbs.reaches.get(name).map_or_default(|reaches| {
+                            reaches
+                                .iter()
+                                .map(|(service, hosts)| {
+                                    (service.clone(), hosts.iter().cloned().collect())
+                                })
+                                .collect()
+                        }),
                     },
                 )
             })
@@ -1779,12 +1775,8 @@ impl DaemonBackend for StockDaemonBackend {
                     acp: agent.as_ref().map(|agent| agent.acp.is_some()),
                     services: agent
                         .as_ref()
-                        .map(|agent| agent.services.clone())
-                        .unwrap_or_default(),
-                    reaches: agent
-                        .as_ref()
-                        .map(|agent| agent.reaches.clone())
-                        .unwrap_or_default(),
+                        .map_or_default(|agent| agent.services.clone()),
+                    reaches: agent.as_ref().map_or_default(|agent| agent.reaches.clone()),
                     sessions: agent.and_then(|agent| agent.sessions),
                     descriptor: exact
                         .as_ref()
@@ -2145,7 +2137,7 @@ impl DaemonBackend for StockDaemonBackend {
         let extra_environment = if request.session.ephemeral_home || confinement.is_some() {
             sbxenv::Environment::default()
         } else if let Some(parent) = child_view {
-            self.inherited_environment(&store.job(parent).map(|job| job.mounts).unwrap_or_default())
+            self.inherited_environment(&store.job(parent).map_or_default(|job| job.mounts))
         } else {
             self.environment(&request.command)
         };
@@ -2161,7 +2153,7 @@ impl DaemonBackend for StockDaemonBackend {
         // without its `.marsh` and Git guards, nor a `readOnly` extra folder
         // inside it read-write (a child inherits those in its parent's view).
         let parent_mounts =
-            child_view.map(|parent| store.job(parent).map(|job| job.mounts).unwrap_or_default());
+            child_view.map(|parent| store.job(parent).map_or_default(|job| job.mounts));
         let view = match Self::job_view(
             &request.session,
             &extra_environment,
@@ -2629,8 +2621,7 @@ impl DaemonBackend for StockDaemonBackend {
             job: job_id.clone(),
             control: control.clone(),
             socket: EndpointPaths::for_home(&self.config.daemon_home)
-                .map(|paths| paths.socket)
-                .unwrap_or_default(),
+                .map_or_default(|paths| paths.socket),
             store: store.clone(),
             token: None,
             channels: BTreeMap::new(),
@@ -9542,8 +9533,7 @@ mod kit_lifecycle_callers {
                         Some(format!("2026-01-{:02}T00:00:00Z", day + 1))
                     })
                     .filter(|created| !created.is_empty())
-                    .map(|created| format!(r#","created":"{created}""#))
-                    .unwrap_or_default();
+                    .map_or_default(|created| format!(r#","created":"{created}""#));
                 return ok(format!(r#"{{"config":{{"Labels":{labels}}}{created}}}"#));
             }
             if argv[1..] == ["ls", "--json"] {

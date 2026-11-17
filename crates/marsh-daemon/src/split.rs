@@ -332,8 +332,7 @@ impl SplitLineage {
                                     .iter()
                                     .find(|old| old.label == branch.label)
                             })
-                            .map(|old| old.command.clone())
-                            .unwrap_or_default()
+                            .map_or_default(|old| old.command.clone())
                     },
                     |spec| match (&spec.shell, &spec.argv) {
                         (Some(shell), _) => shell.chars().take(200).collect(),
@@ -1298,8 +1297,7 @@ impl SplitEngine {
             ports: branch
                 .restore
                 .as_ref()
-                .map(|restore| restore.ports.clone())
-                .unwrap_or_default(),
+                .map_or_default(|restore| restore.ports.clone()),
         };
         // Files stay while the record does: a remove or the collector takes
         // the record before any file, so an unchanged record is a copy of a
@@ -1720,16 +1718,13 @@ impl SplitEngine {
                     .any(|branch| branch.label == label && branch.live > 0)
             }) || !store.fork_jobs(id, Some(label)).live.is_empty()
         };
-        let labels = self
-            .record(id)
-            .map(|record| {
-                record
-                    .branches
-                    .iter()
-                    .map(|b| b.label.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let labels = self.record(id).map_or_default(|record| {
+            record
+                .branches
+                .iter()
+                .map(|b| b.label.clone())
+                .collect::<Vec<_>>()
+        });
         while Instant::now() < deadline && labels.iter().any(|label| live(label)) {
             tick();
             thread::sleep(Duration::from_millis(100));
@@ -1949,8 +1944,7 @@ impl SplitEngine {
                     let ports = branch
                         .restore
                         .as_ref()
-                        .map(crate::lane_services::LaneRestore::port_map)
-                        .unwrap_or_default();
+                        .map_or_default(crate::lane_services::LaneRestore::port_map);
                     backend.services_lane(&record.root, &workspace, Some(&ports));
                 }
             }
@@ -2605,9 +2599,7 @@ impl SplitEngine {
                 Some("no local data in this checkpoint; nothing was restored".into()),
             );
         }
-        let record_gaps = services
-            .map(|record| record.gaps.clone())
-            .unwrap_or_default();
+        let record_gaps = services.map_or_default(|record| record.gaps.clone());
         let source = facts.lane.as_deref().and_then(|lane| {
             let (split, label) = lane.split_once('/')?;
             (crate::split_confinement::split_id(split)

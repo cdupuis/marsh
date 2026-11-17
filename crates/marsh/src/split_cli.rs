@@ -679,16 +679,13 @@ fn splits(arguments: &[OsString], channel: impl FnOnce(bool) -> Result<Channel, 
         }
         Ok(PublicReply::Splits { document }) => {
             for split in document["splits"].as_array().into_iter().flatten() {
-                let parent = split["parent"]
-                    .as_object()
-                    .map(|parent| {
-                        format!(
-                            "  (child of {}/{})",
-                            parent["split"].as_str().unwrap_or(""),
-                            parent["label"].as_str().unwrap_or("")
-                        )
-                    })
-                    .unwrap_or_default();
+                let parent = split["parent"].as_object().map_or_default(|parent| {
+                    format!(
+                        "  (child of {}/{})",
+                        parent["split"].as_str().unwrap_or(""),
+                        parent["label"].as_str().unwrap_or("")
+                    )
+                });
                 println!(
                     "{}  {}  {}{parent}",
                     split["id"].as_str().unwrap_or(""),
@@ -1230,8 +1227,7 @@ fn apply(arguments: &[OsString], channel: impl FnOnce(bool) -> Result<Channel, S
     }
     let objects = objects
         .as_deref()
-        .map(Path::as_os_str)
-        .unwrap_or_default()
+        .map_or_default(Path::as_os_str)
         .to_owned();
     // In the shell VM, the session shell is already there; from the host,
     // `marsh -c` runs the same script in it.

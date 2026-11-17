@@ -2150,7 +2150,7 @@ fn write_absent_scope_report(
     command: &cli::ProductCommand,
     daemon_home: &Path,
 ) -> Result<Option<i32>, RunError> {
-    let account_home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let account_home = env::var_os("HOME").map_or_default(PathBuf::from);
     let control = env::var_os("MARSH_CONTROL_HOME").map(PathBuf::from);
     let include_services = matches!(
         command,

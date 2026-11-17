@@ -583,22 +583,19 @@ pub(super) fn owned_sandboxes(state: &Path) -> Vec<serde_json::Value> {
     let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Vec::new();
     };
-    document["entries"]
-        .as_object()
-        .map(|entries| {
-            entries
-                .values()
-                .map(|entry| {
-                    serde_json::json!({
-                        "name": entry["name"],
-                        "id": entry["id"],
-                        "image": entry["image"],
-                        "agent": entry["agent"],
-                    })
+    document["entries"].as_object().map_or_default(|entries| {
+        entries
+            .values()
+            .map(|entry| {
+                serde_json::json!({
+                    "name": entry["name"],
+                    "id": entry["id"],
+                    "image": entry["image"],
+                    "agent": entry["agent"],
                 })
-                .collect()
-        })
-        .unwrap_or_default()
+            })
+            .collect()
+    })
 }
 
 /// The coordinator's guardrails, decided on the laptop (the plan): which

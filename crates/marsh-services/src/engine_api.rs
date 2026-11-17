@@ -178,8 +178,7 @@ impl ContainerSummary {
         self.names
             .as_ref()
             .and_then(|names| names.first())
-            .map(|name| name.trim_start_matches('/').to_owned())
-            .unwrap_or_default()
+            .map_or_default(|name| name.trim_start_matches('/').to_owned())
     }
 }
 

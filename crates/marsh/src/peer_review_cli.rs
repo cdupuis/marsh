@@ -491,10 +491,55 @@ mod tests {
         let path = scope.path().join(DROPIN_DIR).join(MARSH_DROPIN);
         let file = DropIn::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(file.enabled, Some(true));
+        // codex is given the openai mid model the snapshot lists last (a
+        // newer refresh moves it): eligible and the latest-dated terra the
+        // snapshot has, read from the data file here and not through `newest`.
+        // Membership in the offered list is not asserted here: a much newer
+        // model of another class legitimately drops older families from it
+        // (the daemon's peer_review tests cover the list).
+        let table = ClassTable::builtin();
+        let reviewer = file
+            .reviewers
+            .iter()
+            .find(|r| r.agent == "codex" && r.class == Some(ModelClass::Mid))
+            .unwrap_or_else(|| panic!("no codex mid reviewer: {:?}", file.reviewers));
+        let model = reviewer.model.clone();
+        let found = table.classify(&model).unwrap();
         assert!(
-            file.reviewers
-                .iter()
-                .any(|r| r.agent == "codex" && r.model == "gpt-6.1-terra")
+            found.eligible && found.how != "retired",
+            "{model}: {found:?}"
+        );
+        assert_eq!(found.vendor.as_deref(), Some("openai"));
+        let data: serde_json::Value =
+            serde_json::from_str(include_str!("../../marsh-daemon/data/models-dev.json")).unwrap();
+        // Several terra rows may tie for the latest (same date, same id
+        // length): the product keeps one of them, and any is right.
+        let terras = data["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row[0] == "openai" && row[3] == "openai")
+            .filter_map(|row| Some((row[1].as_str()?, row[6].as_str()?)))
+            .filter(|(id, _)| id.contains("-terra"))
+            .filter(|(id, _)| {
+                !["codex", "preview", "latest"]
+                    .iter()
+                    .any(|w| id.contains(w))
+            })
+            .map(|(id, released)| (released, std::cmp::Reverse(id.len()), id))
+            .collect::<Vec<_>>();
+        let best = terras
+            .iter()
+            .map(|(released, len, _)| (*released, *len))
+            .max();
+        let latest = terras
+            .iter()
+            .filter(|(released, len, _)| Some((*released, *len)) == best)
+            .map(|(_, _, id)| *id)
+            .collect::<Vec<_>>();
+        assert!(
+            latest.contains(&model.as_str()),
+            "{model} is not one of {latest:?}"
         );
         write_switch(scope.path(), false, &agents, &credentials).unwrap();
         let off = DropIn::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();

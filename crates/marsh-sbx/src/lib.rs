@@ -9409,6 +9409,17 @@ pub enum SbxError {
     Json(#[from] serde_json::Error),
 }
 
+/// The daemon's busy refusal tells a user that a teardown held up by a stock `sbx`
+/// that does not respond can take "several minutes ... a stock call is cut off after
+/// 5 minutes, and a teardown can wait for two: up to about 10"
+/// (`marsh-daemon`'s `busy_blockers_message`). It is these two constants.
+#[cfg(test)]
+#[test]
+fn the_busy_refusals_bound_on_a_hung_stock_call_is_these_constants() {
+    assert_eq!(PREPARATION_SBX_TIMEOUT, Duration::from_mins(5));
+    assert_eq!(LIFECYCLE_FENCE_WAIT, 2 * PREPARATION_SBX_TIMEOUT);
+}
+
 #[cfg(test)]
 mod tests;
 

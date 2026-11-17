@@ -2223,7 +2223,8 @@ fn a_gone_clients_session_is_not_promised_a_release_within_seconds() {
         message.contains("usually released within seconds"),
         "{message}"
     );
-    assert!(message.contains("up to about 5 minutes"), "{message}");
+    assert!(message.contains("several minutes"), "{message}");
+    assert!(message.contains("up to about 10"), "{message}");
     assert!(message.contains("`sbx ls`"), "{message}");
     assert!(
         message.ends_with("a reset or stop retries once it is"),
@@ -2232,6 +2233,60 @@ fn a_gone_clients_session_is_not_promised_a_release_within_seconds() {
     assert!(!message.contains("is released within seconds"), "{message}");
     assert!(busy_lifecycle_refusal(&message));
     assert!(!transient_busy(&message));
+}
+
+/// The refusal a client really gets (the handler, over the socket) while a gone
+/// client's shell is still being torn down: the truth about the wait, and the
+/// prefix every caller matches.
+#[test]
+fn the_refusal_a_client_gets_for_a_session_being_torn_down_says_it_can_take_minutes() {
+    let home = home();
+    let server = Arc::new(Server::bind(home.path()).unwrap());
+    let gone_pid = {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    };
+    let session = server
+        .store
+        .attach_shell(gone_pid, authority("/Users/example/gone", home.path()));
+    server
+        .store
+        .lock()
+        .shell_attachments
+        .insert(session, "generation".into());
+    let stop = Arc::new(AtomicBool::new(false));
+    let (task_server, task_stop) = (Arc::clone(&server), Arc::clone(&stop));
+    let task = thread::spawn(move || {
+        task_server
+            .serve_until(|| task_stop.load(Ordering::Relaxed))
+            .unwrap();
+    });
+    let client = Client::connect(home.path()).unwrap();
+    let reply = client.request(PublicRequest::Shutdown).unwrap();
+    stop.store(true, Ordering::Relaxed);
+    task.join().unwrap();
+    let PublicReply::Error { message, .. } = reply else {
+        panic!("expected a refusal, got {reply:?}")
+    };
+    assert!(
+        message.starts_with("daemon is busy: a session of pid "),
+        "{message}"
+    );
+    assert!(message.contains("still being torn down"), "{message}");
+    assert!(
+        message.contains("usually released within seconds"),
+        "{message}"
+    );
+    assert!(message.contains("several minutes"), "{message}");
+    assert!(message.contains("`sbx ls`"), "{message}");
+    assert!(
+        message.ends_with("a reset or stop retries once it is"),
+        "{message}"
+    );
+    assert!(!message.contains("is released within seconds"), "{message}");
+    assert!(busy_lifecycle_refusal(&message) && !transient_busy(&message));
 }
 
 #[test]

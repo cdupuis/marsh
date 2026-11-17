@@ -180,10 +180,12 @@ fn request_label(body: &PublicRequest) -> String {
 
 /// The busy refusal that names what blocks a reset or stop. A session whose
 /// client is gone is released when its shell teardown ends, which waits on the
-/// stock `sbx` (one operation times out after 300 s).
+/// stock `sbx`: a stock call is cut off after 5 minutes and a teardown can wait
+/// for two (`marsh-sbx`'s `PREPARATION_SBX_TIMEOUT` and `LIFECYCLE_FENCE_WAIT`,
+/// pinned by a test there).
 fn busy_blockers_message(blockers: &[String]) -> String {
     format!(
-        "{BUSY_BLOCKED}{}; a session whose client is gone is usually released within seconds, but up to about 5 minutes if the stock `sbx` is not responding (check `sbx ls`); a reset or stop retries once it is",
+        "{BUSY_BLOCKED}{}; a session whose client is gone is usually released within seconds, but if the stock `sbx` is not responding it can take several minutes (a stock call is cut off after 5 minutes, and a teardown can wait for two: up to about 10; check `sbx ls`); a reset or stop retries once it is",
         blockers.join("; ")
     )
 }

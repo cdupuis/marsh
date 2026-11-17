@@ -2117,13 +2117,21 @@ mod tests {
                 );
                 assert_eq!(resolve_family(&choices, &choice.model), Ok(None), "{at}");
             }
-            // The first row of each class is the vendor's newest of it.
+            // A class with a row (every family of it may have aged out of the
+            // list) starts with a model released as late as the vendor's
+            // newest of that class. Two families released the same day may be
+            // listed in either order, so the dates are compared, not the ids.
             for class in ModelClass::ALL {
-                let first = choices.iter().find(|c| c.class == class.name());
+                let Some(first) = choices.iter().find(|c| c.class == class.name()) else {
+                    continue;
+                };
+                let Some(newest) = table.newest(vendor, class) else {
+                    panic!("{at}: {class:?} is listed ({first:?}) but has no newest");
+                };
                 assert_eq!(
-                    first.map(|c| c.model.clone()),
-                    table.newest(vendor, class).filter(|_| first.is_some()),
-                    "{at}: {class:?}"
+                    released(table, &first.model),
+                    released(table, &newest),
+                    "{at}: {class:?}: {first:?} against {newest}"
                 );
             }
             assert_eq!(resolve_family(&choices, "mystery"), Ok(None));
@@ -2144,21 +2152,19 @@ mod tests {
         );
         let unreached = agent_choices(table, "pi", &[ANY_PROVIDER.to_owned()], &none);
         assert_eq!(unreached.len(), 0);
-        // Two vendors with one family name: the candidates, by id.
-        let sol = ModelChoice {
-            model: "x/sol".into(),
-            class: "large".into(),
-            family: "sol".into(),
+        // Two vendors with one family name: the candidates, by id. Whichever
+        // family of codex is listed will do (one may have aged out).
+        let Some(listed) = codex.first().cloned() else {
+            panic!("{what}: codex lists nothing");
         };
-        let first = codex
-            .iter()
-            .find(|c| c.family == "sol")
-            .unwrap()
-            .model
-            .clone();
-        let error = resolve_family(&[codex, vec![sol]].concat(), "sol").unwrap_err();
+        let other = ModelChoice {
+            model: format!("x/{}", listed.family),
+            class: listed.class.clone(),
+            family: listed.family.clone(),
+        };
+        let error = resolve_family(&[codex, vec![other]].concat(), &listed.family).unwrap_err();
         assert!(
-            error.contains(&format!("{first}, x/sol")),
+            error.contains(&format!("{}, x/{}", listed.model, listed.family)),
             "{what}: {error}"
         );
     }

@@ -2272,7 +2272,7 @@ impl DaemonBackend for StockDaemonBackend {
                 request.effective_working_directory(),
             ) {
                 return Err(DaemonError::Refused(format!(
-                    "{}: its Kit does not mount your home ({}): {reason}; run it from a project folder under it",
+                    "{}: its Kit does not mount your home ({}): {reason}; run it from a project folder under it, not from the home or a dot-directory of it",
                     request.command,
                     guest_home.display()
                 )));
@@ -4284,11 +4284,46 @@ fn observed_unix_ms(
         .map(|elapsed| boundaries.started_unix_ms + elapsed)
 }
 
+/// The project a lane of `marsh split` forks, for judging a path: the one
+/// `.marsh/split/<id>/<label>` of `<project>/.marsh/split/<id>/<label>[/rest]`
+/// is set aside, so the path reads as `<project>/[rest]`. Any other path, a
+/// fork of the home itself (`~/.marsh/split/...` is the home's own dot-directory),
+/// and what a fork holds beyond the first one (`.marsh` again) stay as they are.
+fn fork_as_project(path: &Path, homes: &[PathBuf]) -> PathBuf {
+    use marsh_daemon::split_confinement::{split_id, split_label};
+    use std::path::Component;
+    let parts = path.components().collect::<Vec<_>>();
+    let at = parts.windows(4).position(|window| match window {
+        [
+            Component::Normal(marsh),
+            Component::Normal(split),
+            Component::Normal(id),
+            Component::Normal(label),
+        ] => {
+            *marsh == ".marsh"
+                && *split == "split"
+                && id.to_str().is_some_and(split_id)
+                && label.to_str().is_some_and(split_label)
+        }
+        _ => false,
+    });
+    let Some(at) = at else {
+        return path.to_path_buf();
+    };
+    let mut project: PathBuf = parts[..at].iter().collect();
+    if homes.contains(&project) {
+        return path.to_path_buf();
+    }
+    project.extend(&parts[at + 4..]);
+    project
+}
+
 /// Whether a Kit that declares no home may run from `cwd` in a session whose
 /// project is `project`: the guest home's contents beyond the project stay
 /// out of its view, so it is refused from the home itself, from a
 /// dot-directory of the home (other agents' settings and saved logins), and
-/// when the project is the home or a dot-directory (after symlinks).
+/// when the project is the home or a dot-directory (after symlinks). A lane
+/// of a split is judged as the project it forks (`fork_as_project`).
 fn no_home_view_admitted(
     guest_home: &Path,
     home_backing: &Path,
@@ -4308,8 +4343,10 @@ fn no_home_view_admitted(
     homes.extend(fs::canonicalize(guest_home).ok());
     homes.push(home_backing.to_path_buf());
     homes.extend(fs::canonicalize(home_backing).ok());
+    let judged_projects =
+        [project, resolved_project.as_path()].map(|path| fork_as_project(path, &homes));
     for home in &homes {
-        for path in [project, resolved_project.as_path()] {
+        for path in &judged_projects {
             if path == home {
                 return Err("the project is the home".into());
             }
@@ -4322,7 +4359,7 @@ fn no_home_view_admitted(
         if cwd == guest_home {
             return Err("this is the home itself".into());
         }
-        if dot_dir_under(guest_home, cwd).is_some() {
+        if dot_dir_under(guest_home, &fork_as_project(cwd, &homes)).is_some() {
             return Err("this is inside a dot-directory of the home".into());
         }
         if !cwd.starts_with(project) {
@@ -7283,6 +7320,86 @@ mod tests {
         let outside = root.path().join("work");
         fs::create_dir(&outside).unwrap();
         assert!(admitted(&outside, &outside).is_ok());
+    }
+
+    /// A lane of `marsh split` is judged as the project it forks: the owner's
+    /// case was `gog` from `~/dev/runmylife/.marsh/split/<id>/<lane>`.
+    #[test]
+    fn no_home_kit_runs_from_a_lane_of_a_project_under_the_home() {
+        const ID: &str = "abc123def456";
+        let root = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(root.path()).unwrap().join("home");
+        let project = home.join("dev/runmylife");
+        let lane = project.join(".marsh/split").join(ID).join("lane");
+        fs::create_dir_all(lane.join("sub/deeper")).unwrap();
+        fs::create_dir_all(lane.join(".git")).unwrap();
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::create_dir_all(home.join(".marsh/split").join(ID).join("lane/dev/p")).unwrap();
+        fs::create_dir_all(home.join(".config/x/.marsh/split").join(ID).join("lane")).unwrap();
+        let admitted =
+            |project: &Path, cwd: &Path| no_home_view_admitted(&home, &home, project, cwd);
+
+        // The session's project is the fork itself (a Pix session in a lane).
+        assert_eq!(admitted(&lane, &lane), Ok(()));
+        assert_eq!(admitted(&lane, &lane.join("sub")), Ok(()));
+        assert_eq!(admitted(&lane, &lane.join("sub/deeper")), Ok(()));
+        // The session's project is the base project, the cwd is in a lane.
+        assert_eq!(admitted(&project, &lane), Ok(()));
+        assert_eq!(admitted(&project, &lane.join("sub")), Ok(()));
+        // As for the base project, a dot-directory inside it is not a cwd.
+        assert!(admitted(&project, &project.join(".git")).is_err());
+        assert!(admitted(&lane, &lane.join(".git")).is_err());
+
+        // Under the home's own `.marsh`, a lane is not a project folder.
+        let in_marsh = home.join(".marsh/split").join(ID).join("lane");
+        assert!(admitted(&in_marsh, &in_marsh).is_err());
+        assert!(admitted(&in_marsh, &in_marsh.join("dev/p")).is_err());
+        assert!(admitted(&project, &in_marsh).is_err());
+        assert!(admitted(&project, &in_marsh.join("dev/p")).is_err());
+        assert!(admitted(&in_marsh.join("dev/p"), &in_marsh.join("dev/p")).is_err());
+        // Nor under another dot-directory of the home.
+        let nested = home.join(".config/x/.marsh/split").join(ID).join("lane");
+        assert!(admitted(&nested, &nested).is_err());
+        assert!(admitted(&project, &nested).is_err());
+        // Only the one `.marsh/split/<id>/<label>` of a fork is set aside:
+        // not another `.marsh`, a fork of a fork, or a malformed lane.
+        let twice = lane.join(".marsh/split").join(ID).join("again");
+        assert!(admitted(&twice, &twice).is_err());
+        assert!(admitted(&project, &twice).is_err());
+        assert!(admitted(&project, &project.join(".marsh/other/x")).is_err());
+        assert!(admitted(&project, &project.join(".marsh")).is_err());
+        assert!(admitted(&project, &project.join(".marsh/split")).is_err());
+        assert!(admitted(&project, &project.join(".marsh/split").join(ID)).is_err());
+        let odd = project.join(".marsh/split/not an id/lane");
+        assert!(admitted(&odd, &odd).is_err());
+        let odd = project.join(".marsh/split").join(ID).join("out");
+        assert!(admitted(&odd, &odd).is_err());
+        // A lane of the home itself is the home; the home's dot-directories
+        // stay refused from the base project or from a lane.
+        assert!(admitted(&home, &home.join(".ssh")).is_err());
+        assert!(admitted(&lane, &home.join(".ssh")).is_err());
+        assert!(admitted(&project, &home.join(".ssh")).is_err());
+        assert!(admitted(&lane, &home).is_err());
+        // The cwd must still be in the project (compared before the strip).
+        let other = home.join("dev/other");
+        fs::create_dir_all(&other).unwrap();
+        assert!(admitted(&other, &lane).is_err());
+        assert!(admitted(&lane, &project).is_err());
+
+        // Symlinks stay judged where they lead.
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join("dev/to-ssh")).unwrap();
+        let link = home.join("dev/to-ssh");
+        assert!(admitted(&link, &link).is_err());
+        std::os::unix::fs::symlink(&lane, home.join("dev/to-lane")).unwrap();
+        let link = home.join("dev/to-lane");
+        assert!(admitted(&link, &link).is_ok());
+
+        // A lane of a project outside the home keeps working.
+        let outside = root.path().join("work/proj");
+        let outside_lane = outside.join(".marsh/split").join(ID).join("lane");
+        fs::create_dir_all(&outside_lane).unwrap();
+        assert_eq!(admitted(&outside_lane, &outside_lane), Ok(()));
+        assert_eq!(admitted(&outside, &outside_lane), Ok(()));
     }
 
     struct NeverRunner;

@@ -113,6 +113,20 @@ pub fn is_terminal_unsafe(character: char) -> bool {
         )
 }
 
+/// `text` as plain one-line text for a status or event: the characters of
+/// `text` without any [`is_terminal_unsafe`] one and without the marks that
+/// reorder or hide text and that a status line never needs, the Arabic letter
+/// mark (U+061C), the zero-width joiners and the direction marks (U+200C to
+/// U+200F). Letters of any script stay. The characters are dropped, not
+/// replaced, and come lazily, so a caller cuts the text with `.take(limit)`
+/// without reading the rest of a long string a VM chose. Quoting and cutting
+/// stay with the caller; [`display_safe_text`] is the one for the user's
+/// terminal.
+pub fn sanitize_vm_text(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars()
+        .filter(|c| !is_terminal_unsafe(*c) && !matches!(*c, '\u{061c}' | '\u{200c}'..='\u{200f}'))
+}
+
 fn is_joiner(character: char) -> bool {
     matches!(character, '\u{200c}' | '\u{200d}')
 }
@@ -307,6 +321,73 @@ pub fn hyperlink(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vm_text(text: &str) -> String {
+        sanitize_vm_text(text).collect()
+    }
+
+    #[test]
+    fn vm_text_drops_controls_and_escape_sequences_and_keeps_the_rest() {
+        assert_eq!(
+            vm_text("a\u{1b}[31mb\u{9b}c\u{7}d\re\nf\tg\u{7f}h"),
+            "a[31mbcdefgh"
+        );
+        assert_eq!(vm_text("a\u{1b}]8;;http://x\u{7}b"), "a]8;;http://xb");
+        assert_eq!(vm_text("a\u{2028}b\u{2029}c"), "abc");
+        assert_eq!(vm_text(""), "");
+    }
+
+    /// Every one of the characters named, on its own between two letters: a
+    /// code point dropped from the list, or from `is_terminal_unsafe`, fails.
+    /// LRM and RLM (U+200E, U+200F) are kept by `display_safe_text` for right-
+    /// to-left text on the terminal, and dropped here.
+    #[test]
+    fn vm_text_drops_each_direction_and_format_character() {
+        let embeddings = ['\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}'];
+        let isolates = ['\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}'];
+        let marks = ['\u{061c}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}'];
+        let invisible = ['\u{200b}', '\u{2060}', '\u{feff}', '\u{00ad}'];
+        for hidden in embeddings
+            .into_iter()
+            .chain(isolates)
+            .chain(marks)
+            .chain(invisible)
+        {
+            assert_eq!(
+                vm_text(&format!("a{hidden}b")),
+                "ab",
+                "U+{:04X}",
+                hidden as u32
+            );
+        }
+        for hidden in '\u{200c}'..='\u{200f}' {
+            assert_eq!(
+                vm_text(&format!("a{hidden}b")),
+                "ab",
+                "U+{:04X}",
+                hidden as u32
+            );
+        }
+    }
+
+    /// Whatever `is_terminal_unsafe` rejects is dropped, over every scalar value.
+    #[test]
+    fn vm_text_drops_every_terminal_unsafe_character() {
+        for c in (0..=0x0010_ffff).filter_map(char::from_u32) {
+            if is_terminal_unsafe(c) {
+                assert_eq!(vm_text(&c.to_string()), "", "U+{:04X}", c as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn vm_text_keeps_ordinary_unicode_and_is_lazy() {
+        let text = "naïve café 日本語 שלום مرحبا Привет 🙂 ñ";
+        assert_eq!(vm_text(text), text);
+        assert_eq!(vm_text("é\u{200d}é"), "éé");
+        let long = format!("ab\u{202e}c{}", "x".repeat(1 << 20));
+        assert_eq!(sanitize_vm_text(&long).take(3).collect::<String>(), "abc");
+    }
 
     #[test]
     fn display_filter_holds_a_split_character_and_hides_controls() {

@@ -210,11 +210,7 @@ fn bounded(text: &str) -> String {
 /// reorder or hide text (direction controls, zero-width and other format
 /// characters) are dropped; letters of any script stay.
 fn plain(text: &str, limit: usize) -> String {
-    text.chars()
-        .filter(|c| {
-            !marsh_contracts::terminal::is_terminal_unsafe(*c)
-                && !matches!(*c, '\u{061c}' | '\u{200c}'..='\u{200f}')
-        })
+    marsh_contracts::terminal::sanitize_vm_text(text)
         .take(limit)
         .collect()
 }

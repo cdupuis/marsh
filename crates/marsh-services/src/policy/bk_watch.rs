@@ -214,12 +214,7 @@ impl Refused {
 /// and the ones that reorder or hide text are dropped (as for every string the
 /// VM reports), and it is cut to [`SHOWN_NAME`] characters.
 pub(super) fn shown_name(name: &str) -> String {
-    let mut shown: String = name
-        .chars()
-        .filter(|c| {
-            !marsh_contracts::terminal::is_terminal_unsafe(*c)
-                && !matches!(*c, '\u{061c}' | '\u{200c}'..='\u{200f}')
-        })
+    let mut shown: String = marsh_contracts::terminal::sanitize_vm_text(name)
         .take(SHOWN_NAME + 1)
         .collect();
     if shown.chars().count() > SHOWN_NAME {

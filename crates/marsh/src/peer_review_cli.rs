@@ -491,17 +491,50 @@ mod tests {
         let path = scope.path().join(DROPIN_DIR).join(MARSH_DROPIN);
         let file = DropIn::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(file.enabled, Some(true));
-        // codex gets openai's newest mid model, whichever the snapshot has.
-        let terra = ClassTable::builtin()
-            .newest("openai", ModelClass::Mid)
-            .unwrap();
+        // codex is given the openai mid model the snapshot lists last (a
+        // newer refresh moves it): eligible, in the `task` tool's list for
+        // codex, and the latest-dated terra the snapshot has, read from the
+        // data file here and not through `newest`.
+        let table = ClassTable::builtin();
+        let model = file
+            .reviewers
+            .iter()
+            .find(|r| r.agent == "codex" && r.class == Some(ModelClass::Mid))
+            .map(|r| r.model.clone())
+            .unwrap_or_else(|| panic!("no codex mid reviewer: {:?}", file.reviewers));
+        let found = table.classify(&model).unwrap();
         assert!(
-            file.reviewers
-                .iter()
-                .any(|r| r.agent == "codex" && r.model == terra),
-            "{:?}",
-            file.reviewers
+            found.eligible && found.how != "retired",
+            "{model}: {found:?}"
         );
+        assert_eq!(found.vendor.as_deref(), Some("openai"));
+        let codex = marsh_daemon::peer_review::agent_choices(
+            &table,
+            "codex",
+            &["openai".to_owned()],
+            &BTreeMap::new(),
+        );
+        assert!(
+            codex.iter().any(|c| c.model == model && c.class == "mid"),
+            "{model} is not in codex's list: {codex:?}"
+        );
+        let data: serde_json::Value =
+            serde_json::from_str(include_str!("../../marsh-daemon/data/models-dev.json")).unwrap();
+        let latest_terra = data["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row[0] == "openai" && row[3] == "openai")
+            .filter_map(|row| Some((row[1].as_str()?, row[6].as_str()?)))
+            .filter(|(id, _)| id.contains("-terra"))
+            .filter(|(id, _)| {
+                !["codex", "preview", "latest"]
+                    .iter()
+                    .any(|w| id.contains(w))
+            })
+            .max_by_key(|(id, released)| (*released, std::cmp::Reverse(id.len())))
+            .map(|(id, _)| id);
+        assert_eq!(latest_terra, Some(model.as_str()));
         write_switch(scope.path(), false, &agents, &credentials).unwrap();
         let off = DropIn::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!((off.enabled, off.reviewers), (Some(false), file.reviewers));

@@ -1274,6 +1274,17 @@ mod tests {
         &'static str,
     );
 
+    /// A row released `days` after the newest release of the snapshot it is
+    /// added to, so no real model a refresh brings can be newer than it.
+    type Later = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        f64,
+        i64,
+    );
+
     fn table_over(models: &[serde_json::Value]) -> ClassTable {
         let text = serde_json::json!({"fields": [], "models": models}).to_string();
         ClassTable::with_snapshot(Snapshot::parse(&text).unwrap())
@@ -1288,15 +1299,78 @@ mod tests {
             .collect()
     }
 
-    /// The compiled-in snapshot with `extra` rows added: the models a refresh
-    /// of it may bring, which the product code must take in its stride.
-    fn builtin_plus(extra: &[Row]) -> ClassTable {
+    /// Days since 1970-01-01 of a calendar date, and back (proleptic
+    /// Gregorian, Howard Hinnant's algorithms).
+    fn civil_days(year: i64, month: i64, day: i64) -> i64 {
+        let year = year - i64::from(month <= 2);
+        let era = year.div_euclid(400);
+        let year_of_era = year - era * 400;
+        let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        era * 146_097 + day_of_era - 719_468
+    }
+
+    fn civil_date(days: i64) -> (i64, i64, i64) {
+        let days = days + 719_468;
+        let era = days.div_euclid(146_097);
+        let day_of_era = days - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_index = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+        let month = if month_index < 10 {
+            month_index + 3
+        } else {
+            month_index - 9
+        };
+        (year_of_era + era * 400 + i64::from(month <= 2), month, day)
+    }
+
+    fn add_days(date: &str, days: i64) -> String {
+        let [year, month, day]: [i64; 3] = date
+            .split('-')
+            .map(|part| part.parse().unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let (year, month, day) = civil_date(civil_days(year, month, day) + days);
+        format!("{year:04}-{month:02}-{day:02}")
+    }
+
+    #[test]
+    fn the_test_calendar_adds_days() {
+        assert_eq!(add_days("2026-12-16", 0), "2026-12-16");
+        assert_eq!(add_days("2026-12-16", 30), "2027-01-15");
+        assert_eq!(add_days("2028-02-28", 1), "2028-02-29");
+        assert_eq!(add_days("2099-01-01", 400), "2100-02-05");
+        assert_eq!(add_days("2026-03-01", -1), "2026-02-28");
+    }
+
+    /// The compiled-in snapshot with models a refresh may bring: `fixed` rows
+    /// as dated, then `later` rows dated after the newest release of all of
+    /// it (so they stay the newest, whatever a real refresh adds). The product
+    /// code must take them in its stride.
+    fn builtin_plus(fixed: &[Row], later: &[Later]) -> ClassTable {
         let mut file: serde_json::Value = serde_json::from_str(SNAPSHOT).unwrap();
-        file["models"].as_array_mut().unwrap().extend(rows(extra));
+        let models = file["models"].as_array_mut().unwrap();
+        models.extend(rows(fixed));
+        let latest = models
+            .iter()
+            .filter_map(|row| row[6].as_str())
+            .max()
+            .unwrap()
+            .to_owned();
+        for (provider, id, family, vendor, output, days) in later {
+            let released = add_days(&latest, *days);
+            models.push(serde_json::json!([
+                provider, id, family, vendor, output, false, released
+            ]));
+        }
         let table = ClassTable::with_snapshot(Snapshot::parse(&file.to_string()).unwrap());
         assert_eq!(
             table.snapshot.models.len(),
-            snapshot().models.len() + extra.len()
+            snapshot().models.len() + fixed.len() + later.len()
         );
         table
     }
@@ -1328,36 +1402,56 @@ mod tests {
         ),
     ];
 
-    fn released<'a>(table: &'a ClassTable, model: &str) -> &'a str {
-        let row = table
-            .snapshot
-            .models
-            .iter()
-            .find(|row| row.id == model && row.first_party());
-        row.unwrap_or_else(|| panic!("{model} is not in the snapshot"))
-            .released
-            .as_str()
+    /// The oracle below counts release distances the way the product
+    /// documents (`day_number`: 365-day years of 31-day months) and cuts at
+    /// the literal 180, written here and not taken from the product.
+    const OWN_RECENT_DAYS: i64 = 180;
+
+    fn own_days(date: &str) -> i64 {
+        let [year, month, day]: [i64; 3] = date
+            .split('-')
+            .map(|part| part.parse().unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        year * 372 + month * 31 + day
     }
 
-    /// The newest model of `family` that `vendor` serves itself, read off the
-    /// table's snapshot by release date (a shorter id wins a tie), not through
-    /// `newest` or `choices`: the expectation the two must agree with. It
-    /// knows nothing of retired models, so only a snapshot where no retired
-    /// model is newer than a current one may use it.
-    fn newest_of_family(table: &ClassTable, vendor: &str, family: &str) -> Option<String> {
-        let key = |row: &SnapshotModel| (row.released.clone(), std::cmp::Reverse(row.id.len()));
+    /// `model`'s release date as the vendor itself lists it (the newest, where
+    /// a snapshot repeats an id).
+    fn released(table: &ClassTable, model: &str) -> String {
         table
             .snapshot
             .models
             .iter()
-            .filter(|row| row.vendor == vendor && row.first_party() && plain_chat_model(&row.id))
-            .filter(|row| normalize(&row.id).contains(&format!("-{family}")))
-            .max_by_key(|row| key(row))
+            .filter(|row| row.id == model && row.provider == row.vendor)
+            .map(|row| row.released.clone())
+            .max()
+            .unwrap_or_else(|| panic!("{model} is not in the snapshot"))
+    }
+
+    /// The newest model of `family` that `vendor` itself lists, read off the
+    /// table's snapshot by release date (a shorter id wins a tie): the
+    /// expectation `newest` and `choices` must agree with. Written without the
+    /// product's `first_party`, `normalize` and `day_number`; only
+    /// `plain_chat_model` (which ids are chat models) is shared. It knows
+    /// nothing of retired models, so only a snapshot where no retired model is
+    /// newer than a current one may use it.
+    fn newest_of_family(table: &ClassTable, vendor: &str, family: &str) -> Option<String> {
+        let needle = format!("-{family}");
+        table
+            .snapshot
+            .models
+            .iter()
+            .filter(|row| row.vendor == vendor && row.provider == vendor)
+            .filter(|row| plain_chat_model(&row.id))
+            .filter(|row| row.id.to_ascii_lowercase().contains(&needle))
+            .max_by_key(|row| (row.released.clone(), std::cmp::Reverse(row.id.len())))
             .map(|row| row.id.clone())
     }
 
     /// What the `task` tool lists for `vendor`'s own agent: each family's
-    /// newest model, except a family more than `CHOICE_RECENT_DAYS` behind the
+    /// newest model, except a family more than `OWN_RECENT_DAYS` behind the
     /// vendor's newest; small before mid before large, newest first within a
     /// class.
     fn expected_list(
@@ -1374,19 +1468,19 @@ mod tests {
             .collect::<Vec<_>>();
         let latest = found
             .iter()
-            .map(|(model, ..)| day_number(released(table, model)))
+            .map(|(model, ..)| own_days(&released(table, model)))
             .max()
             .unwrap_or(0);
         let mut found = found
             .into_iter()
-            .filter(|(model, ..)| day_number(released(table, model)) + CHOICE_RECENT_DAYS >= latest)
+            .filter(|(model, ..)| own_days(&released(table, model)) + OWN_RECENT_DAYS >= latest)
             .collect::<Vec<_>>();
-        found.sort_by(|a, b| {
-            (a.1, std::cmp::Reverse(released(table, &a.0)), &a.0).cmp(&(
-                b.1,
-                std::cmp::Reverse(released(table, &b.0)),
-                &b.0,
-            ))
+        found.sort_by_key(|(model, class, _)| {
+            (
+                *class,
+                std::cmp::Reverse(released(table, model)),
+                model.clone(),
+            )
         });
         found
     }
@@ -1552,161 +1646,78 @@ mod tests {
         assert_eq!(vendor_name("openai"), "openai");
     }
 
-    const FABLE_A_MONTH_ON: Row = (
-        "anthropic",
-        "claude-fable-5-9",
-        "claude-fable",
-        "anthropic",
-        40.0,
-        "2026-12-16",
-    );
-
-    /// A model so much newer than the vendor's other families that they fall
-    /// out of the `task` tool's list (a family over half a year behind).
+    /// Models a real refresh could bring, dated as it could: a newer opus and
+    /// sonnet within weeks, and a model far in the future. Every table built
+    /// on them must still pass every test, which is the point of them.
     #[rustfmt::skip]
-    const FABLE_A_YEAR_ON: Row = ("anthropic", "claude-fable-6-0", "claude-fable", "anthropic", 40.0, "2027-12-16");
-
-    /// A newer model in every family, the vendor's large families in the
-    /// opposite order to today's, and a year on from the snapshot.
-    const EVERY_FAMILY_NEWER: [Row; 8] = [
-        (
-            "anthropic",
-            "claude-haiku-7-1",
-            "claude-haiku",
-            "anthropic",
-            0.5,
-            "2031-01-02",
-        ),
-        (
-            "anthropic",
-            "claude-sonnet-7-1",
-            "claude-sonnet",
-            "anthropic",
-            10.0,
-            "2031-01-03",
-        ),
-        (
-            "anthropic",
-            "claude-fable-7-1",
-            "claude-fable",
-            "anthropic",
-            40.0,
-            "2031-01-04",
-        ),
-        (
-            "anthropic",
-            "claude-opus-7-1",
-            "claude-opus",
-            "anthropic",
-            20.0,
-            "2031-01-05",
-        ),
-        (
-            "openai",
-            "gpt-7-luna",
-            "gpt-luna",
-            "openai",
-            0.5,
-            "2031-01-02",
-        ),
-        (
-            "openai",
-            "gpt-7.1-terra",
-            "gpt-terra",
-            "openai",
-            5.0,
-            "2031-01-03",
-        ),
-        (
-            "openai",
-            "gpt-7.1-astra",
-            "gpt-astra",
-            "openai",
-            50.0,
-            "2031-01-04",
-        ),
-        (
-            "openai",
-            "gpt-7.2-sol",
-            "gpt-sol",
-            "openai",
-            10.0,
-            "2031-01-05",
-        ),
+    const A_REFRESH: [Row; 3] = [
+        ("anthropic", "claude-opus-5-6", "claude-opus", "anthropic", 20.0, "2026-12-20"),
+        ("anthropic", "claude-sonnet-5-6", "claude-sonnet", "anthropic", 10.0, "2027-01-10"),
+        ("openai", "gpt-6.2-sol", "gpt-sol", "openai", 10.0, "2099-01-01"),
     ];
 
-    /// The compiled-in snapshot, and it with the models a refresh may bring.
-    /// Every test of what is newest and how it is listed runs on each.
-    fn refreshed_tables() -> Vec<(&'static str, ClassTable)> {
-        vec![
-            ("compiled-in snapshot", ClassTable::builtin()),
-            ("a newer fable", builtin_plus(&[FABLE_A_MONTH_ON])),
-            ("a fable a year on", builtin_plus(&[FABLE_A_YEAR_ON])),
-            ("every family newer", builtin_plus(&EVERY_FAMILY_NEWER)),
-        ]
+    /// A newer fable a month on from the snapshot's newest release.
+    #[rustfmt::skip]
+    const FABLE_A_MONTH_ON: Later = ("anthropic", "claude-fable-x9", "claude-fable", "anthropic", 40.0, 30);
+
+    /// A fable so much newer than the vendor's other families that they fall
+    /// out of the `task` tool's list (a family over half a year behind).
+    #[rustfmt::skip]
+    const FABLE_A_YEAR_ON: Later = ("anthropic", "claude-fable-x9", "claude-fable", "anthropic", 40.0, 400);
+
+    /// A newer model in every family, the vendor's large families in the
+    /// opposite order to today's (opus and sol newest), a year on.
+    #[rustfmt::skip]
+    const EVERY_FAMILY_NEWER: [Later; 8] = [
+        ("anthropic", "claude-haiku-x9", "claude-haiku", "anthropic", 0.5, 401),
+        ("anthropic", "claude-sonnet-x9", "claude-sonnet", "anthropic", 10.0, 402),
+        ("anthropic", "claude-fable-x9", "claude-fable", "anthropic", 40.0, 403),
+        ("anthropic", "claude-opus-x9", "claude-opus", "anthropic", 20.0, 404),
+        ("openai", "gpt-x9-luna", "gpt-luna", "openai", 0.5, 401),
+        ("openai", "gpt-x9-terra", "gpt-terra", "openai", 5.0, 402),
+        ("openai", "gpt-x9-astra", "gpt-astra", "openai", 50.0, 403),
+        ("openai", "gpt-x9-sol", "gpt-sol", "openai", 10.0, 404),
+    ];
+
+    /// The compiled-in snapshot, and it with the models a refresh may bring,
+    /// alone and on top of `A_REFRESH`. Every test of what is newest and how
+    /// it is listed runs on each.
+    fn refreshed_tables() -> Vec<(String, ClassTable)> {
+        let mut tables = Vec::new();
+        for (base, fixed) in [("", &[][..]), (" after a refresh", &A_REFRESH[..])] {
+            tables.push((
+                format!("compiled-in snapshot{base}"),
+                builtin_plus(fixed, &[]),
+            ));
+            tables.push((
+                format!("a newer fable{base}"),
+                builtin_plus(fixed, &[FABLE_A_MONTH_ON]),
+            ));
+            tables.push((
+                format!("a fable a year on{base}"),
+                builtin_plus(fixed, &[FABLE_A_YEAR_ON]),
+            ));
+            tables.push((
+                format!("every family newer{base}"),
+                builtin_plus(fixed, &EVERY_FAMILY_NEWER),
+            ));
+        }
+        tables
     }
 
     /// Models no listing may reach for, though they are newer than every
     /// current model: retired generations, ids that are not plain chat models,
     /// and another host's listing of a maker's model.
-    const NEWER_BUT_NEVER_OFFERED: [Row; 8] = [
-        (
-            "anthropic",
-            "claude-opus-4-9",
-            "claude-opus",
-            "anthropic",
-            25.0,
-            "2032-01-01",
-        ),
-        (
-            "anthropic",
-            "claude-sonnet-4-9",
-            "claude-sonnet",
-            "anthropic",
-            15.0,
-            "2032-01-01",
-        ),
-        (
-            "anthropic",
-            "claude-haiku-5-9-preview",
-            "claude-haiku",
-            "anthropic",
-            0.5,
-            "2032-01-01",
-        ),
-        (
-            "anthropic",
-            "claude-haiku-5-9-20320101",
-            "claude-haiku",
-            "anthropic",
-            0.5,
-            "2032-01-01",
-        ),
-        ("openai", "gpt-5.9", "gpt-5", "openai", 10.0, "2032-01-01"),
-        (
-            "openai",
-            "gpt-6.3-terra-latest",
-            "gpt-terra",
-            "openai",
-            5.0,
-            "2032-01-01",
-        ),
-        (
-            "openai",
-            "gpt-6.3-luna-codex",
-            "gpt-luna",
-            "openai",
-            0.5,
-            "2032-01-01",
-        ),
-        (
-            "openrouter",
-            "anthropic/claude-opus-7-9",
-            "claude-opus",
-            "anthropic",
-            20.0,
-            "2032-01-01",
-        ),
+    #[rustfmt::skip]
+    const NEWER_BUT_NEVER_OFFERED: [Later; 8] = [
+        ("anthropic", "claude-opus-4-9", "claude-opus", "anthropic", 25.0, 900),
+        ("anthropic", "claude-sonnet-4-9", "claude-sonnet", "anthropic", 15.0, 900),
+        ("anthropic", "claude-haiku-5-9-preview", "claude-haiku", "anthropic", 0.5, 900),
+        ("anthropic", "claude-haiku-5-9-20320101", "claude-haiku", "anthropic", 0.5, 900),
+        ("openai", "gpt-5.9", "gpt-5", "openai", 10.0, 900),
+        ("openai", "gpt-6.3-terra-latest", "gpt-terra", "openai", 5.0, 900),
+        ("openai", "gpt-6.3-luna-codex", "gpt-luna", "openai", 0.5, 900),
+        ("openrouter", "anthropic/claude-opus-7-9", "claude-opus", "anthropic", 20.0, 900),
     ];
 
     #[test]
@@ -1735,21 +1746,23 @@ mod tests {
         }
         // The expectation moves with the snapshot: a model added to it is the
         // answer, and the product does not go on naming the one it replaced.
-        let table = builtin_plus(&[FABLE_A_MONTH_ON]);
-        assert_eq!(
-            table.newest("anthropic", ModelClass::Large).as_deref(),
-            Some("claude-fable-5-9")
-        );
-        let table = builtin_plus(&EVERY_FAMILY_NEWER);
-        for (vendor, class, model) in [
-            ("anthropic", ModelClass::Small, "claude-haiku-7-1"),
-            ("anthropic", ModelClass::Mid, "claude-sonnet-7-1"),
-            ("anthropic", ModelClass::Large, "claude-opus-7-1"),
-            ("openai", ModelClass::Small, "gpt-7-luna"),
-            ("openai", ModelClass::Mid, "gpt-7.1-terra"),
-            ("openai", ModelClass::Large, "gpt-7.2-sol"),
-        ] {
-            assert_eq!(table.newest(vendor, class).as_deref(), Some(model));
+        for fixed in [&[][..], &A_REFRESH[..]] {
+            let table = builtin_plus(fixed, &[FABLE_A_MONTH_ON]);
+            assert_eq!(
+                table.newest("anthropic", ModelClass::Large).as_deref(),
+                Some("claude-fable-x9")
+            );
+            let table = builtin_plus(fixed, &EVERY_FAMILY_NEWER);
+            for (vendor, class, model) in [
+                ("anthropic", ModelClass::Small, "claude-haiku-x9"),
+                ("anthropic", ModelClass::Mid, "claude-sonnet-x9"),
+                ("anthropic", ModelClass::Large, "claude-opus-x9"),
+                ("openai", ModelClass::Small, "gpt-x9-luna"),
+                ("openai", ModelClass::Mid, "gpt-x9-terra"),
+                ("openai", ModelClass::Large, "gpt-x9-sol"),
+            ] {
+                assert_eq!(table.newest(vendor, class).as_deref(), Some(model));
+            }
         }
     }
 
@@ -2153,37 +2166,27 @@ mod tests {
     #[test]
     fn an_agents_models_are_each_familys_newest_and_nicknames_resolve() {
         for (what, table) in refreshed_tables() {
-            assert_the_lists_have_their_shape(what, &table);
+            assert_the_lists_have_their_shape(&what, &table);
         }
-        // The compiled-in snapshot lists every family of both vendors.
-        let table = ClassTable::builtin();
-        for (agent, vendor, families) in FAMILIES {
-            let choices = agent_choices(&table, agent, &[vendor.to_owned()], &BTreeMap::new());
-            let mut listed = choices
-                .iter()
-                .map(|c| c.family.as_str())
-                .collect::<Vec<_>>();
-            listed.sort_unstable();
-            let mut named = families.map(|(family, _)| family);
-            named.sort_unstable();
-            assert_eq!(listed, named, "{agent}");
+        // A model added to the snapshot is the row, in release order (the
+        // large families by release, not by name).
+        for fixed in [&[][..], &A_REFRESH[..]] {
+            let table = builtin_plus(fixed, &EVERY_FAMILY_NEWER);
+            let list = |agent: &str, service: &str| {
+                let choices = agent_choices(&table, agent, &[service.to_owned()], &BTreeMap::new());
+                describe_choices(&BTreeMap::from([(agent.to_owned(), choices)]))
+            };
+            assert_eq!(
+                list("codex", "openai"),
+                "codex: gpt-x9-luna (small, luna), gpt-x9-terra (mid, terra), \
+                 gpt-x9-sol (large, sol), gpt-x9-astra (large, astra)"
+            );
+            assert_eq!(
+                list("claude", "anthropic"),
+                "claude: claude-haiku-x9 (small, haiku), claude-sonnet-x9 (mid, sonnet), \
+                 claude-opus-x9 (large, opus), claude-fable-x9 (large, fable)"
+            );
         }
-        // A model added to the snapshot is the row, in release order.
-        let table = builtin_plus(&EVERY_FAMILY_NEWER);
-        let codex = agent_choices(&table, "codex", &["openai".to_owned()], &BTreeMap::new());
-        assert_eq!(
-            describe_choices(&BTreeMap::from([("codex".to_owned(), codex)])),
-            "codex: gpt-7-luna (small, luna), gpt-7.1-terra (mid, terra), \
-             gpt-7.2-sol (large, sol), gpt-7.1-astra (large, astra)"
-        );
-        let table = builtin_plus(&[FABLE_A_MONTH_ON]);
-        let claude = agent_choices(
-            &table,
-            "claude",
-            &["anthropic".to_owned()],
-            &BTreeMap::new(),
-        );
-        assert_eq!(claude[2].model, "claude-fable-5-9");
         assert_eq!(family_nickname("gpt-*luna*"), "luna");
         assert_eq!(family_nickname("claude-*-haiku*"), "haiku");
         assert_eq!(family_nickname("gpt-oss-20b*"), "oss");
@@ -2251,6 +2254,91 @@ mod tests {
                 "{vendor} {class:?}"
             );
         }
+    }
+
+    /// Release dates a given number of days behind 2030-12-10 as `day_number`
+    /// counts them (365-day years of 31-day months, so 2030-06-16 is 180 days
+    /// behind though the calendar says 177).
+    #[rustfmt::skip]
+    const LAGS: [Row; 7] = [
+        ("openai", "gpt-b1-sol", "gpt-sol", "openai", 10.0, "2030-12-10"),
+        ("openai", "gpt-b1-terra", "gpt-terra", "openai", 5.0, "2030-06-17"),
+        ("openai", "gpt-b1-luna", "gpt-luna", "openai", 0.5, "2030-06-16"),
+        ("openai", "gpt-b1-astra", "gpt-astra", "openai", 50.0, "2030-06-15"),
+        ("anthropic", "claude-opus-b1", "claude-opus", "anthropic", 20.0, "2030-12-10"),
+        ("anthropic", "claude-sonnet-b1", "claude-sonnet", "anthropic", 10.0, "2030-09-03"),
+        ("anthropic", "claude-haiku-b1", "claude-haiku", "anthropic", 0.5, "2029-11-13"),
+    ];
+
+    /// A family is listed when it is at most 180 days behind the vendor's
+    /// newest: 179 (terra) and 180 (luna) stay, 181 (astra) goes, as does one
+    /// 400 days behind (haiku); one 100 days behind (sonnet) stays. Fails if
+    /// the limit is anything but 180, or the distance is counted another way.
+    #[test]
+    fn a_family_is_listed_up_to_180_days_behind_the_vendors_newest() {
+        let table = table_over(&rows(&LAGS));
+        let list = |agent: &str, service: &str| {
+            let choices = agent_choices(&table, agent, &[service.to_owned()], &BTreeMap::new());
+            describe_choices(&BTreeMap::from([(agent.to_owned(), choices)]))
+        };
+        assert_eq!(
+            list("codex", "openai"),
+            "codex: gpt-b1-luna (small, luna), gpt-b1-terra (mid, terra), gpt-b1-sol (large, sol)"
+        );
+        assert_eq!(
+            list("claude", "anthropic"),
+            "claude: claude-sonnet-b1 (mid, sonnet), claude-opus-b1 (large, opus)"
+        );
+        // Too old to list is not too old to be the newest of its class.
+        assert_eq!(
+            table.newest("openai", ModelClass::Large).as_deref(),
+            Some("gpt-b1-sol")
+        );
+        assert_eq!(
+            table.newest("anthropic", ModelClass::Small).as_deref(),
+            Some("claude-haiku-b1")
+        );
+    }
+
+    /// Eleven families of three vendors, each newer than the last by a day.
+    #[rustfmt::skip]
+    const ELEVEN: [Row; 11] = [
+        ("openai", "gpt-t1-luna", "gpt-luna", "openai", 0.5, "2030-03-01"),
+        ("openai", "gpt-t1-terra", "gpt-terra", "openai", 5.0, "2030-03-02"),
+        ("openai", "gpt-t1-sol", "gpt-sol", "openai", 10.0, "2030-03-03"),
+        ("openai", "gpt-t1-astra", "gpt-astra", "openai", 50.0, "2030-03-04"),
+        ("anthropic", "claude-haiku-t1", "claude-haiku", "anthropic", 0.5, "2030-03-05"),
+        ("anthropic", "claude-sonnet-t1", "claude-sonnet", "anthropic", 10.0, "2030-03-06"),
+        ("anthropic", "claude-fable-t1", "claude-fable", "anthropic", 40.0, "2030-03-07"),
+        ("anthropic", "claude-opus-t1", "claude-opus", "anthropic", 20.0, "2030-03-08"),
+        ("google", "gemma-t1", "gemma", "google", 0.1, "2030-03-09"),
+        ("google", "gemini-t1-flash", "gemini-flash", "google", 0.5, "2030-03-10"),
+        ("google", "gemini-t1-pro", "gemini-pro", "google", 10.0, "2030-03-11"),
+    ];
+
+    /// A multi-provider agent that reaches three vendors is offered the eight
+    /// newest of their eleven families (the three oldest, gpt-t1-luna, terra
+    /// and sol, are cut), ordered small, mid, large, then by vendor, then
+    /// newest first. Fails if the cap is not 8 or the cut keeps the oldest.
+    #[test]
+    fn a_multi_provider_agent_is_offered_the_eight_newest_families() {
+        let table = table_over(&rows(&ELEVEN));
+        let reaches = BTreeMap::from([
+            ("anthropic".to_owned(), vec!["api.anthropic.com".to_owned()]),
+            ("openai".to_owned(), vec!["api.openai.com".to_owned()]),
+            (
+                "google".to_owned(),
+                vec!["generativelanguage.googleapis.com".to_owned()],
+            ),
+        ]);
+        let pi = agent_choices(&table, "pi", &[ANY_PROVIDER.to_owned()], &reaches);
+        assert_eq!(
+            describe_choices(&BTreeMap::from([("pi".to_owned(), pi)])),
+            "pi: anthropic/claude-haiku-t1 (small, haiku), google/gemini-t1-flash (small, flash), \
+             google/gemma-t1 (small, gemma), anthropic/claude-sonnet-t1 (mid, sonnet), \
+             google/gemini-t1-pro (mid, pro), anthropic/claude-opus-t1 (large, opus), \
+             anthropic/claude-fable-t1 (large, fable), openai/gpt-t1-astra (large, astra)"
+        );
     }
 
     #[test]
@@ -2368,10 +2456,16 @@ mod tests {
             "o3-pro", "o3", "o1", "o4-mini", "gpt-4", "gpt-4o", "gpt-4.1", "gpt-5",
         ];
         let never = NEWER_BUT_NEVER_OFFERED.map(|(_, id, ..)| id);
-        let current = refreshed_tables().into_iter().chain([(
-            "retired and unlisted models newer than all",
-            builtin_plus(&NEWER_BUT_NEVER_OFFERED),
-        )]);
+        let current = refreshed_tables().into_iter().chain([
+            (
+                "models newer than all that are never offered".to_owned(),
+                builtin_plus(&[], &NEWER_BUT_NEVER_OFFERED),
+            ),
+            (
+                "the same after a refresh".to_owned(),
+                builtin_plus(&A_REFRESH, &NEWER_BUT_NEVER_OFFERED),
+            ),
+        ]);
         for (what, table) in current {
             let offered = offered(&table);
             assert!(offered.len() > 8, "{what}: {offered:?}");
@@ -2406,12 +2500,12 @@ mod tests {
         }
         // Offering the newest never needs the retired models: the same lists
         // as without them, though they are the newest of all.
-        let (with, without) = (
-            builtin_plus(&NEWER_BUT_NEVER_OFFERED),
-            ClassTable::builtin(),
-        );
-        assert_eq!(offered(&with), offered(&without));
-        assert_eq!(detected(&with), detected(&without));
+        for fixed in [&[][..], &A_REFRESH[..]] {
+            let with = builtin_plus(fixed, &NEWER_BUT_NEVER_OFFERED);
+            let without = builtin_plus(fixed, &[]);
+            assert_eq!(offered(&with), offered(&without));
+            assert_eq!(detected(&with), detected(&without));
+        }
         // And every model of the compiled-in snapshot a retired glob names
         // is refused, whatever its date.
         for model in ["claude-opus-4-8", "claude-sonnet-4-6", "gpt-5.5"] {

@@ -1589,9 +1589,7 @@ pub fn link(name: &str, arguments: &[OsString]) -> i32 {
             .iter()
             .map(|arg| arg.as_bytes().to_vec())
             .collect(),
-        cwd: std::env::current_dir()
-            .map(|cwd| cwd.into_os_string().into_vec())
-            .unwrap_or_default(),
+        cwd: std::env::current_dir().map_or_default(|cwd| cwd.into_os_string().into_vec()),
         env: std::env::vars_os()
             .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_vec())))
             .filter(|(name, _)| marsh_daemon::split::forwardable(name))

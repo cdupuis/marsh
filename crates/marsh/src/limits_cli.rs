@@ -186,8 +186,7 @@ pub fn set_command(scope_root: &Path, name: &str, value: &str) -> Result<i32, (S
         let mut values = document
             .get_mut(limits::CONFIG_KEY)
             .and_then(serde_json::Value::as_object_mut)
-            .map(std::mem::take)
-            .unwrap_or_default();
+            .map_or_default(std::mem::take);
         match &parsed {
             Some(parsed) => {
                 values.insert(

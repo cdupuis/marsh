@@ -4779,8 +4779,7 @@ impl DaemonStore {
             limits: state
                 .job_defaults
                 .as_ref()
-                .map(|_| state.limits().status())
-                .unwrap_or_default(),
+                .map_or_default(|_| state.limits().status()),
             current_session_id,
             // An ended shell (detached, its authority released) is history, not
             // state: past `marsh -c` sessions do not accumulate here.

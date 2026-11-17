@@ -808,8 +808,7 @@ impl Server {
         let mut model = request
             .model
             .as_ref()
-            .map(|model| vec!["--model", model.as_str()])
-            .unwrap_or_default();
+            .map_or_default(|model| vec!["--model", model.as_str()]);
         // The daemon reads the agent's usage from its output (`--usage`).
         if let Some(parser) = &request.usage {
             model.extend(["--usage", parser.as_str()]);

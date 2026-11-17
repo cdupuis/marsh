@@ -674,8 +674,7 @@ fn read_record(control_home: &Path, store: &Path) -> (Record, Option<PathBuf>) {
 fn scope_name(control_home: &Path) -> String {
     control_home
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_or_default(|name| name.to_string_lossy().into_owned())
 }
 
 /// Writes the record durably (synced, then renamed into place and the

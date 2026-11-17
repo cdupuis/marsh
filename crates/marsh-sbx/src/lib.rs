@@ -8949,15 +8949,10 @@ fn supported_sbx_version(output: &str) -> bool {
                 let Some(abbreviated_commit) = abbreviated_commit.strip_prefix('g') else {
                     return false;
                 };
-                if distance == 0
-                    || !(7..=40).contains(&abbreviated_commit.len())
-                    || !abbreviated_commit.bytes().all(is_lower_hex_digit)
-                    || !commit.starts_with(abbreviated_commit)
-                {
-                    return false;
-                }
-
-                true
+                distance != 0
+                    && (7..=40).contains(&abbreviated_commit.len())
+                    && abbreviated_commit.bytes().all(is_lower_hex_digit)
+                    && commit.starts_with(abbreviated_commit)
             }
             [_] => true,
             _ => false,

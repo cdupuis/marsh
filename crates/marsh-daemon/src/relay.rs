@@ -364,9 +364,7 @@ where
         &tunnel,
         &TunnelFrame::Initialize {
             token: session_token,
-            breaks: services
-                .map(|services| services.guest_breaks())
-                .unwrap_or_default(),
+            breaks: services.map_or_default(|services| services.guest_breaks()),
         },
     ) {
         ready(Err(error.to_string()));
@@ -1872,7 +1870,7 @@ mod tests {
         let expected: Vec<u8> = (0..written)
             .map(|index| pattern[index % CHUNK_BYTES])
             .collect();
-        response.extend(rest.as_ref().map(Vec::as_slice).unwrap_or_default());
+        response.extend(rest.as_ref().map_or_default(Vec::as_slice));
         assert!(
             rest.is_ok() && response == expected,
             "the response was cut short: {} of {written} bytes ({:?})",

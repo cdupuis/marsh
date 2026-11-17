@@ -2514,10 +2514,7 @@ mod linux {
                                 "service '{}' is {}{}",
                                 text(service, 60),
                                 status,
-                                health
-                                    .as_deref()
-                                    .map(|h| format!(" ({h})"))
-                                    .unwrap_or_default()
+                                health.as_deref().map_or_default(|h| format!(" ({h})"))
                             ));
                         }
                         seen.push(json!({

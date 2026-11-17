@@ -162,7 +162,7 @@ fn recorded_names(map: &Path, key: &str, include_services: bool) -> io::Result<V
     Ok(value
         .get(key)
         .and_then(serde_json::Value::as_object)
-        .map(|entries| {
+        .map_or_default(|entries| {
             entries
                 .iter()
                 .filter(|(_, entry)| {
@@ -172,6 +172,5 @@ fn recorded_names(map: &Path, key: &str, include_services: bool) -> io::Result<V
                 })
                 .map(|(name, _)| name.clone())
                 .collect()
-        })
-        .unwrap_or_default())
+        }))
 }

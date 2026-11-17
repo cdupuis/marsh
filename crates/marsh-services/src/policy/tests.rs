@@ -762,8 +762,7 @@ fn list_queries_are_pinned_to_the_scope() {
             .query
             .iter()
             .find(|(k, _)| k == "filters")
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
+            .map_or_default(|(_, v)| v.clone());
         assert!(f.contains("dev.marsh.scope=lane-a"), "{t}: {f}");
     }
     // A user's own label filter is kept and ANDed.

@@ -117,8 +117,7 @@ fn main() {
                     working_directory: None,
                     environment: Vec::new(),
                 })
-                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-                .unwrap_or_default();
+                .map_or_default(|output| String::from_utf8_lossy(&output.stdout).into_owned());
             if listing.lines().any(|line| {
                 line.split_whitespace().next() == Some(vm.as_str()) && line.contains("running")
             }) {

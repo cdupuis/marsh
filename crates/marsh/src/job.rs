@@ -731,8 +731,7 @@ pub fn render_jobs(
     let roots = document
         .get("jobs")
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+        .map_or_default(Vec::as_slice);
     let mut roots = roots.iter().collect::<Vec<_>>();
     // Active trees first, then newest first.
     roots.sort_by_key(|root| {
@@ -1025,8 +1024,7 @@ struct Row<'a> {
 fn children(node: &serde_json::Value) -> &[serde_json::Value] {
     node.get("children")
         .and_then(serde_json::Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+        .map_or_default(Vec::as_slice)
 }
 
 fn collect_rows<'a>(

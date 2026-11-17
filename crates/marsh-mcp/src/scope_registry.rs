@@ -690,8 +690,7 @@ pub(crate) fn reconcile_persisted_scope(
             let prior = scope
                 .diagnostic
                 .take()
-                .map(|diagnostic| format!("{diagnostic}; "))
-                .unwrap_or_default();
+                .map_or_default(|diagnostic| format!("{diagnostic}; "));
             scope.diagnostic = Some(bounded_diagnostic(&format!(
                 "{prior}persisted scope home could not be verified safely and was isolated: {error}"
             )));

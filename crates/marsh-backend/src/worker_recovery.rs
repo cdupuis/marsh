@@ -83,12 +83,11 @@ impl StockDaemonBackend {
         self.sbx
             .quarantined_vms()
             .get(vm)
-            .map(|quarantine| WorkerQuarantine {
+            .map_or_default(|quarantine| WorkerQuarantine {
                 reason: quarantine.reason.clone(),
                 since: quarantine.since_unix_ms,
                 ..WorkerQuarantine::default()
             })
-            .unwrap_or_default()
     }
 
     /// Why automatic recovery last left `vm` quarantined.
@@ -268,9 +267,7 @@ impl StockDaemonBackend {
                     worker_id: vm.clone(),
                     vm_id: vm.clone(),
                     scope_id: scope_id.to_owned(),
-                    kit_ref: spec
-                        .map(|spec| spec.workload_kit.identity().to_owned())
-                        .unwrap_or_default(),
+                    kit_ref: spec.map_or_default(|spec| spec.workload_kit.identity().to_owned()),
                     kits,
                     warm: false,
                     health: WorkerHealth::Quarantined,

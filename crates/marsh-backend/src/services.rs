@@ -312,10 +312,8 @@ impl StockDaemonBackend {
         let Ok(settings) = self.services_settings() else {
             return;
         };
-        let running: BTreeSet<PathBuf> = self
-            .sbx
-            .stock_inventory(false)
-            .map(|inventory| {
+        let running: BTreeSet<PathBuf> =
+            self.sbx.stock_inventory(false).map_or_default(|inventory| {
                 self.sbx
                     .owned_services_vms()
                     .into_iter()
@@ -326,8 +324,7 @@ impl StockDaemonBackend {
                     })
                     .map(|(_, key)| PathBuf::from(key))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         let mut to_recover = Vec::new();
         for root in relays.unrecovered_roots() {
             if running.contains(&root) && settings.enabled_for(&root) {
@@ -1390,24 +1387,20 @@ impl StockDaemonBackend {
         let idle = Duration::from_secs(settings.idle_seconds);
         // A daemon that started with a services VM running (its holders and
         // lease died with the previous daemon) gives each one an idle timer.
-        let running = self
-            .sbx
-            .stock_inventory(false)
-            .map(|inventory| {
-                owned
-                    .iter()
-                    .filter(|(name, _)| {
-                        inventory
-                            .get(name)
-                            .is_some_and(marsh_sbx::StockInventoryVm::possibly_running)
-                    })
-                    .filter_map(|(_, key)| {
-                        let path = PathBuf::from(key);
-                        path.is_absolute().then_some(path)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let running = self.sbx.stock_inventory(false).map_or_default(|inventory| {
+            owned
+                .iter()
+                .filter(|(name, _)| {
+                    inventory
+                        .get(name)
+                        .is_some_and(marsh_sbx::StockInventoryVm::possibly_running)
+                })
+                .filter_map(|(_, key)| {
+                    let path = PathBuf::from(key);
+                    path.is_absolute().then_some(path)
+                })
+                .collect::<Vec<_>>()
+        });
         let mut due = Vec::new();
         {
             let mut projects = self
@@ -2460,15 +2453,12 @@ mod tests {
     fn config_list(home: &Path, key: &str) -> Vec<String> {
         let document: Value =
             serde_json::from_slice(&fs::read(home.join("config.json")).unwrap()).unwrap();
-        document[key]
-            .as_array()
-            .map(|all| {
-                all.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default()
+        document[key].as_array().map_or_default(|all| {
+            all.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
     }
 
     /// A daemon home and a base folder for the `rm --project` tests below:

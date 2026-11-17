@@ -115,16 +115,22 @@ pub fn is_terminal_unsafe(character: char) -> bool {
 
 /// `text` as plain one-line text for a status or event: the characters of
 /// `text` without any [`is_terminal_unsafe`] one and without the marks that
-/// reorder or hide text and that a status line never needs, the Arabic letter
+/// reorder or hide text and that a status line never needs: the Arabic letter
 /// mark (U+061C), the zero-width joiners and the direction marks (U+200C to
-/// U+200F). Letters of any script stay. The characters are dropped, not
-/// replaced, and come lazily, so a caller cuts the text with `.take(limit)`
-/// without reading the rest of a long string a VM chose. Quoting and cutting
-/// stay with the caller; [`display_safe_text`] is the one for the user's
-/// terminal.
+/// U+200F), and the emoji and text variation selectors (U+FE0E, U+FE0F). Those
+/// two move no cursor and reorder nothing, but they show nothing either, so
+/// they are a place to hide data in a name; a name loses only the choice
+/// between an emoji's text and picture forms. Letters of any script stay. The
+/// characters are dropped, not replaced, and come lazily, so a caller cuts the
+/// text with `.take(limit)` without reading the rest of a long string a VM
+/// chose. Quoting and cutting stay with the caller; [`display_safe_text`] is
+/// the one for the user's terminal, which keeps the two selectors where they
+/// belong to an emoji.
 pub fn sanitize_vm_text(text: &str) -> impl Iterator<Item = char> + '_ {
-    text.chars()
-        .filter(|c| !is_terminal_unsafe(*c) && !matches!(*c, '\u{061c}' | '\u{200c}'..='\u{200f}'))
+    text.chars().filter(|c| {
+        !is_terminal_unsafe(*c)
+            && !matches!(*c, '\u{061c}' | '\u{200c}'..='\u{200f}' | '\u{fe0e}'..='\u{fe0f}')
+    })
 }
 
 fn is_joiner(character: char) -> bool {
@@ -368,6 +374,27 @@ mod tests {
                 hidden as u32
             );
         }
+    }
+
+    /// Every variation selector goes, the emoji and text selectors U+FE0E and
+    /// U+FE0F too (`is_terminal_unsafe` leaves those two to `display_safe`):
+    /// alone, after ASCII or an emoji, they hide nothing a name needs and are
+    /// a place to hide data.
+    #[test]
+    fn vm_text_drops_every_variation_selector() {
+        for selector in '\u{fe00}'..='\u{fe0f}' {
+            for around in ["a{}b", "{}", "\u{2764}{}", "{}\u{1f600}"] {
+                let text = around.replace("{}", &selector.to_string());
+                let kept = text.replace(selector, "");
+                assert_eq!(
+                    vm_text(&text),
+                    kept,
+                    "U+{:04X} in {text:?}",
+                    selector as u32
+                );
+            }
+        }
+        assert_eq!(vm_text("\u{2764}\u{fe0f}"), "\u{2764}");
     }
 
     /// Whatever `is_terminal_unsafe` rejects is dropped, over every scalar value.

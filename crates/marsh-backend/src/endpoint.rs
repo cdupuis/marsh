@@ -391,7 +391,7 @@ fn serve<'scope, 'env>(
 ) {
     let relay = match backend.services_relay(&shared.scope.root) {
         Ok(relay) => relay,
-        Err(error) => return refuse(shared, channel, &format!("marsh: {error}")),
+        Err(error) => return refuse(shared, channel, &error.to_string()),
     };
     if let Err(error) = hold(backend, shared) {
         return refuse(shared, channel, &format!("marsh: {error}"));
@@ -411,7 +411,7 @@ fn serve<'scope, 'env>(
     });
     let stream = match opened {
         Ok(stream) => stream,
-        Err(error) => return refuse(shared, channel, &format!("marsh: {error}")),
+        Err(error) => return refuse(shared, channel, &error.to_string()),
     };
     // Aborted while the relay channel was opening.
     if !shared
@@ -827,15 +827,15 @@ impl<'scope, 'env> ShellEndpoint<'scope, 'env> {
         let relay = self
             .backend
             .services_relay(&self.root)
-            .map_err(|error| format!("marsh: {error}"))?;
+            .map_err(|error| error.to_string())?;
         self.hold();
         let authority = AttemptScope::new(&self.root, BASE_WORKSPACE, SHELL_ATTEMPT)
-            .map_err(|error| format!("marsh: {error}"))?;
+            .map_err(|error| error.to_string())?;
         let stream = match kind {
             ChannelKind::Docker => relay.open_docker(&authority),
             ChannelKind::Tcp { port } => relay.open_tcp(&authority, port),
         }
-        .map_err(|error| format!("marsh: {error}"))?;
+        .map_err(|error| error.to_string())?;
         let (finish, close) = (stream.clone(), stream.clone());
         Ok(ServiceStream {
             reader: Box::new(stream.clone()),
@@ -845,5 +845,68 @@ impl<'scope, 'env> ShellEndpoint<'scope, 'env> {
             }),
             close: Box::new(move || close.close()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a shell's Docker call is told when the endpoint cannot open the
+    /// channel: the daemon's own text, with `marsh:` once.
+    fn shell_refusal(backend: &StockDaemonBackend, root: &std::path::Path) -> String {
+        std::thread::scope(|scope| {
+            let (_endpoint, provider, _guard) = ShellEndpoint::start(
+                scope,
+                backend,
+                root.to_owned(),
+                "session".into(),
+                Arc::new(|_| {}),
+            );
+            match provider.open(ChannelKind::Docker) {
+                Ok(_) => panic!("the channel opened"),
+                Err(message) => message,
+            }
+        })
+    }
+
+    /// After a daemon restart the project's relay is not recovered for a few
+    /// seconds: a Docker call in a shell is told to retry and where to look, and the
+    /// refusal does not say `marsh:` twice.
+    #[test]
+    fn a_shell_call_before_the_relay_is_recovered_says_to_retry_with_one_prefix() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new())
+            .with_services_artifacts(home.path().join("artifacts"));
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        backend
+            .services
+            .relays
+            .as_ref()
+            .unwrap()
+            .mark_unrecovered([root.clone()]);
+        let message = shell_refusal(&backend, &root);
+        assert!(
+            message.starts_with("marsh: services relay unavailable: the relay has not been recovered since the daemon started"),
+            "{message}"
+        );
+        assert!(
+            message.contains("retry in a few seconds") && message.contains("`marsh docker status`"),
+            "{message}"
+        );
+        assert_eq!(message.matches("marsh: ").count(), 1, "{message}");
+    }
+
+    /// Every refusal of the shell endpoint carries the daemon's text with a single
+    /// `marsh:` (here: no services engine artifacts at all).
+    #[test]
+    fn a_shell_refusal_says_marsh_once() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        assert_eq!(
+            shell_refusal(&backend, &root),
+            "marsh: services relay unavailable: this daemon has no services engine artifacts"
+        );
     }
 }

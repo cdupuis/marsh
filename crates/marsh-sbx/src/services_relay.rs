@@ -162,6 +162,10 @@ const AGENT_MODES: &[&str] = &[
 /// running container of the project.
 pub const QUARANTINE_RECOVERY: &str = "`marsh services start` clears it, but it starts a new engine generation, which stops every running container of this project (its volumes and stopped containers stay)";
 
+/// Why a project whose daemon just (re)started has no relay yet, and what to do:
+/// the recovery pass brings it back within seconds.
+pub const UNRECOVERED: &str = "the relay has not been recovered since the daemon started: the daemon restarted and is reconnecting the Docker engine; retry in a few seconds (`marsh docker status` shows when it is ready)";
+
 /// Reads the relay exec's stderr, which is the VM's, with the same bounded,
 /// plain-text reader the engine watcher uses (`vm_text`): at most
 /// `DISPLAY_LINE_BYTES` of a line are kept and the rest is discarded as it is
@@ -639,9 +643,7 @@ impl ServicesRelays {
     /// `Unavailable` with the reason.
     pub fn get(&self, root: &Path) -> Result<Arc<RelayEntry>, RelayError> {
         if self.is_unrecovered(root) {
-            return Err(RelayError::Unavailable(
-                "the relay has not been recovered since the daemon started".into(),
-            ));
+            return Err(RelayError::Unavailable(UNRECOVERED.into()));
         }
         let entry = self.entries().get(root).cloned();
         match entry {
@@ -1008,6 +1010,27 @@ mod tests {
     use super::*;
     use crate::stuck_engine::start_held;
     use marsh_services::engine::EngineEvent;
+
+    /// A project the restarted daemon has not recovered yet refuses with the
+    /// reason, how long to expect, and where to look; `marsh:` once.
+    #[test]
+    fn an_unrecovered_project_is_told_to_retry() {
+        let held = Arc::new(crate::stuck_engine::HeldCopy::default());
+        let stock = Arc::new(StockSbx::new("sbx", held));
+        let relays = ServicesRelays::new(stock, None, DaemonBudget::new(1), None);
+        let root = PathBuf::from("/Users/alice/project");
+        relays.mark_unrecovered([root.clone()]);
+        let message = relays.get(&root).err().unwrap().to_string();
+        assert!(
+            message.starts_with("marsh: services relay unavailable: the relay has not been recovered since the daemon started"),
+            "{message}"
+        );
+        assert!(
+            message.contains("retry in a few seconds") && message.contains("`marsh docker status`"),
+            "{message}"
+        );
+        assert_eq!(message.matches("marsh: ").count(), 1, "{message}");
+    }
 
     /// A start that is not ready in time while its worker is inside an admitted
     /// call (the failed-establish path of `establish`): `close` must refuse to

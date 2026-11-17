@@ -362,6 +362,19 @@ fn hold(backend: &StockDaemonBackend, shared: &Shared) -> Result<(), String> {
     Ok(())
 }
 
+/// What a refusal says to the job or shell: the error's text with `marsh: ` once.
+/// A [`RelayError`](marsh_sbx::services_relay::RelayError) already begins with it,
+/// a plain text does not. Every refusal here goes through this
+/// (`every_refusal_goes_through_refusal_text` enforces it).
+fn refusal_text(error: &impl std::fmt::Display) -> String {
+    let text = error.to_string();
+    if text.starts_with("marsh: ") {
+        text
+    } else {
+        format!("marsh: {text}")
+    }
+}
+
 fn refuse(shared: &Shared, channel: u32, message: &str) {
     let _ = shared.control.send(&WorkerRequest::ChanRefused {
         attempt: shared.attempt.clone(),
@@ -391,10 +404,10 @@ fn serve<'scope, 'env>(
 ) {
     let relay = match backend.services_relay(&shared.scope.root) {
         Ok(relay) => relay,
-        Err(error) => return refuse(shared, channel, &format!("marsh: {error}")),
+        Err(error) => return refuse(shared, channel, &refusal_text(&error)),
     };
     if let Err(error) = hold(backend, shared) {
-        return refuse(shared, channel, &format!("marsh: {error}"));
+        return refuse(shared, channel, &refusal_text(&error));
     }
     let opened = AttemptScope::new(
         &shared.scope.authority_root,
@@ -411,7 +424,7 @@ fn serve<'scope, 'env>(
     });
     let stream = match opened {
         Ok(stream) => stream,
-        Err(error) => return refuse(shared, channel, &format!("marsh: {error}")),
+        Err(error) => return refuse(shared, channel, &refusal_text(&error)),
     };
     // Aborted while the relay channel was opening.
     if !shared
@@ -827,15 +840,15 @@ impl<'scope, 'env> ShellEndpoint<'scope, 'env> {
         let relay = self
             .backend
             .services_relay(&self.root)
-            .map_err(|error| format!("marsh: {error}"))?;
+            .map_err(|error| refusal_text(&error))?;
         self.hold();
         let authority = AttemptScope::new(&self.root, BASE_WORKSPACE, SHELL_ATTEMPT)
-            .map_err(|error| format!("marsh: {error}"))?;
+            .map_err(|error| refusal_text(&error))?;
         let stream = match kind {
             ChannelKind::Docker => relay.open_docker(&authority),
             ChannelKind::Tcp { port } => relay.open_tcp(&authority, port),
         }
-        .map_err(|error| format!("marsh: {error}"))?;
+        .map_err(|error| refusal_text(&error))?;
         let (finish, close) = (stream.clone(), stream.clone());
         Ok(ServiceStream {
             reader: Box::new(stream.clone()),
@@ -845,5 +858,108 @@ impl<'scope, 'env> ShellEndpoint<'scope, 'env> {
             }),
             close: Box::new(move || close.close()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One `marsh:` whatever the error: every kind of relay error (each begins with it) and
+    /// a plain text (the reap record's, which does not).
+    #[test]
+    fn a_refusal_says_marsh_once_whatever_the_error() {
+        use marsh_sbx::services_relay::RelayError;
+        for error in [
+            RelayError::Invalid("a".into()),
+            RelayError::Unavailable("b".into()),
+            RelayError::Unavailable("marsh: c".into()),
+            RelayError::NotAuthorized("d".into()),
+            RelayError::Limit("e".into()),
+            RelayError::Refused("f".into()),
+            RelayError::Timeout("g".into()),
+            RelayError::Agent("h".into()),
+            RelayError::Hostile("i".into()),
+        ] {
+            let text = refusal_text(&error);
+            assert!(text.starts_with("marsh: "), "{text}");
+            assert_eq!(text.matches("marsh: ").count(), 1, "{text}");
+        }
+        assert_eq!(
+            refusal_text(&"the reap records are unreadable"),
+            "marsh: the reap records are unreadable"
+        );
+    }
+
+    /// Each of the six refusal sites (the two of a job channel's `serve`, the three
+    /// of a shell's `open_now`, and the reap record's) goes through `refusal_text`:
+    /// the first two, the three, and the record's have no VM-free caller, so this
+    /// reads the source, and a site that formats or converts on its own fails here.
+    #[test]
+    fn every_refusal_goes_through_refusal_text() {
+        let source = include_str!("endpoint.rs");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        assert_eq!(production.matches("refusal_text(").count(), 7);
+        // Only the helper itself puts the prefix on.
+        assert_eq!(production.matches("format!(\"marsh: {").count(), 1);
+        assert_eq!(production.matches(".to_string()").count(), 1);
+    }
+
+    /// What a shell's Docker call is told when the endpoint cannot open the
+    /// channel: the daemon's own text, with `marsh:` once.
+    fn shell_refusal(backend: &StockDaemonBackend, root: &std::path::Path) -> String {
+        std::thread::scope(|scope| {
+            let (_endpoint, provider, _guard) = ShellEndpoint::start(
+                scope,
+                backend,
+                root.to_owned(),
+                "session".into(),
+                Arc::new(|_| {}),
+            );
+            match provider.open(ChannelKind::Docker) {
+                Ok(_) => panic!("the channel opened"),
+                Err(message) => message,
+            }
+        })
+    }
+
+    /// After a daemon restart the project's relay is not recovered for a few
+    /// seconds: a Docker call in a shell is told to retry and where to look, and the
+    /// refusal does not say `marsh:` twice.
+    #[test]
+    fn a_shell_call_before_the_relay_is_recovered_says_to_retry_with_one_prefix() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new())
+            .with_services_artifacts(home.path().join("artifacts"));
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        backend
+            .services
+            .relays
+            .as_ref()
+            .unwrap()
+            .mark_unrecovered([root.clone()]);
+        let message = shell_refusal(&backend, &root);
+        assert!(
+            message.starts_with("marsh: services relay unavailable: the relay has not been recovered since the daemon started"),
+            "{message}"
+        );
+        assert!(
+            message.contains("retry in a few seconds") && message.contains("`marsh docker status`"),
+            "{message}"
+        );
+        assert_eq!(message.matches("marsh: ").count(), 1, "{message}");
+    }
+
+    /// Every refusal of the shell endpoint carries the daemon's text with a single
+    /// `marsh:` (here: no services engine artifacts at all).
+    #[test]
+    fn a_shell_refusal_says_marsh_once() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = crate::tests::backend_for_kit_identity(home.path(), BTreeMap::new());
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        assert_eq!(
+            shell_refusal(&backend, &root),
+            "marsh: services relay unavailable: this daemon has no services engine artifacts"
+        );
     }
 }

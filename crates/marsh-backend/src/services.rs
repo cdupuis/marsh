@@ -273,7 +273,7 @@ impl StockDaemonBackend {
         }
         if relays.is_unrecovered(root) {
             return Err(RelayError::Unavailable(
-                "the relay has not been recovered since the daemon started".into(),
+                marsh_sbx::services_relay::UNRECOVERED.into(),
             ));
         }
         if let Some(reason) = relays.quarantine(root) {

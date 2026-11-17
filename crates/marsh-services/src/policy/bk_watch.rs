@@ -171,8 +171,70 @@ pub(super) struct Watch {
     began: u64,
 }
 
-/// The engine's tagged images (tag, image ID, pulled) and whether a name was left out.
-type Listed = (Vec<(String, String, bool)>, bool);
+/// The engine's tagged images (tag, image ID, pulled) and the names left out.
+type Listed = (Vec<(String, String, bool)>, Refused);
+
+/// Most names an "unable to check" event spells out.
+const NAMED_REFUSED: usize = 3;
+/// Longest a name is shown.
+const SHOWN_NAME: usize = 64;
+
+/// Image names that could not be watched: how many, and the first few as they
+/// may be shown.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(super) struct Refused {
+    pub(super) count: usize,
+    names: Vec<String>,
+}
+
+impl Refused {
+    pub(super) fn note(&mut self, name: &str) {
+        self.count += 1;
+        if self.names.len() < NAMED_REFUSED {
+            self.names.push(shown_name(name));
+        }
+    }
+
+    /// `"a", "b", "c" +2 more`; a quote or backslash in a name is escaped.
+    pub(super) fn describe(&self) -> String {
+        let mut text = self
+            .names
+            .iter()
+            .map(|n| format!("\"{}\"", n.replace('\\', "\\\\").replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.count > self.names.len() {
+            text.push_str(&format!(" +{} more", self.count - self.names.len()));
+        }
+        text
+    }
+}
+
+/// An image name the engine chose, safe to put in an event: control characters
+/// and the ones that reorder or hide text are dropped (as for every string the
+/// VM reports), and it is cut to [`SHOWN_NAME`] characters.
+pub(super) fn shown_name(name: &str) -> String {
+    let mut shown: String = name
+        .chars()
+        .filter(|c| {
+            !marsh_contracts::terminal::is_terminal_unsafe(*c)
+                && !matches!(*c, '\u{061c}' | '\u{200c}'..='\u{200f}')
+        })
+        .take(SHOWN_NAME + 1)
+        .collect();
+    if shown.chars().count() > SHOWN_NAME {
+        shown = shown.chars().take(SHOWN_NAME).collect();
+        shown.push('…');
+    }
+    shown
+}
+
+/// A listed name that is not a tag anybody can claim: an untagged image
+/// (`<none>:<none>`), or a digest reference (`name@sha256:...`, which the
+/// containerd image store lists as `moby-dangling@sha256:...`).
+fn names_no_tag(name: &str) -> bool {
+    name.starts_with("<none>") || name.contains('@')
+}
 
 impl Services {
     pub(super) fn lock_bk(&self) -> std::sync::MutexGuard<'_, Bk> {
@@ -246,7 +308,7 @@ impl Services {
         }
         let list: Vec<serde_json::Value> = serde_json::from_slice(&body)
             .map_err(|_| "the engine's image list is not readable".to_owned())?;
-        let (mut out, mut skipped) = (Vec::new(), false);
+        let (mut out, mut refused) = (Vec::new(), Refused::default());
         for image in &list {
             let Some(id) = image.get("Id").and_then(|i| i.as_str()) else {
                 continue;
@@ -259,12 +321,12 @@ impl Services {
             for tag in tags.into_iter().flatten().filter_map(|t| t.as_str()) {
                 match crate::policy::admit::canonical_tag(tag, None) {
                     Ok(tag) => out.push((tag, id.to_owned(), pulled)),
-                    // An untagged image is listed as `<none>:<none>`.
-                    Err(_) => skipped |= !tag.starts_with("<none>"),
+                    Err(_) if names_no_tag(tag) => {}
+                    Err(_) => refused.note(tag),
                 }
             }
         }
-        Ok((out, skipped))
+        Ok((out, refused))
     }
 }
 
@@ -341,15 +403,21 @@ impl Scope {
         }
         match listed {
             Err(why) => svc.unchecked(&ws, &why),
-            Ok((_, skipped)) => {
+            Ok((_, refused)) => {
                 if cut > 0 {
                     svc.unchecked(
                         &ws,
                         &format!("{cut} protected tags are not watched (only {MAX_WATCHED} are)"),
                     );
                 }
-                if skipped {
-                    svc.unchecked(&ws, "some image names cannot be watched (too long, or not a name the filter accepts)");
+                if refused.count > 0 {
+                    svc.unchecked(
+                        &ws,
+                        &format!(
+                            "some image names cannot be watched (too long, or not a name the filter accepts): {}",
+                            refused.describe()
+                        ),
+                    );
                 }
             }
         }

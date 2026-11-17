@@ -170,6 +170,8 @@ impl fmt::Display for RelayError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable(why) | Self::Hostile(why) => {
+                // A reason that is itself a marsh message already says `marsh:`.
+                let why = why.strip_prefix("marsh: ").unwrap_or(why);
                 write!(f, "marsh: services relay unavailable: {why}")
             }
             Self::Invalid(why) | Self::NotAuthorized(why) | Self::Limit(why) => {
@@ -2542,6 +2544,22 @@ impl Write for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reason that already begins `marsh:` (the daemon's own message, as the
+    /// startup-recovery-off break and a failed start give it) is not prefixed twice.
+    #[test]
+    fn an_unavailable_relay_says_marsh_once() {
+        for error in [
+            RelayError::Unavailable("marsh: the relay has not been recovered".into()),
+            RelayError::Unavailable("the relay has not been recovered".into()),
+            RelayError::Hostile("marsh: the relay has not been recovered".into()),
+        ] {
+            assert_eq!(
+                error.to_string(),
+                "marsh: services relay unavailable: the relay has not been recovered"
+            );
+        }
+    }
 
     #[test]
     fn scope_ids_follow_the_policy_rule() {

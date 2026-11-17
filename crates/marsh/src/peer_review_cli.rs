@@ -492,9 +492,11 @@ mod tests {
         let file = DropIn::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(file.enabled, Some(true));
         // codex is given the openai mid model the snapshot lists last (a
-        // newer refresh moves it): eligible, in the `task` tool's list for
-        // codex, and the latest-dated terra the snapshot has, read from the
-        // data file here and not through `newest`.
+        // newer refresh moves it): eligible and the latest-dated terra the
+        // snapshot has, read from the data file here and not through `newest`.
+        // Membership in the offered list is not asserted here: a much newer
+        // model of another class legitimately drops older families from it
+        // (the daemon's peer_review tests cover the list).
         let table = ClassTable::builtin();
         let reviewer = file
             .reviewers
@@ -508,16 +510,6 @@ mod tests {
             "{model}: {found:?}"
         );
         assert_eq!(found.vendor.as_deref(), Some("openai"));
-        let codex = marsh_daemon::peer_review::agent_choices(
-            &table,
-            "codex",
-            &["openai".to_owned()],
-            &BTreeMap::new(),
-        );
-        assert!(
-            codex.iter().any(|c| c.model == model && c.class == "mid"),
-            "{model} is not in codex's list: {codex:?}"
-        );
         let data: serde_json::Value =
             serde_json::from_str(include_str!("../../marsh-daemon/data/models-dev.json")).unwrap();
         let latest_terra = data["models"]

@@ -470,7 +470,11 @@ has is checked.
      workspaces). Image names the agent cannot make into a tag (over the 255 characters a tag may
      have, as a long pulled name can, or not a name the filter accepts, such as an
      IPv6 registry host) are not watched, and that is an "unable
-     to check" event, not a silent skip; a list that fails is one too, and the stream
+     to check" event, not a silent skip; the event names up to three of them (cleaned of
+     control and direction characters, cut to 64 characters, quotes escaped, then "+N
+     more"). A name that is no tag at all, an untagged image (`<none>:<none>`) or a
+     digest reference (`name@sha256:...`, which the containerd image store lists as
+     `moby-dangling@sha256:...`), is not an event; a list that fails is one too, and the stream
      runs (fail open). No lock is held across the list, but the tag table is locked briefly before
      it (to read the held names and open the window, as one step): a claim of another
      workspace that holds it across an engine inspect delays the start of a build by
@@ -508,12 +512,14 @@ has is checked.
      deliberately not a new relay frame: a frame or `Settings` field the peer does not
      know is a protocol violation on both sides (every message type is a closed set); an
      old agent refuses the unknown route (no events) and an old host never asks.
-     "Unable to check" is kept once per workspace and cause. At the cap the list gives up, in this order, a later report of
+     "Unable to check" is kept once per workspace and text: the same text again is not
+     shown, and a text that names other refused names is a new report (the oldest "unable
+     to check" goes first at the cap). At the cap the list gives up, in this order, a later report of
      a tag that has several (the first report of a tag is kept: it holds the owner's
      original image), then "unable to check" (never the one just added), then the oldest
      report; a tag's only report goes only when nothing else can. Nothing
      expires: a report stays until the agent restarts, even after the owner put the tag
-     back, and a repeated "unable to check" for the same workspace and cause is never
+     back, and a repeated "unable to check" with the same workspace and text is never
      shown again. Not persisted.
   Not done: **the overwrite is detected after the stream, not prevented**: while the
   build runs, and from its export until its stream ends, the other workspace's tag

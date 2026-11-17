@@ -195,12 +195,12 @@ impl Refused {
         }
     }
 
-    /// `"a", "b", "c" +2 more`
+    /// `"a", "b", "c" +2 more`; a quote or backslash in a name is escaped.
     pub(super) fn describe(&self) -> String {
         let mut text = self
             .names
             .iter()
-            .map(|n| format!("\"{n}\""))
+            .map(|n| format!("\"{}\"", n.replace('\\', "\\\\").replace('"', "\\\"")))
             .collect::<Vec<_>>()
             .join(", ");
         if self.count > self.names.len() {

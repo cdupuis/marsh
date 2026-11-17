@@ -496,12 +496,12 @@ mod tests {
         // codex, and the latest-dated terra the snapshot has, read from the
         // data file here and not through `newest`.
         let table = ClassTable::builtin();
-        let model = file
+        let reviewer = file
             .reviewers
             .iter()
             .find(|r| r.agent == "codex" && r.class == Some(ModelClass::Mid))
-            .map(|r| r.model.clone())
             .unwrap_or_else(|| panic!("no codex mid reviewer: {:?}", file.reviewers));
+        let model = reviewer.model.clone();
         let found = table.classify(&model).unwrap();
         assert!(
             found.eligible && found.how != "retired",

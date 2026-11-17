@@ -178,6 +178,16 @@ fn request_label(body: &PublicRequest) -> String {
         )
 }
 
+/// The busy refusal that names what blocks a reset or stop. A session whose
+/// client is gone is released when its shell teardown ends, which waits on the
+/// stock `sbx` (one operation times out after 300 s).
+fn busy_blockers_message(blockers: &[String]) -> String {
+    format!(
+        "{BUSY_BLOCKED}{}; a session whose client is gone is usually released within seconds, but up to about 5 minutes if the stock `sbx` is not responding (check `sbx ls`); a reset or stop retries once it is",
+        blockers.join("; ")
+    )
+}
+
 /// A refusal a replacing client waits out briefly before reporting it.
 fn busy_lifecycle_refusal(message: &str) -> bool {
     message == BUSY_LIFECYCLE_MESSAGE
@@ -3471,7 +3481,7 @@ impl DaemonStore {
                     ProcessIdentity::Gone if state.shell_attachments.contains_key(&shell.session_id) =>
                         "its shell is still being torn down".to_owned(),
                     ProcessIdentity::Gone =>
-                        "that process is gone; it is released within seconds".to_owned(),
+                        "that process is gone; it is usually released within seconds".to_owned(),
                     ProcessIdentity::Unverified => format!(
                         "this process cannot be identified: see what runs at that pid with `ps -p {} -o command`",
                         shell.pid
@@ -6171,10 +6181,7 @@ impl ConnectionHandler {
                         format!("{BUSY_BLOCKED}{REQUEST_IN_FLIGHT}: {}", requests.join(", "))
                     }
                 } else {
-                    format!(
-                        "{BUSY_BLOCKED}{}; a session whose client is gone is released within seconds, and a reset or stop retries once it is",
-                        blockers.join("; ")
-                    )
+                    busy_blockers_message(&blockers)
                 }
             }
         }

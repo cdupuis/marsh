@@ -480,12 +480,16 @@ impl Relay {
         let stderr = thread::spawn(move || {
             let mut total = 0_u64;
             let mut buffer = [0_u8; 1024];
+            let mut diagnostics = relay::GuestDiagnostics::default();
             loop {
                 let count = attachment.stderr.read(&mut buffer)?;
                 if count == 0 {
                     return Ok(total);
                 }
                 total += count as u64;
+                for line in diagnostics.feed(&buffer[..count]) {
+                    eprintln!("marshd: shell relay, in the VM: {line}");
+                }
                 let mut head = head
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);

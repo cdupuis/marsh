@@ -519,15 +519,41 @@ is 130. `split` exits with the first nonzero code in declaration order.
     Past the cap a connection gets a refusal frame. When descriptors still
     run out, `accept` waits and retries; the daemon never stops serving
     for it.
-  - A shell's relay (in the shell VM) admits at most `2 * POOL_LIMIT` (128)
-    open connections, idle ones included. An excess connection reads one
-    refusal frame (`marsh: this shell holds 128 daemon connections, its
-    most; try again`), not a bare close, which a caller that had already
-    written its request would see as `Connection reset by peer`. Unit test
-    `relay::tests::guest_relay_past_its_capacity_refuses_with_a_frame_not_a_reset`.
-    The host half of the relay still answers a connection it cannot open
-    (its own cap, or no daemon connection) with a bare close of that
-    connection.
+  - A shell's relay has two halves, the guest's in the shell VM and the
+    host's in the daemon, and each enforces the same two caps. Daemon
+    connections (`marsh` clients, links and splits reaching the daemon) are
+    at most `2 * POOL_LIMIT` (128) open at once, idle ones included;
+    the Docker endpoint's and the forwarded ports' connections are counted
+    apart, at most 32. A services connection never takes a daemon slot.
+  - A daemon connection past the cap, or one the host half cannot open to the
+    daemon, reads one refusal frame (`marsh: this shell holds 128 daemon
+    connections, its most; try again`, or `marsh: this shell's relay could
+    not open a connection to the daemon; try again`), not a bare close, which
+    a caller that had already written its request would see as `Connection
+    reset by peer`. The guest half writes it when it accepts; the host half
+    sends it as the connection's data and ordered end. The client reads it
+    even when its own write failed first (a caller that wrote late, or a
+    request larger than the socket buffers): a write that ends in a broken
+    pipe or a reset takes the refusal queued on that socket instead
+    (`write_request`). Unit tests in `relay.rs`:
+    `guest_relay_past_its_capacity_refuses_with_a_frame_not_a_reset`,
+    `a_client_that_writes_after_the_refusal_reads_the_reason_not_a_broken_pipe`,
+    `a_real_client_with_a_large_request_reads_the_capacity_refusal`,
+    `a_real_client_reads_the_refusal_when_the_host_cannot_reach_the_daemon`,
+    `host_relay_rejects_the_connection_after_its_bounded_capacity` and
+    `a_services_connection_does_not_take_a_daemon_slot_on_the_host`. The
+    Docker endpoint answers past its cap with its own 429 (unchanged).
+  - A relay half says so when it refuses a daemon connection: one line, then
+    at most one more every 10 s that counts the refusals left unsaid. The
+    guest's line (on its stderr) gives the open daemon connections against
+    the cap and the services connections against theirs; the host half's, in
+    the daemon's log, gives the daemon connections or that the daemon socket
+    did not accept. The host passes the guest's refusal lines (and only
+    those) on to the daemon's log, so a refusal in the VM is visible there.
+    The pure parts are tested (`the_guest_says_once_how_full_it_was_when_it_refuses`,
+    `refusal_lines_are_rate_limited_and_count_what_they_skip`,
+    `only_the_guests_refusal_lines_reach_the_daemon_log`); the daemon's
+    `eprintln!` of them has no test.
   - Split input that spooling and running splits hold is bounded: 64 MiB
     for one job's splits, 192 MiB for all jobs' splits, and, apart, 256 MiB
     for the host's and sessions' splits (a session shell is the user's), so

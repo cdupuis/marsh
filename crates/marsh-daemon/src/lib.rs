@@ -8478,7 +8478,7 @@ impl Client {
         let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
         stream.set_read_timeout(Some(read_timeout))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        write_frame(
+        write_request(
             &mut stream,
             &Envelope {
                 protocol: PROTOCOL.into(),
@@ -8517,7 +8517,7 @@ impl Client {
         let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
         stream.set_read_timeout(Some(Duration::from_mins(4)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        write_frame(
+        write_request(
             &mut stream,
             &Envelope {
                 protocol: PROTOCOL.into(),
@@ -8807,7 +8807,7 @@ impl Client {
         stream
             .set_read_timeout(Some(PUBLICATION_REPLY_IDLE_TIMEOUT))
             .map_err(|error| rejected(error.into()))?;
-        write_frame(
+        write_request(
             &mut stream,
             &Envelope {
                 protocol: PROTOCOL.into(),
@@ -8894,7 +8894,7 @@ impl Client {
     pub fn reset_workers(&self, selection: LoadSelection) -> Result<Vec<String>, DaemonError> {
         let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        write_frame(
+        write_request(
             &mut stream,
             &Envelope {
                 protocol: PROTOCOL.into(),
@@ -8918,7 +8918,7 @@ impl Client {
         Self::wait_out_busy(TRANSIENT_BUSY_WAIT, || {
             let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
             stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-            write_frame(
+            write_request(
                 &mut stream,
                 &Envelope {
                     protocol: PROTOCOL.into(),
@@ -8946,7 +8946,7 @@ impl Client {
         Self::wait_out_busy(TRANSIENT_BUSY_WAIT, || {
             let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
             stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-            write_frame(
+            write_request(
                 &mut stream,
                 &Envelope {
                     protocol: PROTOCOL.into(),
@@ -8968,7 +8968,7 @@ impl Client {
         Self::wait_out_busy(TRANSIENT_BUSY_WAIT, || {
             let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
             stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-            write_frame(
+            write_request(
                 &mut stream,
                 &Envelope {
                     protocol: PROTOCOL.into(),
@@ -9068,7 +9068,7 @@ impl Client {
     ) -> Result<ScopeLifecycleReport, DaemonError> {
         let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        write_frame(
+        write_request(
             &mut stream,
             &Envelope {
                 protocol: PROTOCOL.into(),
@@ -9126,7 +9126,7 @@ impl Client {
         mut progress_output: impl Write,
     ) -> Result<PreparationResult, DaemonError> {
         let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
-        write_frame(
+        write_request(
             &mut stream,
             &Envelope {
                 protocol: PROTOCOL.into(),
@@ -9241,7 +9241,7 @@ impl Client {
         // signals and loss without ever waiting behind queued input.
         let credited = spec.placement == Placement::Cloud;
         let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
-        write_frame(
+        write_request(
             &mut stream,
             &Envelope {
                 protocol: PROTOCOL.into(),
@@ -9295,7 +9295,7 @@ impl Client {
 
     fn start_attached(&self, body: PublicRequest) -> Result<ClientExecution, DaemonError> {
         let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
-        write_frame(
+        write_request(
             &mut stream,
             &Envelope {
                 protocol: PROTOCOL.into(),
@@ -9332,7 +9332,7 @@ impl Client {
     /// (`SplitCreate`, `SplitJoin`).
     pub fn open_request(&self, request: PublicRequest) -> Result<UnixStream, DaemonError> {
         let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
-        write_frame(
+        write_request(
             &mut stream,
             &Envelope {
                 protocol: PROTOCOL.into(),
@@ -9345,7 +9345,7 @@ impl Client {
 
     pub fn start_shell(&self, spec: ShellSpec) -> Result<ClientExecution, DaemonError> {
         let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
-        write_frame(
+        write_request(
             &mut stream,
             &Envelope {
                 protocol: PROTOCOL.into(),
@@ -10126,6 +10126,32 @@ pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(
     writer.write_all(&bytes)?;
     writer.flush()?;
     Ok(())
+}
+
+/// Write one request frame. A peer that refuses a connection (a relay or the
+/// daemon past its cap) writes its reason and closes without reading, so a
+/// caller that was slow, or whose request is large, finds its write failing
+/// with a broken pipe or reset while the reason is still queued to be read.
+/// Such a write error gives that reason (one `PublicReply::Error`) instead,
+/// read without waiting: it is already queued, and a peer that is merely
+/// silent must not hold the caller.
+fn write_request<T: Serialize>(stream: &mut UnixStream, request: &T) -> Result<(), DaemonError> {
+    let error = match write_frame(stream, request) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if matches!(
+        &error,
+        DaemonError::Io(io) if matches!(
+            io.kind(),
+            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+        )
+    ) && stream.set_nonblocking(true).is_ok()
+        && let Ok(PublicReply::Error { message, .. }) = read_frame::<PublicReply>(stream)
+    {
+        return Err(DaemonError::Remote(message));
+    }
+    Err(error)
 }
 
 pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T, DaemonError> {

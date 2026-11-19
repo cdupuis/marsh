@@ -354,7 +354,7 @@ impl StockDaemonBackend {
                 let _ = self.kit_assets(vm.job_image());
                 let mut grants = grants_by_command[&command].clone();
                 if self.kit_wants_no_home(&command, &spec.workload_kit)? {
-                    grants.retain(|grant| grant.target() != session.guest_home);
+                    drop_no_home_grants(&mut grants, &session.guest_home);
                 }
                 let pins = self
                     .sbx
@@ -2279,11 +2279,12 @@ impl DaemonBackend for StockDaemonBackend {
             }
             // A project under the home stays mounted on its own; nothing else
             // of the home does.
-            let project = &request.session.launch_directory;
-            view.mounts.retain(|mount| {
-                !mount.target.starts_with(guest_home) || mount.target.starts_with(project)
-            });
-            admitted_grants.retain(|grant| grant.target() != guest_home.as_path());
+            retain_no_home_mounts(
+                &mut view.mounts,
+                guest_home,
+                &request.session.launch_directory,
+            );
+            drop_no_home_grants(&mut admitted_grants, guest_home);
         }
         let private_home = !view
             .mounts
@@ -4318,11 +4319,31 @@ fn fork_as_project(path: &Path, homes: &[PathBuf]) -> PathBuf {
     project
 }
 
+/// A no-home Kit's view of the mounts: none that is the home or holds it (a
+/// project above the home), and one under the home only when it is under
+/// `project`, a folder strictly under the home.
+fn retain_no_home_mounts(mounts: &mut Vec<PublicMount>, guest_home: &Path, project: &Path) {
+    let project_under_home = project != guest_home && project.starts_with(guest_home);
+    mounts.retain(|mount| {
+        if guest_home.starts_with(&mount.target) {
+            return false;
+        }
+        !mount.target.starts_with(guest_home)
+            || (project_under_home && mount.target.starts_with(project))
+    });
+}
+
+/// The grants a no-home Kit's VM gets: none for the home or for a folder
+/// holding it.
+fn drop_no_home_grants(grants: &mut Vec<AdmittedHostGrant>, guest_home: &Path) {
+    grants.retain(|grant| !guest_home.starts_with(grant.target()));
+}
+
 /// Whether a Kit that declares no home may run from `cwd` in a session whose
 /// project is `project`: the guest home's contents beyond the project stay
 /// out of its view, so it is refused from the home itself, from a
 /// dot-directory of the home (other agents' settings and saved logins), and
-/// when the project is the home or a dot-directory (after symlinks). A lane
+/// when the project is the home, holds it, or is a dot-directory (after symlinks). A lane
 /// of a split is judged as the project it forks (`fork_as_project`).
 fn no_home_view_admitted(
     guest_home: &Path,
@@ -4349,6 +4370,12 @@ fn no_home_view_admitted(
         for path in &judged_projects {
             if path == home {
                 return Err("the project is the home".into());
+            }
+            if home.starts_with(path) {
+                return Err(format!(
+                    "the project contains your home ({}), so the home would be mounted with it",
+                    home.display()
+                ));
             }
             if dot_dir_under(home, path).is_some() {
                 return Err("the project is inside a dot-directory of the home".into());
@@ -7320,6 +7347,136 @@ mod tests {
         let outside = root.path().join("work");
         fs::create_dir(&outside).unwrap();
         assert!(admitted(&outside, &outside).is_ok());
+    }
+
+    /// #483: a project ABOVE the home would mount the whole home (other
+    /// agents' settings and saved logins) with it. The standard daemon
+    /// already refuses such a project at attach (it holds marsh's private
+    /// host state under the account home); a session whose home is not the
+    /// account home (a `HOME` elsewhere) gets here, so the Kit's own check
+    /// refuses it too.
+    #[test]
+    fn no_home_kit_is_refused_from_a_project_that_contains_the_home() {
+        let root = tempfile::tempdir().unwrap();
+        let top = fs::canonicalize(root.path()).unwrap();
+        let home = top.join("users/alice");
+        fs::create_dir_all(home.join("proj")).unwrap();
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        // Siblings that share the home's name as a string prefix.
+        fs::create_dir_all(top.join("users/ali")).unwrap();
+        fs::create_dir_all(top.join("users/alice2/proj")).unwrap();
+        fs::create_dir_all(top.join("work")).unwrap();
+        let backing = top.join("marsh/home");
+        fs::create_dir_all(&backing).unwrap();
+        let admitted =
+            |project: &Path, cwd: &Path| no_home_view_admitted(&home, &backing, project, cwd);
+        let contains = |result: Result<(), String>| {
+            result.is_err_and(|reason| reason.contains("the project contains your home"))
+        };
+
+        // The parent of the home, and every folder above it, up to `/`.
+        let parent = top.join("users");
+        assert!(contains(admitted(&parent, &parent)));
+        assert!(contains(admitted(&top, &top)));
+        assert!(contains(admitted(Path::new("/"), Path::new("/"))));
+        assert!(contains(admitted(&parent, &home.join("proj"))));
+        // Through a symlink, or a `..` (refused whichever check sees it first).
+        let link = top.join("work/to-users");
+        std::os::unix::fs::symlink(&parent, &link).unwrap();
+        assert!(contains(admitted(&link, &link)));
+        let dotdot = home.join("proj/../..");
+        assert!(admitted(&dotdot, &dotdot).is_err());
+        // Above the home backing only (a `MARSH_HOME` outside the home).
+        let above_backing = top.join("marsh");
+        assert!(contains(admitted(&above_backing, &above_backing)));
+        // The home through a symlink is still the home.
+        let home_link = top.join("work/to-home");
+        std::os::unix::fs::symlink(&home, &home_link).unwrap();
+        assert!(admitted(&home_link, &home_link).is_err());
+
+        // Folders beside the home, or under it, stay admitted: whole path
+        // components are compared, not string prefixes.
+        for project in [
+            top.join("users/ali"),
+            top.join("users/alice2"),
+            top.join("users/alice2/proj"),
+            top.join("work"),
+            home.join("proj"),
+        ] {
+            assert_eq!(admitted(&project, &project), Ok(()), "{project:?}");
+        }
+        let sibling = top.join("users/alic");
+        fs::create_dir_all(&sibling).unwrap();
+        assert_eq!(admitted(&sibling, &sibling), Ok(()));
+    }
+
+    /// Whatever the caller passes, the narrowed view never keeps a mount that
+    /// is the home or holds it, and keeps a mount under the home only when it
+    /// is under a project that is itself under the home.
+    #[test]
+    fn no_home_view_never_keeps_the_home_or_a_mount_holding_it() {
+        let mount = |target: &str| PublicMount {
+            target: target.into(),
+            access: "read_write".into(),
+        };
+        let kept = |project: &str, targets: &[&str]| {
+            let mut mounts = targets
+                .iter()
+                .map(|target| mount(target))
+                .collect::<Vec<_>>();
+            retain_no_home_mounts(&mut mounts, Path::new("/Users/alice"), Path::new(project));
+            mounts
+                .into_iter()
+                .map(|mount| mount.target.display().to_string())
+                .collect::<Vec<_>>()
+        };
+        let all = [
+            "/Users",
+            "/Users/alice",
+            "/Users/alice/proj",
+            "/Users/alice/.ssh",
+            "/work",
+            "/Users/alice2",
+        ];
+        // The ordinary case: a project under the home stays mounted alone.
+        assert_eq!(
+            kept("/Users/alice/proj", &all),
+            ["/Users/alice/proj", "/work", "/Users/alice2"]
+        );
+        // The same for the grants behind them.
+        let root = tempfile::tempdir().unwrap();
+        let top = fs::canonicalize(root.path()).unwrap();
+        let home = top.join("users/alice");
+        let targets = [
+            top.clone(),
+            top.join("users"),
+            home.clone(),
+            home.join("proj"),
+            top.join("work"),
+            top.join("users/alice2"),
+        ];
+        let mut grants = targets
+            .iter()
+            .map(|target| {
+                fs::create_dir_all(target).unwrap();
+                AdmittedHostGrant::open(target.clone(), target.clone(), MountAccess::ReadWrite)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        drop_no_home_grants(&mut grants, &home);
+        assert_eq!(
+            grants
+                .iter()
+                .map(|grant| grant.target().to_path_buf())
+                .collect::<Vec<_>>(),
+            targets[3..]
+        );
+        // A project outside the home: nothing of the home remains.
+        assert_eq!(kept("/work", &all), ["/work", "/Users/alice2"]);
+        // A project above the home, or the home: neither it nor the home.
+        assert_eq!(kept("/Users", &all), ["/work", "/Users/alice2"]);
+        assert_eq!(kept("/", &all), ["/work", "/Users/alice2"]);
+        assert_eq!(kept("/Users/alice", &all), ["/work", "/Users/alice2"]);
     }
 
     /// A lane of `marsh split` is judged as the project it forks: the owner's

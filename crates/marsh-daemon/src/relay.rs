@@ -6,7 +6,7 @@
 //! containers receive neither path nor token.
 
 use crate::relay_cleanup::{RelayIdentity, current_identity};
-use crate::{DaemonError, read_frame, write_frame};
+use crate::{DaemonError, ErrorCode, PublicReply, read_frame, write_frame};
 use marsh_contracts::process::{ChannelKind, PortState};
 use serde::{Deserialize, Serialize};
 use std::net::Shutdown;
@@ -514,6 +514,24 @@ fn send_guest_ready<W: Write>(tunnel: &SharedWriter<W>) -> Result<(), DaemonErro
     send(tunnel, &TunnelFrame::Ready)
 }
 
+/// Past the relay's cap: tell the caller why rather than close on it. A bare
+/// close reaches a caller that has already written its request as a reset
+/// (`ECONNRESET` on Linux). Best effort, and never blocking the accept loop.
+fn refuse_guest_connection(mut stream: UnixStream) {
+    if stream.set_nonblocking(true).is_ok() {
+        let _ = write_frame(
+            &mut stream,
+            &PublicReply::Error {
+                code: ErrorCode::InvalidRequest,
+                message: format!(
+                    "marsh: this shell holds {MAX_RELAY_CONNECTIONS} daemon connections, its most; try again"
+                ),
+            },
+        );
+    }
+    let _ = stream.shutdown(Shutdown::Write);
+}
+
 /// Guest half used by the installed `marsh-relay` helper.
 pub fn run_guest<R, W>(
     from_host: R,
@@ -588,7 +606,7 @@ where
                             .count()
                             >= MAX_RELAY_CONNECTIONS
                         {
-                            let _ = stream.shutdown(Shutdown::Both);
+                            refuse_guest_connection(stream);
                             continue;
                         }
                         if stream.set_nonblocking(false).is_err() {
@@ -2008,6 +2026,32 @@ mod tests {
             MAX_RELAY_CONNECTIONS * 2,
             "retained guest sockets consumed closed daemon relay slots"
         );
+    }
+
+    #[test]
+    fn guest_relay_past_its_capacity_refuses_with_a_frame_not_a_reset() {
+        let relays = PairedRelays::new();
+        let held = (0..MAX_RELAY_CONNECTIONS)
+            .map(|_| relays.connect())
+            .collect::<Vec<_>>();
+        let mut excess = UnixStream::connect(&relays.socket).unwrap();
+        excess.set_read_timeout(Some(PATIENCE)).unwrap();
+        excess.set_write_timeout(Some(PATIENCE)).unwrap();
+        // A client writes its request before it reads the reply; left unread
+        // by the relay, that request turns the close into a reset (ECONNRESET
+        // on Linux, where the shell's relay runs).
+        write_frame(&mut excess, &PublicRequest::Ping).unwrap();
+        let reply = read_frame::<PublicReply>(&mut excess);
+        drop(held);
+        relays.stop();
+        match reply {
+            Ok(PublicReply::Error { message, .. }) => assert!(
+                message.contains(&MAX_RELAY_CONNECTIONS.to_string())
+                    && message.contains("try again"),
+                "{message}"
+            ),
+            other => panic!("the excess connection read {other:?}, not a refusal frame"),
+        }
     }
 
     #[test]

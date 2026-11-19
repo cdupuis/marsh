@@ -519,6 +519,15 @@ is 130. `split` exits with the first nonzero code in declaration order.
     Past the cap a connection gets a refusal frame. When descriptors still
     run out, `accept` waits and retries; the daemon never stops serving
     for it.
+  - A shell's relay (in the shell VM) admits at most `2 * POOL_LIMIT` (128)
+    open connections, idle ones included. An excess connection reads one
+    refusal frame (`marsh: this shell holds 128 daemon connections, its
+    most; try again`), not a bare close, which a caller that had already
+    written its request would see as `Connection reset by peer`. Unit test
+    `relay::tests::guest_relay_past_its_capacity_refuses_with_a_frame_not_a_reset`.
+    The host half of the relay still answers a connection it cannot open
+    (its own cap, or no daemon connection) with a bare close of that
+    connection.
   - Split input that spooling and running splits hold is bounded: 64 MiB
     for one job's splits, 192 MiB for all jobs' splits, and, apart, 256 MiB
     for the host's and sessions' splits (a session shell is the user's), so

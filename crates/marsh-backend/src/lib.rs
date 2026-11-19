@@ -4325,7 +4325,7 @@ fn fork_as_project(path: &Path, homes: &[PathBuf]) -> PathBuf {
 fn retain_no_home_mounts(mounts: &mut Vec<PublicMount>, guest_home: &Path, project: &Path) {
     let project_under_home = project != guest_home && project.starts_with(guest_home);
     mounts.retain(|mount| {
-        if guest_home.starts_with(&mount.target) {
+        if relation_to_home(&mount.target, guest_home).is_some() {
             return false;
         }
         !mount.target.starts_with(guest_home)
@@ -4333,10 +4333,46 @@ fn retain_no_home_mounts(mounts: &mut Vec<PublicMount>, guest_home: &Path, proje
     });
 }
 
+/// How a path relates to a home it would show: it is the home, or a folder
+/// holding it. Judged by path components and by identity
+/// (`marsh_daemon::holds_by_identity`), which sees what they cannot: macOS
+/// firmlinks (`/System/Volumes/Data` holds `/Users/me`) and aliases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HomeRelation {
+    Is,
+    Holds,
+}
+
+fn relation_to_home(path: &Path, home: &Path) -> Option<HomeRelation> {
+    if path == home || marsh_daemon::same_directory(path, home) {
+        Some(HomeRelation::Is)
+    } else if home.starts_with(path) || marsh_daemon::holds_by_identity(path, home) {
+        Some(HomeRelation::Holds)
+    } else {
+        None
+    }
+}
+
+/// Whether a grant for `target` would show the home to a no-home Kit: the
+/// path as given or resolved is the home, or holds it, as given or resolved.
+fn grant_shows_home(target: &Path, guest_home: &Path) -> bool {
+    let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let (targets, homes) = (
+        [target, &resolve(target)],
+        [guest_home, &resolve(guest_home)],
+    );
+    targets.iter().any(|target| {
+        homes
+            .iter()
+            .any(|home| relation_to_home(target, home).is_some())
+    })
+}
+
 /// The grants a no-home Kit's VM gets: none for the home or for a folder
-/// holding it.
+/// holding it. `execute` and `prepare_for_shell` both call this
+/// (`no_home_grants_are_dropped_by_both_callers`).
 fn drop_no_home_grants(grants: &mut Vec<AdmittedHostGrant>, guest_home: &Path) {
-    grants.retain(|grant| !guest_home.starts_with(grant.target()));
+    grants.retain(|grant| !grant_shows_home(grant.target(), guest_home));
 }
 
 /// Whether a Kit that declares no home may run from `cwd` in a session whose
@@ -4368,14 +4404,15 @@ fn no_home_view_admitted(
         [project, resolved_project.as_path()].map(|path| fork_as_project(path, &homes));
     for home in &homes {
         for path in &judged_projects {
-            if path == home {
-                return Err("the project is the home".into());
-            }
-            if home.starts_with(path) {
-                return Err(format!(
-                    "the project contains your home ({}), so the home would be mounted with it",
-                    home.display()
-                ));
+            match relation_to_home(path, home) {
+                Some(HomeRelation::Is) => return Err("the project is the home".into()),
+                Some(HomeRelation::Holds) => {
+                    return Err(format!(
+                        "the project contains your home ({}), so the home would be mounted with it",
+                        home.display()
+                    ));
+                }
+                None => {}
             }
             if dot_dir_under(home, path).is_some() {
                 return Err("the project is inside a dot-directory of the home".into());
@@ -7350,11 +7387,11 @@ mod tests {
     }
 
     /// #483: a project ABOVE the home would mount the whole home (other
-    /// agents' settings and saved logins) with it. The standard daemon
-    /// already refuses such a project at attach (it holds marsh's private
-    /// host state under the account home); a session whose home is not the
-    /// account home (a `HOME` elsewhere) gets here, so the Kit's own check
-    /// refuses it too.
+    /// agents' settings and saved logins) with it. The daemon's attach guard
+    /// refuses a project that holds marsh's private host state, which lives
+    /// under the account home, but it cannot be relied on alone (a session
+    /// whose `HOME` is elsewhere; a path that reaches the home through an
+    /// alias): the Kit's own check refuses it too.
     #[test]
     fn no_home_kit_is_refused_from_a_project_that_contains_the_home() {
         let root = tempfile::tempdir().unwrap();
@@ -7408,6 +7445,145 @@ mod tests {
         let sibling = top.join("users/alic");
         fs::create_dir_all(&sibling).unwrap();
         assert_eq!(admitted(&sibling, &sibling), Ok(()));
+    }
+
+    /// macOS firmlinks: `/System/Volumes/Data` holds `/Users/me` as
+    /// `<Data>/Users/me`, which no canonical path shows. Judged by identity,
+    /// on a tree where the home is reachable through an alias.
+    #[test]
+    fn no_home_kit_is_refused_from_a_project_that_reaches_the_home_by_alias() {
+        let root = tempfile::tempdir().unwrap();
+        let top = fs::canonicalize(root.path()).unwrap();
+        let home = top.join("users/alice");
+        fs::create_dir_all(home.join("proj")).unwrap();
+        let backing = top.join("marsh/home");
+        fs::create_dir_all(&backing).unwrap();
+        let data = top.join("data");
+        let beside = top.join("beside");
+        for dir in [&data, &beside] {
+            fs::create_dir(dir).unwrap();
+        }
+        let admitted = |project: &Path| no_home_view_admitted(&home, &backing, project, project);
+        assert_eq!(admitted(&data), Ok(()));
+        for held in [&home, &backing] {
+            let at = data.join(held.strip_prefix("/").unwrap());
+            fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(held, at).unwrap();
+        }
+        let refused = admitted(&data).unwrap_err();
+        assert!(
+            refused.contains("the project contains your home"),
+            "{refused}"
+        );
+        assert_eq!(admitted(&beside), Ok(()));
+        // The home reached by the alias is the home.
+        let alias = data.join(home.strip_prefix("/").unwrap());
+        assert_eq!(
+            no_home_view_admitted(&home, &backing, &alias, &alias),
+            Err("the project is the home".into())
+        );
+    }
+
+    /// The exact shape, where the machine has it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_home_kit_is_refused_from_the_data_volume_root_on_macos() {
+        let data = Path::new("/System/Volumes/Data");
+        let Some(home) = std::env::var_os("HOME")
+            .and_then(|home| fs::canonicalize(home).ok())
+            .filter(|home| home.starts_with("/Users") && data.join("Users").is_dir())
+        else {
+            return;
+        };
+        let backing = home.join(".marsh/home");
+        let refused = no_home_view_admitted(&home, &backing, data, data).unwrap_err();
+        assert!(
+            refused.contains("the project contains your home"),
+            "{refused}"
+        );
+    }
+
+    /// A no-home Kit's grants never show the home, however the path names
+    /// it: as given, resolved (`..`, a case variant on a case-insensitive
+    /// volume, a symlinked home), or through an alias.
+    #[test]
+    fn a_grant_for_the_home_or_a_folder_holding_it_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let top = fs::canonicalize(root.path()).unwrap();
+        let home = top.join("users/alice");
+        fs::create_dir_all(home.join("proj")).unwrap();
+        fs::create_dir_all(top.join("users/alice2")).unwrap();
+        fs::create_dir_all(top.join("work")).unwrap();
+        let shows = |target: &Path| grant_shows_home(target, &home);
+        assert!(shows(&home));
+        assert!(shows(&top));
+        assert!(shows(&top.join("users")));
+        assert!(!shows(&home.join("proj")));
+        assert!(!shows(&top.join("users/alice2")));
+        assert!(!shows(&top.join("work")));
+        // Resolved: a `..` path.
+        assert!(shows(&top.join("work/../users")));
+        // The home itself a symlink.
+        let link = top.join("work/home-link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        assert!(grant_shows_home(&top.join("users"), &link));
+        assert!(!grant_shows_home(&top.join("users/alice2"), &link));
+        // An alias that leads to the home.
+        let data = top.join("data");
+        let at = data.join(home.strip_prefix("/").unwrap());
+        fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&home, &at).unwrap();
+        assert!(shows(&data));
+        assert!(shows(&at));
+        // A case variant, where the volume ignores case (macOS).
+        let upper = top.join("USERS");
+        if upper.exists() {
+            assert!(shows(&upper));
+            assert!(!shows(&upper.join("ALICE2")));
+        }
+        // The grants themselves.
+        let grant = |target: &Path| {
+            AdmittedHostGrant::open(target.into(), target.into(), MountAccess::ReadWrite).unwrap()
+        };
+        let mut grants = vec![
+            grant(&top.join("users")),
+            grant(&home.join("proj")),
+            grant(&top.join("work")),
+        ];
+        drop_no_home_grants(&mut grants, &home);
+        assert_eq!(
+            grants
+                .iter()
+                .map(|grant| grant.target().to_path_buf())
+                .collect::<Vec<_>>(),
+            [home.join("proj"), top.join("work")]
+        );
+    }
+
+    /// `execute` and `prepare_for_shell` are the only places that narrow a
+    /// no-home Kit's grants, and neither can be driven without the sbx stack:
+    /// this reads the source, so a caller that goes back to its own filter, or
+    /// loses the call, fails here.
+    #[test]
+    fn no_home_grants_are_dropped_by_both_callers() {
+        let source = include_str!("lib.rs");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let body = |name: &str| {
+            let start = production.find(&format!("fn {name}(")).unwrap();
+            let end = production[start + 1..]
+                .find("\n    fn ")
+                .map_or(production.len(), |end| start + 1 + end);
+            &production[start..end]
+        };
+        for caller in ["prepare_for_shell", "execute"] {
+            let body = body(caller);
+            assert_eq!(body.matches("kit_wants_no_home(").count(), 1, "{caller}");
+            assert_eq!(body.matches("drop_no_home_grants(").count(), 1, "{caller}");
+            assert!(!body.contains("grant.target() !="), "{caller}");
+            assert!(!body.contains("starts_with(grant.target())"), "{caller}");
+        }
+        assert_eq!(production.matches("drop_no_home_grants(").count(), 3);
+        assert_eq!(production.matches("retain_no_home_mounts(").count(), 2);
     }
 
     /// Whatever the caller passes, the narrowed view never keeps a mount that

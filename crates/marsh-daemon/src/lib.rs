@@ -5961,7 +5961,61 @@ struct ConnectionHandler {
     upgrade: Option<Arc<upgrade::UpgradeWatch>>,
 }
 
-/// Reject a guest mount containing, or contained by, a host-owned path.
+/// Whether `container` holds the directory `inner` by identity: the same
+/// path, read from `container`, leads to the same directory (`(st_dev,
+/// st_ino)`). Canonical paths do not show this for macOS firmlinks
+/// (`/System/Volumes/Data` holds `/Users/me` as `/System/Volumes/Data/Users/me`
+/// yet is no textual ancestor), nor for an alias of the home. A path that
+/// does not exist, or an `inner` that is not an absolute path of plain
+/// components, is not held.
+#[must_use]
+pub fn holds_by_identity(container: &Path, inner: &Path) -> bool {
+    holds_by_identity_with(container, inner, |path| {
+        fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    })
+}
+
+/// [`holds_by_identity`] with the `(dev, ino)` lookup supplied.
+#[must_use]
+pub fn holds_by_identity_with(
+    container: &Path,
+    inner: &Path,
+    stat: impl Fn(&Path) -> Option<(u64, u64)>,
+) -> bool {
+    use std::path::Component;
+    let mut parts = inner.components();
+    if parts.next() != Some(Component::RootDir) {
+        return false;
+    }
+    let relative = parts.as_path();
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return false;
+    }
+    match (stat(inner), stat(&container.join(relative))) {
+        (Some(inner), Some(held)) => inner == held,
+        _ => false,
+    }
+}
+
+/// Whether `path` is the directory `other`, by identity.
+#[must_use]
+pub fn same_directory(path: &Path, other: &Path) -> bool {
+    let identity = |path: &Path| {
+        fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    };
+    identity(path).is_some_and(|path| identity(other) == Some(path))
+}
+
+/// Reject a guest mount containing, or contained by, a host-owned path
+/// (containing includes by identity: [`holds_by_identity`]).
 /// Canonicalization fails closed so symlink changes cannot bypass the check.
 /// A protected root that does not exist yet is resolved through its nearest
 /// existing ancestor plus the missing tail, so a mount that would contain it
@@ -5978,11 +6032,12 @@ pub fn reject_guest_mount_overlap(mounts: &[&Path], roots: &[PathBuf]) -> Result
                 mount.display()
             )
         })?;
+        let holds = |root: &PathBuf| root.starts_with(&mount) || holds_by_identity(&mount, root);
         if let Some(root) = roots
             .iter()
-            .find(|root| root.starts_with(&mount) || mount.starts_with(root))
+            .find(|root| holds(root) || mount.starts_with(root))
         {
-            return Err(if root.starts_with(&mount) {
+            return Err(if holds(root) {
                 format!(
                     "cannot mount {} into the VM: it contains marsh's private host state at {}; start marsh from a project directory instead (for example `mkdir -p ~/scratch && cd ~/scratch`)",
                     mount.display(),
@@ -6039,6 +6094,102 @@ fn resolve_protected_root(root: &Path) -> Result<PathBuf, String> {
 mod mount_guard_tests {
     use super::reject_guest_mount_overlap;
     use std::{fs, os::unix::fs::symlink};
+
+    use super::{holds_by_identity, holds_by_identity_with, same_directory};
+    use std::path::Path;
+
+    /// A mount that reaches a protected root only through an alias (a macOS
+    /// firmlink such as `/System/Volumes/Data`) holds it, though no canonical
+    /// path starts with the mount.
+    #[test]
+    fn rejects_a_mount_that_holds_a_root_through_an_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let top = temp.path().canonicalize().unwrap();
+        let root = top.join("real/state");
+        fs::create_dir_all(&root).unwrap();
+        let mount = top.join("data");
+        fs::create_dir(&mount).unwrap();
+        let elsewhere = top.join("other");
+        fs::create_dir(&elsewhere).unwrap();
+        assert!(reject_guest_mount_overlap(&[&mount], std::slice::from_ref(&root)).is_ok());
+        // `<mount>/<root without its leading slash>` leads to the root.
+        let relative = root.strip_prefix("/").unwrap();
+        fs::create_dir_all(mount.join(relative).parent().unwrap()).unwrap();
+        symlink(&root, mount.join(relative)).unwrap();
+        let error = reject_guest_mount_overlap(&[&mount], std::slice::from_ref(&root)).unwrap_err();
+        assert!(
+            error.contains("contains marsh's private host state"),
+            "{error}"
+        );
+        assert!(reject_guest_mount_overlap(&[&elsewhere], std::slice::from_ref(&root)).is_ok());
+    }
+
+    #[test]
+    fn identity_holding_follows_the_stat_it_is_given() {
+        let stat = |path: &Path| match path.to_str().unwrap() {
+            "/Users/me" | "/System/Volumes/Data/Users/me" => Some((16, 42)),
+            "/Users/me2" => Some((16, 43)),
+            "/System/Volumes/Data/Users/me2" => Some((16, 44)),
+            _ => None,
+        };
+        let data = Path::new("/System/Volumes/Data");
+        assert!(holds_by_identity_with(data, Path::new("/Users/me"), stat));
+        // Another directory, a missing one, or nothing to join.
+        assert!(!holds_by_identity_with(data, Path::new("/Users/me2"), stat));
+        assert!(!holds_by_identity_with(data, Path::new("/Users/you"), stat));
+        assert!(!holds_by_identity_with(data, Path::new("/"), stat));
+        assert!(!holds_by_identity_with(data, Path::new("Users/me"), stat));
+        assert!(!holds_by_identity_with(
+            data,
+            Path::new("/Users/../Users/me"),
+            stat
+        ));
+        assert!(!holds_by_identity_with(
+            Path::new("/tmp"),
+            Path::new("/Users/me"),
+            stat
+        ));
+    }
+
+    #[test]
+    fn identity_holding_on_a_real_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let top = temp.path().canonicalize().unwrap();
+        let home = top.join("users/alice");
+        fs::create_dir_all(&home).unwrap();
+        let alias = top.join("alias");
+        fs::create_dir(&alias).unwrap();
+        assert!(!holds_by_identity(&alias, &home));
+        let inside = alias.join(home.strip_prefix("/").unwrap());
+        fs::create_dir_all(inside.parent().unwrap()).unwrap();
+        symlink(&home, &inside).unwrap();
+        assert!(holds_by_identity(&alias, &home));
+        // A folder beside it, the home itself, and the root of the tree.
+        assert!(!holds_by_identity(&top.join("users"), &home));
+        assert!(!holds_by_identity(&home, &home));
+        assert!(holds_by_identity(Path::new("/"), &home));
+        assert!(same_directory(&inside, &home));
+        assert!(!same_directory(&alias, &home));
+        assert!(!same_directory(&top.join("missing"), &home));
+    }
+
+    /// The exact shape: the Data volume's root holds the home as
+    /// `<Data>/Users/<name>`, with no textual relation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_data_volume_root_holds_the_home_on_macos() {
+        let data = Path::new("/System/Volumes/Data");
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        if !data.join("Users").is_dir() || !home.starts_with("/Users") {
+            return;
+        }
+        let home = home.canonicalize().unwrap();
+        assert!(holds_by_identity(data, &home));
+        // An ordinary session started there is refused at attach.
+        assert!(reject_guest_mount_overlap(&[data], &[home]).is_err());
+    }
 
     #[test]
     fn rejects_ancestor_sibling_and_symlink_mounts() {

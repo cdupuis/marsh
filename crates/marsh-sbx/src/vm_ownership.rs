@@ -727,6 +727,49 @@ impl VmOwnership {
         Ok(())
     }
 
+    /// Forget `name` after a listing found nothing under it. `observed` is
+    /// the UUID the map recorded for it before that listing was taken: only
+    /// that VM is proven gone by it. A name still an intent, or one whose UUID
+    /// was adopted since (a newer listing found a VM landing late), is kept:
+    /// forgetting it would make that VM nobody's. Returns whether it forgot.
+    pub(crate) fn forget_absent(
+        &self,
+        name: &str,
+        observed: Option<&str>,
+    ) -> Result<bool, SbxError> {
+        let mut state = self.lock();
+        let Some(entry) = state.entries.get(name) else {
+            return Ok(false);
+        };
+        if observed.is_none() || entry.uuid.as_deref() != observed {
+            return Ok(false);
+        }
+        let before = state.snapshot();
+        if let Some(mut entry) = state.entries.remove(name) {
+            entry.uuid = None;
+            state.retired.insert(name.to_owned(), entry);
+            if let Err(error) = self.persist(&state) {
+                self.rollback(&mut state, before);
+                return Err(error);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Owned Kit names with the UUID each has now, read before a listing
+    /// whose absences [`Self::forget_absent`] then acts on.
+    pub(crate) fn owned_kit_uuids(&self) -> Vec<(String, String)> {
+        let names = self.owned_kit_names();
+        let state = self.lock();
+        names
+            .into_iter()
+            .filter_map(|name| {
+                let uuid = state.entries.get(&name)?.uuid.clone()?;
+                Some((name, uuid))
+            })
+            .collect()
+    }
+
     /// Persist a just-forgotten name again as an intent (no UUID), before a
     /// replacement VM is created under it.
     pub(crate) fn restore_intent(&self, name: &str) -> Result<(), SbxError> {

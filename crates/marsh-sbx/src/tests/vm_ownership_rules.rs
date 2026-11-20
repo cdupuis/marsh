@@ -182,7 +182,7 @@ fn create_intent_persists_before_create_and_restart_adopts_present_and_keeps_abs
     assert_ne!(created, never);
     assert_eq!(first.vm_name(VmPurpose::Kit, "kit-a").unwrap(), created);
     // The intent is durable before any stock call.
-    assert!(model.calls().is_empty());
+    assert_eq!(model.calls().len(), 0);
     assert!(fs::read_to_string(&map).unwrap().contains(&created));
     // Crash after `sbx create` succeeded but before the UUID was recorded.
     let uuid = model.seed_vm(&created);
@@ -606,7 +606,7 @@ fn ownership_mirror_holds_every_intent_before_create_and_tracks_removal() {
     assert!(fs::read_to_string(&mirror).unwrap().contains(&kept));
     // A new intent reaches the mirror before any stock call.
     let name = adapter.vm_name(VmPurpose::Kit, "kit-b").unwrap();
-    assert!(model.calls().is_empty());
+    assert_eq!(model.calls().len(), 0);
     assert!(fs::read_to_string(&mirror).unwrap().contains(&name));
     let uuid = model.seed_vm(&name);
     adapter.adopt_created(&name).unwrap();
@@ -990,6 +990,59 @@ fn install_records_end_with_their_retired_name_and_stay_with_an_intent() {
     ));
 }
 
+#[test]
+fn review_install_record_failed_writes_roll_back_before_publication() {
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let ownership = VmOwnership::persisted(map.clone()).unwrap();
+    let name = ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
+    let before = fs::read(&map).unwrap();
+    fs::set_permissions(control.path(), fs::Permissions::from_mode(0o500)).unwrap();
+    let begun = ownership.begin_install(&name, install("a1", "hf"));
+    fs::set_permissions(control.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(begun.is_err());
+    assert_eq!(ownership.install_records().len(), 0);
+    assert_eq!(fs::read(&map).unwrap(), before);
+    ownership.begin_install(&name, install("a1", "hf")).unwrap();
+    let before = fs::read(&map).unwrap();
+    fs::set_permissions(control.path(), fs::Permissions::from_mode(0o500)).unwrap();
+    let ended = ownership.end_install("a1");
+    fs::set_permissions(control.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(ended.is_err());
+    assert_eq!(ownership.install_records().len(), 1);
+    assert_eq!(fs::read(&map).unwrap(), before);
+}
+
+#[test]
+fn review_install_record_directory_sync_failure_fences_create_and_keeps_disk_state() {
+    use crate::vm_ownership::FailDirectorySync;
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let ownership = VmOwnership::persisted(map.clone()).unwrap();
+    let name = ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
+    let fail = FailDirectorySync::in_dir(control.path());
+    assert!(ownership.begin_install(&name, install("a1", "hf")).is_err());
+    assert_eq!(
+        ownership.install_records(),
+        VmOwnership::persisted(map.clone())
+            .unwrap()
+            .install_records()
+    );
+    assert!(ownership.confirm_durable().is_err());
+    drop(fail);
+    ownership.confirm_durable().unwrap();
+    let fail = FailDirectorySync::in_dir(control.path());
+    assert!(ownership.end_install("a1").is_err());
+    assert_eq!(ownership.install_records().len(), 0);
+    assert_eq!(
+        VmOwnership::persisted(map).unwrap().install_records().len(),
+        0
+    );
+    assert!(ownership.confirm_durable().is_err());
+    drop(fail);
+    ownership.confirm_durable().unwrap();
+}
+
 /// `KitInstall.tla` rule 4 (create-time check): a create is never submitted under
 /// a name that is not a live entry of the map: not under one forgotten after
 /// it was chosen, and (persisted map) not under one the map never gave out.
@@ -1028,4 +1081,30 @@ fn no_create_is_submitted_under_a_name_that_is_not_a_live_entry() {
         Err(SbxError::StaleVmName(_))
     ));
     assert_eq!(model.count("create"), 0);
+}
+
+/// `KitInstall.tla` `staleAbsence`: a listing that found a name empty proves
+/// gone only the VM the map recorded before it was taken. An intent, or a
+/// UUID adopted since (by a newer listing of a VM landing late), is kept.
+#[test]
+fn an_absent_listing_forgets_only_the_vm_recorded_before_it() {
+    let ownership = VmOwnership::in_memory();
+    let late = ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
+    // Observed as an intent; a newer listing adopted its VM meanwhile.
+    ownership.record(&late, FOREIGN).unwrap();
+    assert!(!ownership.forget_absent(&late, None).unwrap());
+    assert_eq!(ownership.uuid(&late).as_deref(), Some(FOREIGN));
+    // Another UUID than the one observed: kept as well.
+    assert!(
+        !ownership
+            .forget_absent(&late, Some("22222222-2222-4222-8222-222222222222"))
+            .unwrap()
+    );
+    // The VM recorded before the listing, absent from it: gone.
+    assert!(ownership.forget_absent(&late, Some(FOREIGN)).unwrap());
+    assert!(!ownership.is_live(&late));
+    // An intent is never forgotten by an absence.
+    let intent = ownership.assign(VmPurpose::Kit, "kit-b").unwrap();
+    assert!(!ownership.forget_absent(&intent, None).unwrap());
+    assert!(ownership.is_live(&intent));
 }

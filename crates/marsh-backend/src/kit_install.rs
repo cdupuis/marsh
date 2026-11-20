@@ -307,6 +307,7 @@ mod tests {
         removed: Mutex<Vec<String>>,
         before_create: Mutex<Option<Hook>>,
         before_list: Mutex<Option<Hook>>,
+        after_list_snapshot: Mutex<Option<Hook>>,
         next_id: AtomicU64,
         hanging: std::sync::atomic::AtomicBool,
         stopped: Mutex<std::collections::BTreeSet<String>>,
@@ -415,6 +416,10 @@ mod tests {
                         })
                         .collect::<Vec<_>>()
                         .join(",");
+                    let after = self.after_list_snapshot.lock().unwrap().take();
+                    if let Some(hook) = after {
+                        hook();
+                    }
                     Ok(CommandOutput {
                         exit_code: Some(0),
                         stdout: format!(r#"{{"sandboxes":[{rows}]}}"#).into_bytes(),
@@ -577,7 +582,10 @@ mod tests {
             Arc::new(backend_with_stock(
                 home,
                 BTreeMap::new(),
-                test_stock(stock.clone()).with_vm_ownership(map).unwrap(),
+                test_stock(stock.clone())
+                    .with_vm_ownership(map)
+                    .unwrap()
+                    .with_ephemeral_root_for_test(home.join("ephemeral-pool")),
             ))
         }
 
@@ -730,7 +738,7 @@ mod tests {
         let vm = lab.stock.created()[0].clone();
         lab.restart();
         assert_eq!(lab.records(), [format!("{vm} hf")]);
-        assert!(lab.backend.sbx.quarantined_vms().is_empty());
+        assert_eq!(lab.backend.sbx.quarantined_vms().len(), 0);
         // The retry reuses the Kit's name; stock refuses it while A is pending.
         let retry = lab.install("hf", &reference('c')).unwrap_err();
         assert!(retry.to_string().contains("already in use"), "{retry}");
@@ -1214,6 +1222,178 @@ mod tests {
         assert_eq!(lab.records(), [format!("{} hf", created[0])]);
         lab.reset(&["hf"]).unwrap();
         assert_eq!(lab.stock.listed(), NONE);
+    }
+
+    // Reviewer ports of the kh/kh2/kh3 interleavings, through real callers.
+    #[test]
+    fn review_record_is_on_disk_before_stock_create_is_submitted() {
+        let lab = Lab::new();
+        let (home, stock) = (lab.home.path().to_owned(), lab.stock.clone());
+        lab.stock.before_create(move || {
+            assert_eq!(stock.created().len(), 0);
+            let fresh = Lab::daemon(&home, &stock);
+            let records = fresh.sbx.install_records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].2.command, "hf");
+            assert_eq!(
+                fresh
+                    .sbx
+                    .recorded_vm_name(marsh_sbx::VmPurpose::Kit, &reference('c'))
+                    .as_deref(),
+                Some(records[0].0.as_str())
+            );
+        });
+        lab.install("hf", &reference('c')).unwrap_err();
+    }
+
+    #[test]
+    fn review_attempt_ids_do_not_replace_a_different_kits_record_after_restart() {
+        let mut lab = Lab::new();
+        lab.stock
+            .script(&[Create::TimedOutLandsLater, Create::FailedListed]);
+        lab.install("hf", &reference('c')).unwrap_err();
+        let first = lab.backend.sbx.install_records()[0].2.attempt.clone();
+        lab.restart();
+        lab.install("hf", &reference('d')).unwrap_err();
+        let records = lab.backend.sbx.install_records();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|(_, _, r)| r.attempt == first));
+        assert_ne!(records[0].2.attempt, records[1].2.attempt);
+        lab.stock.land_pending();
+        lab.reset(&["hf"]).unwrap();
+        assert_eq!(lab.stock.listed().len(), 0);
+    }
+
+    #[test]
+    fn review_late_adoption_during_an_absent_reset_must_not_forget_the_vm() {
+        let mut lab = Lab::new();
+        lab.stock.script(&[Create::TimedOutLandsLater]);
+        lab.install("hf", &reference('c')).unwrap_err();
+        let stock = lab.stock.clone();
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        *lab.stock.after_list_snapshot.lock().unwrap() = Some(Box::new(move || {
+            // Reset's stock listing already observed absence. Before that
+            // response reaches the adapter, GC's inventory lists the late VM.
+            stock.land_pending();
+            let report = backend.gc_vms(true, &store).unwrap();
+            assert!(
+                report
+                    .entries
+                    .iter()
+                    .any(|entry| entry.vm == stock.created()[0])
+            );
+        }));
+        lab.reset(&["hf"]).unwrap();
+        lab.restart();
+        lab.register("fixture", &reference('d'));
+        let named = lab.reset(&["hf"]);
+        let all = lab.reset(&[]);
+        assert!(
+            named.is_ok() && all.is_ok() && lab.stock.listed().is_empty(),
+            "named={named:?}, all={all:?}, surviving={:?}, owned={:?}, records={:?}",
+            lab.stock.listed(),
+            lab.backend.sbx.live_kit_entries(),
+            lab.records()
+        );
+    }
+
+    #[test]
+    fn review_kh_landing_after_absent_reset_keeps_both_cleanup_paths() {
+        for all in [false, true] {
+            let lab = Lab::new();
+            lab.register("fixture", &reference('d'));
+            lab.stock.script(&[Create::TimedOutLandsLater]);
+            lab.install("hf", &reference('c')).unwrap_err();
+            lab.reset(if all { &[] } else { &["hf"] }).unwrap();
+            lab.stock.land_pending();
+            lab.reset(if all { &[] } else { &["hf"] }).unwrap();
+            assert_eq!(lab.stock.listed().len(), 0);
+            assert_eq!(lab.records().len(), 0);
+        }
+    }
+
+    #[test]
+    fn review_kh_new_attempt_during_old_retirement_keeps_its_record() {
+        let lab = Lab::new();
+        lab.stock
+            .script(&[Create::FailedListed, Create::FailedListed]);
+        lab.install("hf", &reference('c')).unwrap_err();
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        lab.stock.before_list(move || {
+            backend
+                .install_command("hf".into(), reference('d'), Some(&store))
+                .unwrap_err();
+        });
+        lab.reset(&["hf"]).unwrap();
+        assert_eq!(lab.stock.listed().len(), 1);
+        assert_eq!(lab.records().len(), 1, "old retirement erased new attempt");
+        lab.reset(&["hf"]).unwrap();
+        assert_eq!(lab.stock.listed().len(), 0);
+        assert_eq!(lab.records().len(), 0);
+    }
+
+    #[test]
+    fn review_kh2_automatic_retirement_retry_and_both_resets() {
+        for all in [false, true] {
+            let lab = Lab::new();
+            lab.stock
+                .script(&[Create::FailedListed, Create::FailedListed]);
+            lab.install("hf", &reference('c')).unwrap_err();
+            let vm = lab.stock.created()[0].clone();
+            lab.backend
+                .recover_quarantined_vm(lab.store(), &vm)
+                .unwrap();
+            assert_eq!(lab.records().len(), 0);
+            lab.install("hf", &reference('c')).unwrap_err();
+            lab.reset(if all { &[] } else { &["hf"] }).unwrap();
+            assert_eq!(lab.stock.listed().len(), 0);
+            assert_eq!(lab.records().len(), 0);
+        }
+    }
+
+    #[test]
+    fn review_kh3_retry_entering_during_locked_reset_uses_a_fresh_name() {
+        let lab = Lab::new();
+        lab.stock
+            .script(&[Create::TimedOutLandsLater, Create::TimedOutLandsLater]);
+        lab.install("hf", &reference('c')).unwrap_err();
+        lab.reset(&["hf"]).unwrap();
+        lab.stock.land_pending();
+        let old = lab.stock.created()[0].clone();
+        let (observed_tx, observed) = std::sync::mpsc::channel();
+        let observed_tx = Mutex::new(observed_tx);
+        *lab.backend.install_hook.lock().unwrap() = Some(Box::new(move |point| {
+            if point == "observed" {
+                observed_tx.lock().unwrap().send(()).unwrap();
+            }
+        }));
+        let retry = Arc::new(Mutex::new(None));
+        let handle = retry.clone();
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        lab.stock.before_list(move || {
+            *handle.lock().unwrap() = Some(std::thread::spawn(move || {
+                backend.install_command("hf".into(), reference('c'), Some(&store))
+            }));
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        lab.reset(&[]).unwrap();
+        retry
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap_err();
+        let created = lab.stock.created();
+        assert_eq!(created.len(), 2, "retry did not submit create");
+        assert_ne!(created[1], old, "retry submitted under retired name");
+        lab.stock.land_pending();
+        lab.assert_every_vm_owned();
+        lab.reset(&["hf"]).unwrap();
+        lab.reset(&[]).unwrap_err(); // No commands or live entries remain.
+        assert_eq!(lab.stock.listed().len(), 0);
+        assert_eq!(lab.records().len(), 0);
     }
 
     /// `removeUnowned` (`NoForeignRemoval`): a VM listed under an install's

@@ -1761,9 +1761,11 @@ impl StockSbx {
     /// Remove one VM only by its recorded, currently present UUID. Absent is a
     /// successful no-op; a foreign or unrecorded VM is never touched.
     fn remove_owned_vm(&self, name: &str, deadline: Instant) -> Result<bool, SbxError> {
+        // Read before the listing: its absence proves only this VM gone.
+        let observed = self.ownership.uuid(name);
         let uuid = match self.classify_vm_before(name, true, deadline)? {
             VmClass::Absent => {
-                self.ownership.forget(name)?;
+                self.ownership.forget_absent(name, observed.as_deref())?;
                 return Ok(false);
             }
             VmClass::Foreign => return Err(SbxError::ForeignVm(name.to_owned())),
@@ -2224,11 +2226,20 @@ impl StockSbx {
                 operation: "list scope Kit VMs for reset",
             });
         }
+        // The UUIDs recorded before the listing: a VM adopted by another
+        // listing after this one was taken is not proven gone by it. (Every
+        // VM this listing finds is a candidate, intents it adopts included.)
+        let observed = self
+            .ownership
+            .owned_kit_uuids()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
         let view = self.stock_view(true)?;
         let mut removed = Vec::new();
         for vm in self.ownership.owned_kit_names() {
             if view.get(&vm).is_none() {
-                self.ownership.forget(&vm)?;
+                self.ownership
+                    .forget_absent(&vm, observed.get(&vm).map(String::as_str))?;
                 continue;
             }
             self.reset_stale_scope_kit_vm_candidate(&vm, deadline)?;
@@ -2577,10 +2588,10 @@ impl StockSbx {
                 {
                     return Err(SbxError::ForeignVm(foreign));
                 }
+                self.ownership.forget(name)?;
             }
             Err(error) => return Err(error),
         }
-        self.ownership.forget(name)?;
         self.worker_init_locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2800,11 +2811,12 @@ impl StockSbx {
             "retire a Kit VM",
         )?;
         let quarantined = self.reject_quarantined(name).is_err();
+        let observed = self.ownership.uuid(name);
         match self.classify_vm_before(name, true, deadline)? {
             VmClass::Absent => {
                 self.drop_worker_lease(name)?;
                 self.clear_worker_generation_named(name, identity);
-                self.ownership.forget(name)?;
+                self.ownership.forget_absent(name, observed.as_deref())?;
                 return Ok(false);
             }
             VmClass::Foreign => return Err(SbxError::ForeignVm(name.to_owned())),

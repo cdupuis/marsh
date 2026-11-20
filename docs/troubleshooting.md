@@ -337,7 +337,7 @@ and Compose reports it like this:
 | `docker compose up`, `create` or `start` of a project that declares scheduled jobs (`jobs:` with `triggers.schedule`) | Exit 1 with `jobs extension is enabled but not ready`, before anything is created. Marsh does not support Compose jobs; remove the scheduled jobs from the compose file. |
 | `docker compose run JOB` for a job declared under `jobs:` | The same error. |
 
-A plain `docker compose down` or `down -v` without `-p` does not print it.
+A plain `docker compose down` or `down -v` without `-p`, of a project that declares no `jobs:`, does not print it.
 
 ## A split was kept
 

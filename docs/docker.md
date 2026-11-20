@@ -781,7 +781,7 @@ In plain words:
   `up` and `create`. The probe is refused at once, so these commands print a
   warning such as `jobs of project NAME not removed: the engine's jobs extension
   is enabled but not ready: ...`, then carry on and exit 0; the warning can be
-  ignored. A plain `docker compose down` or `down -v` (no `-p`) does not probe,
+  ignored. A plain `docker compose down` or `down -v` (no `-p`) of a project that declares no `jobs:` does not probe,
   and neither do `up -d` or `ps` of a project without scheduled
   jobs. A project that declares scheduled jobs (`jobs:` with a `triggers.schedule`)
   fails on `docker compose up`, `create` and `start` before anything is

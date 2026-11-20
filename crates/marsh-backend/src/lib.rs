@@ -4334,9 +4334,10 @@ fn retain_no_home_mounts(mounts: &mut Vec<PublicMount>, guest_home: &Path, proje
 }
 
 /// How a path relates to a home it would show: it is the home, or a folder
-/// holding it. Judged by path components and by identity
-/// (`marsh_daemon::holds_by_identity`), which sees what they cannot: macOS
-/// firmlinks (`/System/Volumes/Data` holds `/Users/me`) and aliases.
+/// holding it. Judged by path components and by identity, which sees what they
+/// cannot: a macOS firmlink (`/System/Volumes/Data` holds `/Users/me`; a path
+/// that IS `/System/Volumes/Data/Users`, `/Users`' alias). Bind mounts (Linux)
+/// are not seen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HomeRelation {
     Is,
@@ -4344,9 +4345,29 @@ enum HomeRelation {
 }
 
 fn relation_to_home(path: &Path, home: &Path) -> Option<HomeRelation> {
-    if path == home || marsh_daemon::same_directory(path, home) {
+    relation_to_home_with(
+        path,
+        home,
+        marsh_daemon::same_directory,
+        marsh_daemon::holds_by_identity,
+    )
+}
+
+/// [`relation_to_home`] with the identity tests supplied: `same(a, b)` for the
+/// same directory, `holds(container, inner)` for `inner` reached from
+/// `container` through an alias.
+fn relation_to_home_with(
+    path: &Path,
+    home: &Path,
+    same: impl Fn(&Path, &Path) -> bool,
+    holds: impl Fn(&Path, &Path) -> bool,
+) -> Option<HomeRelation> {
+    if path == home || same(path, home) {
         Some(HomeRelation::Is)
-    } else if home.starts_with(path) || marsh_daemon::holds_by_identity(path, home) {
+    } else if home.starts_with(path)
+        || holds(path, home)
+        || home.ancestors().skip(1).any(|above| same(path, above))
+    {
         Some(HomeRelation::Holds)
     } else {
         None
@@ -4379,8 +4400,8 @@ fn drop_no_home_grants(grants: &mut Vec<AdmittedHostGrant>, guest_home: &Path) {
 /// project is `project`: the guest home's contents beyond the project stay
 /// out of its view, so it is refused from the home itself, from a
 /// dot-directory of the home (other agents' settings and saved logins), and
-/// when the project is the home, holds it, or is a dot-directory (after symlinks). A lane
-/// of a split is judged as the project it forks (`fork_as_project`).
+/// when the project is the home, holds it, or is a dot-directory (after
+/// symlinks). A lane of a split is judged as the project it forks (`fork_as_project`).
 fn no_home_view_admitted(
     guest_home: &Path,
     home_backing: &Path,
@@ -7447,47 +7468,84 @@ mod tests {
         assert_eq!(admitted(&sibling, &sibling), Ok(()));
     }
 
-    /// macOS firmlinks: `/System/Volumes/Data` holds `/Users/me` as
-    /// `<Data>/Users/me`, which no canonical path shows. Judged by identity,
-    /// on a tree where the home is reachable through an alias.
+    /// A symlink inside a project is not a hold of the home: a mount does not
+    /// follow it (`proj/Users -> /Users`).
     #[test]
-    fn no_home_kit_is_refused_from_a_project_that_reaches_the_home_by_alias() {
+    fn a_symlink_inside_a_project_does_not_make_it_hold_the_home() {
         let root = tempfile::tempdir().unwrap();
         let top = fs::canonicalize(root.path()).unwrap();
         let home = top.join("users/alice");
-        fs::create_dir_all(home.join("proj")).unwrap();
+        fs::create_dir_all(&home).unwrap();
         let backing = top.join("marsh/home");
         fs::create_dir_all(&backing).unwrap();
-        let data = top.join("data");
-        let beside = top.join("beside");
-        for dir in [&data, &beside] {
-            fs::create_dir(dir).unwrap();
+        let project = top.join("project");
+        fs::create_dir(&project).unwrap();
+        let relative = home.strip_prefix("/").unwrap();
+        fs::create_dir_all(project.join(relative).parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&home, project.join(relative)).unwrap();
+        let first = top.join("project2");
+        fs::create_dir(&first).unwrap();
+        std::os::unix::fs::symlink(
+            top.join("users"),
+            first.join(relative.components().next().unwrap()),
+        )
+        .unwrap();
+        for project in [&project, &first] {
+            assert_eq!(
+                no_home_view_admitted(&home, &backing, project, project),
+                Ok(()),
+                "{project:?}"
+            );
+            assert!(!grant_shows_home(project, &home), "{project:?}");
         }
-        let admitted = |project: &Path| no_home_view_admitted(&home, &backing, project, project);
-        assert_eq!(admitted(&data), Ok(()));
-        for held in [&home, &backing] {
-            let at = data.join(held.strip_prefix("/").unwrap());
-            fs::create_dir_all(at.parent().unwrap()).unwrap();
-            std::os::unix::fs::symlink(held, at).unwrap();
-        }
-        let refused = admitted(&data).unwrap_err();
-        assert!(
-            refused.contains("the project contains your home"),
-            "{refused}"
-        );
-        assert_eq!(admitted(&beside), Ok(()));
-        // The home reached by the alias is the home.
-        let alias = data.join(home.strip_prefix("/").unwrap());
-        assert_eq!(
-            no_home_view_admitted(&home, &backing, &alias, &alias),
-            Err("the project is the home".into())
-        );
     }
 
-    /// The exact shape, where the machine has it.
+    /// macOS firmlinks, with the identity tests as a firmlink answers them:
+    /// `/System/Volumes/Data` holds `/Users/me` as `<Data>/Users/me`, and
+    /// `<Data>/Users` is `/Users`, neither seen by canonical paths. A home
+    /// spelled either way is judged the same.
+    #[test]
+    fn a_firmlink_spelling_of_the_home_or_of_a_folder_above_it_is_judged_by_identity() {
+        use HomeRelation::{Holds, Is};
+        const DATA: &str = "/System/Volumes/Data";
+        let same = |a: &Path, b: &Path| {
+            let alias = |path: &Path| match path.to_str().unwrap() {
+                "/Users" | "/System/Volumes/Data/Users" => Some("/Users"),
+                "/Users/me" | "/System/Volumes/Data/Users/me" => Some("/Users/me"),
+                _ => None,
+            };
+            alias(a).is_some() && alias(a) == alias(b)
+        };
+        let holds = |container: &Path, inner: &Path| {
+            container == Path::new(DATA) && inner == Path::new("/Users/me")
+        };
+        let relation = |path: &str, home: &str| {
+            relation_to_home_with(Path::new(path), Path::new(home), same, holds)
+        };
+        // The home as `/Users/me`.
+        assert_eq!(relation(DATA, "/Users/me"), Some(Holds));
+        assert_eq!(
+            relation("/System/Volumes/Data/Users/me", "/Users/me"),
+            Some(Is)
+        );
+        assert_eq!(
+            relation("/System/Volumes/Data/Users", "/Users/me"),
+            Some(Holds)
+        );
+        // The home spelled through the Data volume, and a project at `/Users`.
+        let spelled = "/System/Volumes/Data/Users/me";
+        assert_eq!(relation("/Users", spelled), Some(Holds));
+        assert_eq!(relation("/Users/me", spelled), Some(Is));
+        // Beside and below stay admitted.
+        assert_eq!(relation("/Users/me2", "/Users/me"), None);
+        assert_eq!(relation("/Users/me/proj", "/Users/me"), None);
+        assert_eq!(relation("/System/Volumes", "/Users/me"), None);
+    }
+
+    /// The same, on the real volume where the machine has one.
     #[cfg(target_os = "macos")]
     #[test]
-    fn no_home_kit_is_refused_from_the_data_volume_root_on_macos() {
+    fn no_home_kit_is_refused_from_the_data_volume_and_its_spellings_on_macos() {
         let data = Path::new("/System/Volumes/Data");
         let Some(home) = std::env::var_os("HOME")
             .and_then(|home| fs::canonicalize(home).ok())
@@ -7496,10 +7554,37 @@ mod tests {
             return;
         };
         let backing = home.join(".marsh/home");
-        let refused = no_home_view_admitted(&home, &backing, data, data).unwrap_err();
+        let spelled = data.join(home.strip_prefix("/").unwrap());
+        let contains = |home: &Path, project: &Path| {
+            let refused = no_home_view_admitted(home, &backing, project, project);
+            refused.is_err_and(|reason| reason.contains("the project contains your home"))
+        };
+        // A project at the Data volume's root.
+        assert!(contains(&home, data));
+        assert!(grant_shows_home(data, &home));
+        // The home reached through the Data volume IS the home.
+        assert_eq!(
+            no_home_view_admitted(&home, &backing, &spelled, &spelled),
+            Err("the project is the home".into())
+        );
+        assert!(grant_shows_home(&spelled, &home));
+        // `<Data>/Users` holds the home, as does `/Users` for a home that is
+        // spelled through the Data volume.
+        assert!(contains(&home, &data.join("Users")));
+        assert!(contains(&spelled, Path::new("/Users")));
+        assert!(grant_shows_home(Path::new("/Users"), &spelled));
+        // Folders beside the home stay admitted.
         assert!(
-            refused.contains("the project contains your home"),
-            "{refused}"
+            no_home_view_admitted(&home, &backing, Path::new("/tmp"), Path::new("/tmp")).is_ok()
+        );
+        assert!(
+            no_home_view_admitted(
+                &home,
+                &backing,
+                data.join("tmp").as_path(),
+                data.join("tmp").as_path()
+            )
+            .is_ok()
         );
     }
 
@@ -7528,12 +7613,13 @@ mod tests {
         std::os::unix::fs::symlink(&home, &link).unwrap();
         assert!(grant_shows_home(&top.join("users"), &link));
         assert!(!grant_shows_home(&top.join("users/alice2"), &link));
-        // An alias that leads to the home.
+        // A folder with a symlink to the home inside is not a hold (the
+        // symlink itself, resolved, is the home).
         let data = top.join("data");
         let at = data.join(home.strip_prefix("/").unwrap());
         fs::create_dir_all(at.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&home, &at).unwrap();
-        assert!(shows(&data));
+        assert!(!shows(&data));
         assert!(shows(&at));
         // A case variant, where the volume ignores case (macOS).
         let upper = top.join("USERS");
@@ -7575,10 +7661,27 @@ mod tests {
                 .map_or(production.len(), |end| start + 1 + end);
             &production[start..end]
         };
-        for caller in ["prepare_for_shell", "execute"] {
+        // Each caller passes the session's own guest home.
+        for (caller, call) in [
+            (
+                "prepare_for_shell",
+                "drop_no_home_grants(&mut grants, &session.guest_home)",
+            ),
+            (
+                "execute",
+                "drop_no_home_grants(&mut admitted_grants, guest_home)",
+            ),
+        ] {
             let body = body(caller);
-            assert_eq!(body.matches("kit_wants_no_home(").count(), 1, "{caller}");
+            assert!(body.contains("kit_wants_no_home("), "{caller}");
             assert_eq!(body.matches("drop_no_home_grants(").count(), 1, "{caller}");
+            assert_eq!(body.matches(call).count(), 1, "{caller}");
+            if caller == "execute" {
+                assert!(
+                    body.contains("let guest_home = &request.session.guest_home;"),
+                    "{caller}"
+                );
+            }
             assert!(!body.contains("grant.target() !="), "{caller}");
             assert!(!body.contains("starts_with(grant.target())"), "{caller}");
         }

@@ -574,6 +574,14 @@ StopEnd ==
   /\ stopping' = FALSE
   /\ UNCHANGED <<reg, iVars, jVars, rMode, rT, rHad, rRuns, sFrom, sTo, sRuns, tdRuns, stops, restarts, lates, rstBad>>
 
+\* A forced stop whose requests do not drain within its bound gives up:
+\* admission opens again, the requests go on, nothing is torn down (the code
+\* also lets creates run again: `handle_forced_stop`).
+StopGiveUp ==
+  /\ stopping /\ ~Quiescent
+  /\ stopping' = FALSE
+  /\ UNCHANGED <<world, reg, owner, pc, iVars, jVars, rVars, sVars, tdRuns, stops, restarts, lates, rstBad>>
+
 \* Environment: a create that did not report lands (stock: A2, it was absent).
 Land(n) ==
   /\ inflight[n]
@@ -587,7 +595,7 @@ Next ==
   \/ JobDecideEarly \/ JobRun \/ JobAbort
   \/ RstStart \/ RstLock \/ RstReplan \/ RstAct
   \/ SwStart \/ SwLock \/ SwAct
-  \/ RecoverBg \/ Gc \/ Teardown \/ Restart \/ StopBegin \/ StopEnd
+  \/ RecoverBg \/ Gc \/ Teardown \/ Restart \/ StopBegin \/ StopEnd \/ StopGiveUp
   \/ \E n \in NameIds : Land(n)
 
 Spec == Init /\ [][Next]_vars

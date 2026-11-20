@@ -905,6 +905,37 @@ fn a_map_without_dev_grants_is_not_rewritten_at_load() {
     assert!(!loaded.is_retired("marsh-k-intent01"));
 }
 
+#[test]
+fn review_v2b_interrupted_inline_record_migration_preserves_the_cleanup_handle() {
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    write_map(
+        &map,
+        &serde_json::json!({
+            "version": 3,
+            "vms": {"marsh-k-legacy01": {"purpose": "kit", "key": "kit-a", "uuid": FOREIGN,
+                "installs": [{"attempt": "a9", "command": "hf"}]}}
+        }),
+    );
+    // Interrupt after the first rename, before the side file is published.
+    // This uses the real writer, not a manually constructed split state.
+    let fail = crate::vm_ownership::FailDirectorySync::in_dir(control.path());
+    assert!(VmOwnership::persisted(map.clone()).is_err());
+    drop(fail);
+    let loaded = VmOwnership::persisted(map.clone()).unwrap();
+    assert_eq!(loaded.uuid("marsh-k-legacy01").as_deref(), Some(FOREIGN));
+    assert_eq!(
+        loaded.install_records(),
+        [(
+            "marsh-k-legacy01".into(),
+            "kit-a".into(),
+            install("a9", "hf")
+        )],
+        "the first rename stripped the only durable copy of the failed install's cleanup selector: {}",
+        fs::read_to_string(map).unwrap()
+    );
+}
+
 fn install(attempt: &str, command: &str) -> crate::InstallRecord {
     crate::InstallRecord {
         attempt: attempt.into(),

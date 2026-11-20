@@ -506,13 +506,20 @@ impl VmOwnership {
         {
             let state = ownership.lock();
             let loaded = Self::installs_bytes(&state)?;
-            if !inline {
-                ownership
-                    .on_disk
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .1 = Some(loaded);
+            if inline {
+                // A map an earlier build wrote with records inline: publish
+                // the records file first, while the map still holds them, so
+                // no crash between the two writes loses the only copy (both
+                // reviews). Its names are all entries of the map on disk.
+                if let Some(path) = &ownership.path {
+                    write_atomically(&installs_path(path), &loaded, None)?;
+                }
             }
+            ownership
+                .on_disk
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .1 = Some(loaded);
         }
         if migrated || inline {
             ownership.persist(&ownership.lock())?;

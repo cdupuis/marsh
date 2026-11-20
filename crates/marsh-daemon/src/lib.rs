@@ -300,6 +300,36 @@ fn daemon_busy_message(cap: usize) -> String {
     )
 }
 
+/// A failed process run, by how far the daemon had got with it. A run is
+/// retried only after `NotAdmitted`: once the daemon may have admitted it, a
+/// retry could run the user's command twice, so the failure is reported.
+#[derive(Debug)]
+pub enum ProcessRunError {
+    /// The daemon admitted nothing: the request did not reach it whole, or it
+    /// answered with a refusal before `ExecutionAccepted`.
+    NotAdmitted(DaemonError),
+    /// The daemon may have admitted the run (the reply was lost after a whole
+    /// request) or did (every failure after `ExecutionAccepted`, whatever its
+    /// text).
+    MaybeAdmitted(DaemonError),
+}
+
+impl ProcessRunError {
+    /// Whether the run may be started again: refused before admission, with
+    /// a refusal that says to try again.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::NotAdmitted(error) if is_retryable_refusal(error))
+    }
+
+    #[must_use]
+    pub fn into_error(self) -> DaemonError {
+        match self {
+            Self::NotAdmitted(error) | Self::MaybeAdmitted(error) => error,
+        }
+    }
+}
+
 /// Whether `error` is a refusal that read nothing and started nothing and
 /// says to try again: the job's capability socket full, the daemon or a shell
 /// relay at its connection cap, a relay that could not reach the daemon, or
@@ -9314,13 +9344,48 @@ impl Client {
         O: Write,
         E: Write,
     {
-        let execution = self.start_attached(PublicRequest::ProcessRun(spec))?;
+        self.run_process_with_io_attempt(spec, input, output, error, started)
+            .map_err(ProcessRunError::into_error)
+    }
+
+    /// [`Self::run_process_with_io_started`], telling a failure before the
+    /// daemon admitted the run (which may be retried) from every other
+    /// (which never may be).
+    pub fn run_process_with_io_attempt<R, O, E>(
+        &self,
+        spec: ExecuteSpec,
+        input: R,
+        output: O,
+        error: E,
+        started: &mut dyn FnMut(&str),
+    ) -> Result<i32, ProcessRunError>
+    where
+        R: Read + Send + 'static,
+        O: Write,
+        E: Write,
+    {
+        let execution = self.start_attached_phased(PublicRequest::ProcessRun(spec))?;
         relay_attachment_started(&execution, false, input, output, error, started)
-            .map_err(lost_after_accept)
+            .map_err(|error| ProcessRunError::MaybeAdmitted(lost_after_accept(error)))
     }
 
     fn start_attached(&self, body: PublicRequest) -> Result<ClientExecution, DaemonError> {
-        let mut stream = marsh_runtime::connect_unix(&self.paths.socket)?;
+        self.start_attached_phased(body)
+            .map_err(ProcessRunError::into_error)
+    }
+
+    /// Sends `body` and reads the admission, saying how far it got when it
+    /// fails: `NotAdmitted` only when the request never reached the daemon
+    /// whole (connect or write failed) or the daemon answered it with a
+    /// refusal instead of `ExecutionAccepted`. A reply lost after a whole
+    /// request, or anything unexpected, may have followed an admission.
+    fn start_attached_phased(
+        &self,
+        body: PublicRequest,
+    ) -> Result<ClientExecution, ProcessRunError> {
+        use ProcessRunError::{MaybeAdmitted, NotAdmitted};
+        let mut stream = marsh_runtime::connect_unix(&self.paths.socket)
+            .map_err(|error| NotAdmitted(error.into()))?;
         write_request(
             &mut stream,
             &Envelope {
@@ -9328,10 +9393,12 @@ impl Client {
                 token: self.token.clone(),
                 body,
             },
-        )?;
-        match read_frame::<PublicReply>(&mut stream)? {
-            PublicReply::ExecutionAccepted => ClientExecution::new(stream),
-            reply => Err(unexpected_reply(reply)),
+        )
+        .map_err(NotAdmitted)?;
+        match read_frame::<PublicReply>(&mut stream).map_err(MaybeAdmitted)? {
+            PublicReply::ExecutionAccepted => ClientExecution::new(stream).map_err(MaybeAdmitted),
+            reply @ PublicReply::Error { .. } => Err(NotAdmitted(unexpected_reply(reply))),
+            reply => Err(MaybeAdmitted(unexpected_reply(reply))),
         }
     }
 

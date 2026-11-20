@@ -2555,6 +2555,59 @@ mod tests {
     }
 
     #[test]
+    fn a_process_run_refused_by_the_relay_is_not_admitted_and_retryable() {
+        let run = |client: &Client, bytes: usize| {
+            client.run_process_with_io_attempt(
+                ExecuteSpec {
+                    model: None,
+                    usage: None,
+                    label: None,
+                    kit: None,
+                    command: "fixture".into(),
+                    arguments: vec![vec![b'x'; bytes]],
+                    placement: crate::Placement::Local,
+                    environment: marsh_contracts::ExportedEnvironment::default(),
+                    working_directory: None,
+                    session: session("shell-1", Path::new("/home/u")),
+                    process: None,
+                    acp: false,
+                },
+                std::io::empty(),
+                std::io::sink(),
+                std::io::sink(),
+                &mut |_| panic!("a refused run started"),
+            )
+        };
+        let relays = PairedRelays::new();
+        let held = fill_to_capacity(&relays);
+        let client = client(&relays);
+        // Small, and larger than the socket buffers (written while the relay
+        // refuses and closes): both are refused before admission.
+        let capped = [run(&client, 10), run(&client, 150_000)];
+        drop(held);
+        fs::remove_file(
+            relays
+                .socket
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("daemon.sock"),
+        )
+        .unwrap();
+        let unreachable = run(&client, 10);
+        relays.stop();
+        for result in capped.into_iter().chain([unreachable]) {
+            match result {
+                Err(error @ crate::ProcessRunError::NotAdmitted(_)) => {
+                    assert!(error.is_retryable(), "{error:?}");
+                }
+                other => panic!("expected a refusal before admission, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn every_relay_refusal_a_real_client_reads_is_retryable() {
         let relays = PairedRelays::new();
         let held = fill_to_capacity(&relays);

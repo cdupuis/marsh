@@ -159,3 +159,103 @@ fn every_client_request_write_goes_through_the_refusal_recovery() {
         "the scan found only {clients} client request writers"
     );
 }
+
+/// What a process run reports for one scripted daemon connection.
+fn run_against(
+    reply: impl FnOnce(&mut UnixStream) + Send + 'static,
+) -> Result<i32, ProcessRunError> {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("daemon.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _: serde_json::Value = read_frame(&mut stream).unwrap();
+        reply(&mut stream);
+    });
+    let spec = ExecuteSpec {
+        model: None,
+        usage: None,
+        label: None,
+        kit: None,
+        command: "fixture".into(),
+        arguments: vec![],
+        placement: Placement::Local,
+        environment: marsh_contracts::ExportedEnvironment::default(),
+        working_directory: None,
+        session: SessionSpec {
+            session_id: "s".into(),
+            username: "u".into(),
+            uid: 1000,
+            gid: 1000,
+            launch_directory: "/p".into(),
+            guest_home: "/h".into(),
+            home_backing: "/b".into(),
+            ephemeral_home: false,
+            terminal: false,
+            terminal_size: None,
+        },
+        process: None,
+        acp: false,
+    };
+    let result = Client::capability(&socket).run_process_with_io_attempt(
+        spec,
+        std::io::empty(),
+        std::io::sink(),
+        std::io::sink(),
+        &mut |_| {},
+    );
+    peer.join().unwrap();
+    result
+}
+
+#[test]
+fn a_process_run_says_whether_the_daemon_may_have_admitted_it() {
+    // A refusal in place of the admission: not admitted.
+    let refused = run_against(|stream| {
+        write_frame(
+            stream,
+            &PublicReply::Error {
+                code: ErrorCode::InvalidRequest,
+                message: "marsh: busy; try again".into(),
+            },
+        )
+        .unwrap();
+    });
+    assert!(matches!(
+        refused,
+        Err(ProcessRunError::NotAdmitted(DaemonError::Remote(_)))
+    ));
+    // The reply lost after a whole request, or not an admission at all: the
+    // daemon may have admitted it.
+    let lost = run_against(|_| {});
+    assert!(
+        matches!(lost, Err(ProcessRunError::MaybeAdmitted(_))),
+        "{lost:?}"
+    );
+    let odd = run_against(|stream| write_frame(stream, &PublicReply::ShuttingDown).unwrap());
+    assert!(
+        matches!(odd, Err(ProcessRunError::MaybeAdmitted(_))),
+        "{odd:?}"
+    );
+    // Any failure after the admission, whatever its text.
+    let failed = run_against(|stream| {
+        write_frame(stream, &PublicReply::ExecutionAccepted).unwrap();
+        let _: AttachmentFrame = read_frame(stream).unwrap();
+        write_frame(
+            stream,
+            &AttachmentFrame::Failed {
+                message: "marsh: busy; try again".into(),
+            },
+        )
+        .unwrap();
+    });
+    assert!(
+        matches!(&failed, Err(ProcessRunError::MaybeAdmitted(DaemonError::Remote(m))) if m == "marsh: busy; try again"),
+        "{failed:?}"
+    );
+    assert!(![refused, lost, odd, failed].iter().any(|result| {
+        result
+            .as_ref()
+            .is_err_and(|e| matches!(e, ProcessRunError::MaybeAdmitted(_)) && e.is_retryable())
+    }));
+}

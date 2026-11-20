@@ -541,7 +541,13 @@ is 130. `split` exits with the first nonzero code in declaration order.
     `Client` method writes its request any other way. A refusal that says
     to try again (this one, the daemon's own cap, the job socket's cap) is what
     a link retries (`is_retryable_refusal`, `job.rs` `retry_refusals`: 30
-    attempts, 100 ms apart). Unit tests in `relay.rs`:
+    attempts, 100 ms apart), and only a refusal that came before the daemon
+    admitted the run: `run_process_with_io_attempt` reports
+    `ProcessRunError::NotAdmitted` for a failed connect or request write or a
+    refusal in place of `ExecutionAccepted`, and `MaybeAdmitted` for a reply
+    lost after a whole request and for every failure after `ExecutionAccepted`,
+    whatever its text. Only `NotAdmitted` is retried, so a run that may have
+    started is never submitted twice (`a_run_that_started_is_never_retried_whatever_its_failure_says`). Unit tests in `relay.rs`:
     `guest_relay_past_its_capacity_refuses_with_a_frame_not_a_reset`,
     `a_client_that_writes_after_the_refusal_reads_the_reason_not_a_broken_pipe`,
     `a_real_client_with_a_large_request_reads_the_capacity_refusal`,

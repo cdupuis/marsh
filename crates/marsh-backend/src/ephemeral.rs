@@ -164,6 +164,20 @@ impl StockDaemonBackend {
         Ok(())
     }
 
+    /// The ownership keys of the live ephemeral-home sessions' Kit VMs.
+    pub(super) fn live_ephemeral_keys(&self) -> BTreeSet<String> {
+        self.ephemeral_kits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .flat_map(|(session, specs)| {
+                specs
+                    .values()
+                    .map(|spec| ephemeral_ownership_key(spec.workload_kit.identity(), session))
+            })
+            .collect()
+    }
+
     pub(super) fn remembered_ephemeral_kits(&self) -> Vec<KitVmSpec> {
         self.ephemeral_kits
             .lock()

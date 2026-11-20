@@ -158,7 +158,7 @@ pub struct StockDaemonBackend {
     quarantine_recovery: Mutex<BTreeMap<String, String>>,
     /// The ids of `kit install` attempts that have not published their
     /// command (`kit_install.rs`); their records are persisted in the map.
-    running_installs: Mutex<BTreeSet<String>>,
+    running_installs: Mutex<BTreeMap<String, (String, String)>>,
     /// Runs once between a reset's first plan and its Kit locks (tests that
     /// interleave another operation there).
     #[cfg(test)]
@@ -505,7 +505,7 @@ impl StockDaemonBackend {
             sbxenv_sweep: Mutex::new(sbxenv::Sweep::default()),
             configured_mcp_vms: Mutex::new(BTreeMap::new()),
             quarantine_recovery: Mutex::new(BTreeMap::new()),
-            running_installs: Mutex::new(BTreeSet::new()),
+            running_installs: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             reset_before_locks: Mutex::new(None),
             #[cfg(test)]
@@ -5662,16 +5662,19 @@ impl StockDaemonBackend {
         let owner = workload.identity().to_owned();
         let kit_lock = store.map(|_| self.kit_lock_for_key(&owner)).transpose()?;
         let observed_validation = self.observed_validation(&owner)?;
+        // Running before it waits for the Kit lock: a reset refuses or skips
+        // it rather than waiting out its create.
+        let mut attempt = store.map(|_| self.begin_install_attempt(&command, &owner));
         #[cfg(test)]
         self.install_hook_at("observed");
         let _kit = kit_lock.as_ref().map(|lock| {
             lock.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
-        let mut attempt = None;
         let mut published_vm = None;
-        if let Some(store) = store {
-            let started = attempt.insert(self.begin_install_attempt(&command));
+        if let Some(store) = store
+            && let Some(started) = attempt.as_ref()
+        {
             let hint = self
                 .sbx
                 .recorded_vm_name(VmPurpose::Kit, &owner)

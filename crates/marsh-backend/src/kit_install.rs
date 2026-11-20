@@ -89,25 +89,33 @@ struct ResetPlan {
 }
 
 impl StockDaemonBackend {
-    /// A new install attempt of `command`, running until the guard drops
-    /// ([`InstallRecord::new_attempt`]: its id is never reused).
-    pub(super) fn begin_install_attempt(&self, command: &str) -> InstallAttempt<'_> {
+    /// A new install attempt of `command` from the Kit of ownership key
+    /// `owner`, running until the guard drops ([`InstallRecord::new_attempt`]:
+    /// its id is never reused). It is running from before it takes its Kit
+    /// lock, so a reset never waits behind it, record or not.
+    pub(super) fn begin_install_attempt(&self, command: &str, owner: &str) -> InstallAttempt<'_> {
         let record = InstallRecord::new_attempt(command);
         self.running_installs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(record.attempt.clone());
+            .insert(
+                record.attempt.clone(),
+                (command.to_owned(), owner.to_owned()),
+            );
         InstallAttempt {
             backend: self,
             record,
         }
     }
 
-    fn install_running(&self, attempt: &str) -> bool {
+    /// The running install attempts as `(command, ownership key)`.
+    fn running_attempts(&self) -> Vec<(String, String)> {
         self.running_installs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(attempt)
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// The commands whose install records name `vm`, for `marsh status`.
@@ -163,9 +171,35 @@ impl StockDaemonBackend {
                     .into_iter()
                     .map(|(name, _, _)| name),
             );
-            let claim = Self::claim_retirement(store, plan.targets.keys().cloned().collect())?;
-            let may_land = self.retire_claimed_named(store, &plan.targets, &claim)?;
             let mut reply = plan.selected;
+            let may_land = if matches!(selection, LoadSelection::All) {
+                // One target at a time: a busy one is skipped and reported,
+                // never retired, and the others still go.
+                let mut may_land = Vec::new();
+                for (name, owner) in &plan.targets {
+                    let retired = if store.worker_has_unfinished_jobs(name) {
+                        Err(DaemonError::InvalidState(
+                            "a job on it has not finished (its cleanup is not verified)".into(),
+                        ))
+                    } else {
+                        Self::claim_retirement(store, vec![name.clone()]).and_then(|claim| {
+                            self.retire_claimed_named(
+                                store,
+                                &BTreeMap::from([(name.clone(), owner.clone())]),
+                                &claim,
+                            )
+                        })
+                    };
+                    match retired {
+                        Ok(names) => may_land.extend(names),
+                        Err(error) => reply.push(format!("{name}: skipped: {error}")),
+                    }
+                }
+                may_land
+            } else {
+                let claim = Self::claim_retirement(store, plan.targets.keys().cloned().collect())?;
+                self.retire_claimed_named(store, &plan.targets, &claim)?
+            };
             reply.extend(may_land.into_iter().filter(|vm| submitted.contains(vm)).map(|vm| {
                 format!("{vm}: nothing is listed under it yet; its VM create may still land, and a later reset removes it")
             }));
@@ -186,6 +220,7 @@ impl StockDaemonBackend {
     fn plan_reset(&self, selection: &LoadSelection) -> Result<ResetPlan, DaemonError> {
         let records = self.sbx.install_records();
         let registered = self.command_names();
+        let running = self.running_attempts();
         let mut plan = ResetPlan::default();
         let add_registered = |plan: &mut ResetPlan, command: &str| -> Result<(), DaemonError> {
             let workload = self
@@ -216,14 +251,22 @@ impl StockDaemonBackend {
                         add_registered(&mut plan, &command)?;
                         found = true;
                     }
+                    if let Some((other, _)) = running
+                        .iter()
+                        .find(|(other, owner)| *other == command || plan.keys.contains(owner))
+                    {
+                        return Err(DaemonError::InvalidState(format!(
+                            "`marsh kit install {other}` is still running{}; nothing was removed (`marsh stop --force` cancels it)",
+                            if *other == command {
+                                String::new()
+                            } else {
+                                format!(" on {command}'s Kit")
+                            }
+                        )));
+                    }
                     for (name, owner, record) in &records {
                         if record.command != command {
                             continue;
-                        }
-                        if self.install_running(&record.attempt) {
-                            return Err(DaemonError::InvalidState(format!(
-                                "`marsh kit install {command}` is still running; nothing was removed (`marsh stop --force` cancels it)"
-                            )));
                         }
                         plan.targets.insert(name.clone(), owner.clone());
                         plan.keys.insert(owner.clone());
@@ -245,16 +288,14 @@ impl StockDaemonBackend {
                         .iter()
                         .map(|(name, owner, _)| (name.clone(), owner.clone())),
                 );
-                // A running install holds its Kit lock until it publishes:
-                // its Kit is skipped, not waited for.
-                let running = records
+                // A running install holds its Kit lock until it publishes,
+                // and a live ephemeral-home session's VMs are its own: their
+                // Kits are skipped, not waited for.
+                let mut busy = running
                     .iter()
-                    .filter(|(_, _, record)| self.install_running(&record.attempt))
-                    .collect::<Vec<_>>();
-                let busy = running
-                    .iter()
-                    .map(|(_, owner, _)| owner.clone())
+                    .map(|(_, owner)| owner.clone())
                     .collect::<BTreeSet<_>>();
+                busy.extend(self.live_ephemeral_keys());
                 plan.targets.retain(|_, owner| !busy.contains(owner));
                 plan.keys.retain(|owner| !busy.contains(owner));
                 plan.keys.extend(plan.targets.values().cloned());
@@ -264,11 +305,8 @@ impl StockDaemonBackend {
                     ));
                 }
                 plan.selected = registered;
-                plan.selected.extend(running.iter().map(|(_, _, record)| {
-                    format!(
-                        "{}: its `marsh kit install` is still running; skipped",
-                        record.command
-                    )
+                plan.selected.extend(running.iter().map(|(command, _)| {
+                    format!("{command}: its `marsh kit install` is still running; skipped")
                 }));
             }
         }
@@ -1493,9 +1531,11 @@ mod tests {
 
     /// `removeUnowned` (`NoForeignRemoval`): a VM listed under an install's
     /// recorded name that is not the VM the map recorded (another UUID) is
-    /// never removed, by `reset NAME` or `reset all`; the reset refuses.
-    /// Fails when a reset removes a recorded name's VM without the UUID
-    /// check.
+    /// never removed. `reset NAME` refuses; `reset all` skips it, says so,
+    /// and still removes the other targets (Claude's review: one target it
+    /// cannot remove made the whole reset refuse after earlier ones were
+    /// removed). Fails when a reset removes a recorded name's VM without the
+    /// UUID check, or when `reset all` stops at the first target it skips.
     #[test]
     fn a_reset_never_removes_a_vm_the_map_did_not_record() {
         let lab = Lab::new();
@@ -1505,11 +1545,60 @@ mod tests {
         // A fresh listing adopts the VM's UUID; then another VM takes the name.
         lab.backend.sbx.stock_inventory(true).unwrap();
         lab.stock.replace(&vm);
+        // Another Kit's VM, owned and idle, sorted after it.
+        let other = lab
+            .backend
+            .sbx
+            .vm_name(marsh_sbx::VmPurpose::Kit, &reference('e'))
+            .unwrap();
+        lab.stock.seed(&other);
         let named = lab.reset(&["hf"]).unwrap_err().to_string();
         assert!(named.contains("not an owned"), "{named}");
-        lab.reset(&[]).unwrap_err();
-        assert_eq!(lab.stock.removed(), NONE);
+        let all = lab.reset(&[]).unwrap();
+        assert!(
+            all.iter()
+                .any(|line| line.starts_with(&format!("{vm}: skipped"))
+                    && line.contains("not an owned")),
+            "{all:?}"
+        );
+        assert_eq!(lab.stock.removed(), [other]);
         assert_eq!(lab.stock.listed(), [vm]);
+    }
+
+    /// Claude's review: `reset all` leaves a live ephemeral-home session's
+    /// Kit VM alone (closing the session removes it). Fails when `reset all`
+    /// targets it.
+    #[test]
+    fn reset_all_skips_a_live_ephemeral_sessions_kit_vm() {
+        let lab = Lab::new();
+        let key = format!("{}:ephemeral:session-1", reference('c'));
+        let vm = lab
+            .backend
+            .sbx
+            .vm_name(marsh_sbx::VmPurpose::Kit, &key)
+            .unwrap();
+        lab.stock.seed(&vm);
+        let spec = lab
+            .backend
+            .kit_spec_for_workload_named(
+                marsh_sbx::NativeKitRef::immutable_oci(reference('c')).unwrap(),
+                vm.clone(),
+            )
+            .unwrap();
+        lab.backend
+            .ephemeral_kits
+            .lock()
+            .unwrap()
+            .entry("session-1".into())
+            .or_default()
+            .insert(vm.clone(), spec);
+        lab.register("fixture", &reference('d'));
+        lab.reset(&[]).unwrap();
+        assert_eq!(lab.stock.listed(), [vm]);
+        // Once the session is gone, `reset all` removes it.
+        lab.backend.ephemeral_kits.lock().unwrap().clear();
+        lab.reset(&[]).unwrap();
+        assert_eq!(lab.stock.listed(), NONE);
     }
 
     /// The retry of a failed install succeeds, through a validation flight
@@ -1586,5 +1675,48 @@ mod tests {
         assert_eq!(lab.stock.created(), NONE);
         assert_eq!(lab.records(), NONE);
         assert_eq!(lab.backend.sbx.quarantined_vms().len(), 0);
+    }
+
+    /// Claude's review: `reset NAME` of a command whose Kit an install of
+    /// another command is preparing refuses at once instead of waiting out
+    /// the install's create (it would wait on the Kit lock), and so does a
+    /// reset of the installing command before its record is written (it is
+    /// running from before its Kit lock). Fails when only records count as
+    /// running.
+    #[test]
+    fn a_reset_of_a_kit_an_install_is_preparing_refuses_at_once() {
+        let lab = Lab::new();
+        lab.register("g", &reference('c'));
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        lab.stock.script(&[Create::FailedListed]);
+        lab.stock.before_create(move || {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let install = std::thread::spawn(move || {
+            backend
+                .install_command("hf".into(), reference('c'), Some(&store))
+                .unwrap_err()
+        });
+        entered.recv().unwrap();
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reset = std::thread::spawn(move || {
+            let reset = backend.reset_workers(&LoadSelection::Kits(vec!["g".into()]), store);
+            done_tx.send(()).unwrap();
+            reset
+        });
+        let finished = done.recv_timeout(Duration::from_secs(5));
+        release.send(()).unwrap();
+        let reset = reset.join().unwrap();
+        install.join().unwrap();
+        assert!(
+            finished.is_ok(),
+            "the reset waited for the install's create"
+        );
+        let refused = reset.unwrap_err().to_string();
+        assert!(refused.contains("still running on g's Kit"), "{refused}");
     }
 }

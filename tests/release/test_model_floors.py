@@ -82,6 +82,13 @@ class StateFloors(unittest.TestCase):
                 result = self.run_check("Pins.cfg 560\n", states=states)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
 
+    def test_a_module_glob_selects_its_configs_not_the_module(self):
+        shutil.copy(MODEL / "Pins_leak.cfg", self.model / "Pins_leak.cfg")
+        result = self.run_check("Pins.cfg 560\n", configs=("--list", "Pins*"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        listed = [line.split()[0] for line in result.stdout.splitlines() if "workers=" in line]
+        self.assertEqual(sorted(listed), ["Pins.cfg", "Pins_leak.cfg"], result.stdout)
+
     def test_the_cache_is_keyed_on_the_configs_own_floor(self):
         both = ("Ownership.cfg", "Pins.cfg")
         floors = "Ownership.cfg 50\nPins.cfg 560\n"

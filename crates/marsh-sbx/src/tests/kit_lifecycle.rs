@@ -232,8 +232,18 @@ fn reset_removes_only_the_exact_owned_kit_vm_and_releases_its_quarantine() {
     assert!(adapter.reset_kit_vm(&kit.spec).unwrap());
     assert_eq!(model.vm_names(), ["user-vm"]);
     assert_eq!(adapter.ownership.uuid(KIT), None);
-    // `marsh workers reset KIT` retires the quarantined VM; the Kit is usable.
-    assert!(adapter.ensure_kit_vm(&kit.spec).unwrap().cold_started);
+    // The retired name is never created under again (a VM landing under it
+    // would be nobody's) ...
+    assert!(matches!(
+        adapter.ensure_kit_vm(&kit.spec),
+        Err(SbxError::StaleVmName(name)) if name == KIT
+    ));
+    assert_eq!(model.count("create"), 1);
+    // ... `marsh workers reset KIT` retired the quarantined VM; the Kit is
+    // usable under the name the map gives it now.
+    let mut spec = kit.spec.clone();
+    spec.name = adapter.vm_name(VmPurpose::Kit, "kit-a").unwrap();
+    assert!(adapter.ensure_kit_vm(&spec).unwrap().cold_started);
 }
 
 #[test]

@@ -52,6 +52,7 @@ mod vm_ownership;
 pub use ephemeral_home::{EphemeralHomeLease, EphemeralHomeToken};
 pub use shell_template_reference::ShellTemplateReference;
 pub use stock_inventory::{StockInventory, StockInventoryVm};
+pub use vm_ownership::InstallRecord;
 use vm_ownership::{VmClass, VmOwnership};
 pub use vm_ownership::{VmPurpose, valid_vm_prefix, vm_prefix};
 mod capped_command;
@@ -2345,6 +2346,66 @@ impl StockSbx {
         self.check_shell_reset_admission(name).is_err()
     }
 
+    /// Persist a `marsh kit install` attempt's record under the live Kit VM
+    /// name it chose, before its create (`docs/model/KitInstall.tla`).
+    ///
+    /// # Errors
+    /// [`SbxError::StaleVmName`] when `name` is not an entry of the map; or
+    /// the map cannot be written.
+    pub fn begin_install_record(&self, name: &str, record: InstallRecord) -> Result<(), SbxError> {
+        self.ownership.begin_install(name, record)
+    }
+
+    /// End the install record `attempt` (its command was published).
+    ///
+    /// # Errors
+    /// Fails when the map cannot be written.
+    pub fn end_install_record(&self, attempt: &str) -> Result<bool, SbxError> {
+        self.ownership.end_install(attempt)
+    }
+
+    /// Every persisted install record as `(name, ownership key, record)`.
+    #[must_use]
+    pub fn install_records(&self) -> Vec<(String, String, InstallRecord)> {
+        self.ownership.install_records()
+    }
+
+    /// The ownership key of a VM name, also of one forgotten in this process.
+    #[must_use]
+    pub fn vm_ownership_key(&self, name: &str) -> Option<String> {
+        self.ownership.key_of(name)
+    }
+
+    /// Every live Kit entry of the map as `(name, ownership key)`: intents
+    /// and recorded VMs.
+    #[must_use]
+    pub fn live_kit_entries(&self) -> Vec<(String, String)> {
+        self.ownership.live_kit_entries()
+    }
+
+    /// Lift the quarantine of a Kit VM name under which nothing is listed (a
+    /// create that may still land). The intent stays, so a VM landing later
+    /// is adopted. Returns whether the name was absent.
+    ///
+    /// # Errors
+    /// Fails when stock SBX cannot list its VMs.
+    pub fn release_absent_quarantine(&self, name: &str) -> Result<bool, SbxError> {
+        validate_name(name)?;
+        let (vm_transition, _vm_cleanup) =
+            weak_rw_transition_lock(&self.grant_vm_transition_locks, name.to_owned());
+        let _vm_transition = vm_transition
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.classify_vm(name, true)? != VmClass::Absent {
+            return Ok(false);
+        }
+        self.quarantined_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
+        Ok(true)
+    }
+
     /// The recorded name of `(purpose, key)`, never assigning one.
     #[must_use]
     pub fn recorded_vm_name(&self, purpose: VmPurpose, key: &str) -> Option<String> {
@@ -2934,6 +2995,13 @@ impl StockSbx {
                 "{} (retired for good; the next call creates a new VM)",
                 spec.name
             )));
+        }
+        // A create is submitted only under a live entry of the map: a name
+        // retired since it was chosen would land as a VM nobody owns. A
+        // retirement forgets a name only under this fence's write side, so
+        // the check holds until this preparation's create is submitted.
+        if !self.ownership.is_live(&spec.name) {
+            return Err(SbxError::StaleVmName(spec.name.clone()));
         }
         regular_executable(&spec.worker_binary)?;
         regular_executable(&byte_exec_artifact(&spec.worker_binary))?;
@@ -9287,6 +9355,10 @@ pub enum SbxError {
     MissingCapability(&'static str),
     #[error("existing sandbox name is not an owned compatible kit VM: {0}")]
     ForeignVm(String),
+    /// A Kit VM name that is no longer an entry of the ownership map (it was
+    /// retired after it was chosen): nothing is created under it.
+    #[error("Kit VM name {0} is no longer in the VM ownership map; choose it again")]
+    StaleVmName(String),
     #[error("owned sandbox {vm} cannot be reused: {detail}")]
     IncompatibleVm { vm: String, detail: String },
     #[error(

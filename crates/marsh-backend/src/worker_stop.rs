@@ -18,7 +18,7 @@ use marsh_daemon::{
     DaemonError, DaemonStore, LoadSelection, WorkerHealth, WorkerStatus, WorkerStopEntry,
     WorkersStopReport,
 };
-use marsh_sbx::{KitVmSpec, KitVmStop};
+use marsh_sbx::{KitVmSpec, KitVmStop, NativeKitRef};
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -49,20 +49,24 @@ impl StockDaemonBackend {
                     .into(),
             ));
         }
-        // Resolve every name before stopping anything. Names that run the
-        // same Kit share one VM.
-        let mut vms = BTreeMap::<String, (KitVmSpec, Vec<String>)>::new();
+        // Resolve every Kit before stopping anything. Names that run the
+        // same Kit share one VM, whose name is read under its Kit lock.
+        let mut kits = BTreeMap::<String, (NativeKitRef, Vec<String>)>::new();
         for command in &selected {
-            let spec = self.kit_spec(command)?;
-            vms.entry(spec.name.clone())
-                .or_insert_with(|| (spec, Vec::new()))
+            let workload = self
+                .registered_kit(command)?
+                .workload
+                .capture_generation()
+                .map_err(backend_error)?;
+            kits.entry(workload.identity().to_owned())
+                .or_insert_with(|| (workload, Vec::new()))
                 .1
                 .push(command.clone());
         }
         Ok(WorkersStopReport {
-            entries: vms
+            entries: kits
                 .into_values()
-                .map(|(spec, kits)| self.stop_one_worker(store, &spec, &kits))
+                .map(|(workload, kits)| self.stop_one_worker(store, workload, &kits))
                 .collect(),
         })
     }
@@ -71,10 +75,32 @@ impl StockDaemonBackend {
     fn stop_one_worker(
         &self,
         store: &DaemonStore,
-        spec: &KitVmSpec,
+        workload: NativeKitRef,
         kits: &[String],
     ) -> WorkerStopEntry {
         let label = kits.join(",");
+        let failed = |vm: String, message: String| WorkerStopEntry {
+            kits: kits.to_vec(),
+            vm,
+            action: "failed".into(),
+            running_jobs: 0,
+            message,
+        };
+        // Under the Kit lock (`kit_lock_key`, as every path takes it) no
+        // preparation of this Kit runs, and the VM's name is read under it:
+        // the claim below then holds off every new job until the stop is done.
+        let lock = match self.kit_lock_for_key(workload.identity()) {
+            Ok(lock) => lock,
+            Err(error) => return failed(String::new(), format!("{label}: {error}")),
+        };
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let spec = match self.kit_spec_for_workload(workload) {
+            Ok(spec) => spec,
+            Err(error) => return failed(String::new(), format!("{label}: {error}")),
+        };
+        let spec = &spec;
         let entry = |action: &str, running_jobs: usize, message: String| WorkerStopEntry {
             kits: kits.to_vec(),
             vm: spec.name.clone(),
@@ -82,15 +108,6 @@ impl StockDaemonBackend {
             running_jobs,
             message,
         };
-        // Under the Kit lock no preparation of this Kit runs: the claim below
-        // then holds off every new job until the stop is done.
-        let lock = match self.kit_lock(spec) {
-            Ok(lock) => lock,
-            Err(error) => return entry("failed", 0, format!("{label}: {error}")),
-        };
-        let _guard = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let jobs = store.worker_job_count(&spec.name);
         if jobs > 0 {
             return entry(

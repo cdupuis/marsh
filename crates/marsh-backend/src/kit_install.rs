@@ -1719,4 +1719,24 @@ mod tests {
         let refused = reset.unwrap_err().to_string();
         assert!(refused.contains("still running on g's Kit"), "{refused}");
     }
+
+    /// Claude's review: `marsh workers stop` reads (or chooses) its Kit VM's
+    /// name under the Kit lock, as every other path does, not before it.
+    /// Fails when the name is chosen before the lock (a stop waiting on a
+    /// held lock has already put an intent in the map).
+    #[test]
+    fn workers_stop_reads_its_vm_name_under_the_kit_lock() {
+        let lab = Lab::new();
+        lab.register("c", &reference('c'));
+        let lock = lab.backend.kit_lock_for_key(&reference('c')).unwrap();
+        let held = lock.lock().unwrap();
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let stop = std::thread::spawn(move || {
+            backend.stop_workers(&LoadSelection::Kits(vec!["c".into()]), &store)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(lab.backend.sbx.live_kit_entries(), Vec::new());
+        drop(held);
+        stop.join().unwrap().unwrap();
+    }
 }

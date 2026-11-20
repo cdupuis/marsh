@@ -294,3 +294,9 @@ for kit in claude codex pi; do
   grep -q '^if \[ "${1:-}" = --acp \]; then$' "kits/marsh-$kit/marsh-entrypoint.sh"
 done
 grep -q '^INITIAL_AGENT_MODE=${INITIAL_AGENT_MODE:-agent-full-access}$' kits/marsh-codex/acp-entrypoint.sh
+
+# Codex validates mcp_servers.marsh when it loads the config: the ACP base
+# config names its transport, the same one the proxy adds to each session.
+grep -Fqx '  config["mcp_servers.marsh.command"] = "/run/marsh/bin/marsh";' kits/marsh-codex/acp-entrypoint.sh
+grep -Fqx '  config["mcp_servers.marsh.args"] = ["task-mcp"];' kits/marsh-codex/acp-entrypoint.sh
+grep -Fq 'name: "marsh", command: "/run/marsh/bin/marsh", args: ["task-mcp"]' kits/marsh-codex/mcp-gateway-proxy.mjs

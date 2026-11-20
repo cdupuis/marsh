@@ -1230,6 +1230,9 @@ pub struct StockSbx {
     installed_shell_artifacts: Mutex<BTreeMap<(String, String), String>>,
     shell_mount_references: Mutex<BTreeMap<(String, PathBuf, PathBuf), Arc<ShellMountReference>>>,
     ownership: VmOwnership,
+    /// Cancelled by `marsh stop --force` ([`Self::cancel_creates`]): every
+    /// Kit VM create in flight ends, and no new one is submitted.
+    create_cancel: marsh_runtime::Cancellation,
     shell_recovery_specs: Mutex<BTreeMap<String, ShellVmSpec>>,
     active_shell_sessions: Mutex<BTreeMap<String, Arc<AtomicUsize>>>,
     // Quarantine retains admitted directory handles and mount references until
@@ -1394,6 +1397,7 @@ impl StockSbx {
             installed_shell_artifacts: Mutex::new(BTreeMap::new()),
             shell_mount_references: Mutex::new(BTreeMap::new()),
             ownership: VmOwnership::in_memory(),
+            create_cancel: marsh_runtime::Cancellation::default(),
             shell_recovery_specs: Mutex::new(BTreeMap::new()),
             active_shell_sessions: Mutex::new(BTreeMap::new()),
             uncertain_shell_grants: Mutex::new(BTreeMap::new()),
@@ -5808,6 +5812,7 @@ impl StockSbx {
         // Never submit a create while the intent that authorizes cleaning up
         // after it may not be durable (a failed directory sync).
         self.ownership.confirm_durable()?;
+        self.refuse_create_when_stopping()?;
         self.ownership.invalidate();
         let outcome = (|| {
             let mut selected_home_environment = OsString::from("MARSH_SELECTED_HOME=");
@@ -5835,7 +5840,7 @@ impl StockSbx {
                     registry_kit_reference(spec.workload_kit.identity()),
                     spec.lifecycle_workspace.as_os_str().to_os_string(),
                 ]);
-                self.run_bounded_os("create kit VM", self.preparation_timeouts.create, arguments)
+                self.run_create("create kit VM", &self.invocation(arguments))
             };
             let output = self.create_withholding_clashing_skills(spec, create)?;
             Self::require_success("create kit VM", output)?;
@@ -5916,6 +5921,7 @@ impl StockSbx {
         // Never submit a create while the intent that authorizes cleaning up
         // after it may not be durable (a failed directory sync).
         self.ownership.confirm_durable()?;
+        self.refuse_create_when_stopping()?;
         self.ownership.invalidate();
         let outcome = (|| {
             let mut selected_home_environment = OsString::from("MARSH_SELECTED_HOME=");
@@ -5948,15 +5954,7 @@ impl StockSbx {
                         .environment
                         .push(("SBX_KIT_REBUILD".into(), "1".into()));
                 }
-                self.runner
-                    .run_bounded(&invocation, self.preparation_timeouts.create)
-                    .map_err(|error| {
-                        stock_call_error(
-                            error,
-                            "create local kit VM",
-                            self.preparation_timeouts.create,
-                        )
-                    })
+                self.run_create("create local kit VM", &invocation)
             };
             let output = self.create_withholding_clashing_skills(spec, create)?;
             Self::require_success("create local kit VM", output)?;
@@ -7665,6 +7663,36 @@ impl StockSbx {
         invocation
     }
 
+    /// A Kit VM `sbx create`, bounded by the create timeout and cancelled by
+    /// [`Self::cancel_creates`]. A cancelled create may still land: it fails
+    /// as `Io`, which quarantines its name as may-still-land and keeps its
+    /// intent (`docs/model/KitInstall.tla`, `StopBegin`).
+    fn run_create(
+        &self,
+        operation: &'static str,
+        invocation: &Invocation,
+    ) -> Result<CommandOutput, SbxError> {
+        let timeout = self.preparation_timeouts.create;
+        self.runner
+            .run_bounded_cancellable(invocation, timeout, &self.create_cancel)
+            .map_err(|error| stock_call_error(error, operation, timeout))
+    }
+
+    /// Refuse to submit a Kit VM create once `marsh stop --force` began.
+    fn refuse_create_when_stopping(&self) -> Result<(), SbxError> {
+        if self.create_cancel.is_cancelled() {
+            return Err(SbxError::Stopping);
+        }
+        Ok(())
+    }
+
+    /// `marsh stop --force`: end every Kit VM create in flight (its stock
+    /// process group is killed; the VM may still land, and its intent stays)
+    /// and submit no new one. For the rest of this daemon's life.
+    pub fn cancel_creates(&self) {
+        self.create_cancel.cancel();
+    }
+
     fn run_bounded_os<I, S>(
         &self,
         operation: &'static str,
@@ -9356,6 +9384,10 @@ pub enum SbxError {
     MissingCapability(&'static str),
     #[error("existing sandbox name is not an owned compatible kit VM: {0}")]
     ForeignVm(String),
+    /// `marsh stop --force` is stopping the daemon: no Kit VM create is
+    /// submitted.
+    #[error("marsh stop --force is stopping this daemon; no VM is created")]
+    Stopping,
     /// A Kit VM name that is no longer an entry of the ownership map (it was
     /// retired after it was chosen): nothing is created under it.
     #[error("Kit VM name {0} is no longer in the VM ownership map; choose it again")]

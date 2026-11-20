@@ -1729,6 +1729,66 @@ fn bounded_system_runner_timeout_reaps_leader_and_kills_group() {
     assert!(exits(descendant), "the descendant outlived the call");
 }
 
+/// `marsh stop --force` cancels a stock create in flight: the system runner's
+/// cancellable bounded call ends promptly once cancelled, long before its
+/// deadline, kills the command's process group and reaps the leader. A token
+/// cancelled before the call starts nothing.
+#[test]
+fn a_cancelled_bounded_call_kills_its_group_and_returns_at_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let pids = directory.path().join("pids");
+    let invocation = Invocation {
+        program: "/bin/sh".into(),
+        arguments: vec![
+            "-c".into(),
+            format!(
+                "sleep {DESCENDANT_LIFETIME_SECS} & echo $$ $! > {pids}.tmp; mv {pids}.tmp {pids}; sleep {DESCENDANT_LIFETIME_SECS}",
+                pids = pids.display()
+            )
+            .into(),
+        ],
+        working_directory: None,
+        environment: Vec::new(),
+    };
+    let cancel = Cancellation::default();
+    let canceller = cancel.clone();
+    let watched = pids.clone();
+    let trigger = thread::spawn(move || {
+        while !watched.exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        canceller.cancel();
+    });
+    let started = std::time::Instant::now();
+    let error = SystemCommandRunner::new("/tmp")
+        .run_bounded_cancellable(&invocation, Duration::from_mins(30), &cancel)
+        .unwrap_err();
+    trigger.join().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted, "{error}");
+    assert!(started.elapsed() < Duration::from_secs(15));
+    let text = fs::read_to_string(&pids).unwrap();
+    let mut ids = text.split_whitespace().map(|id| id.parse::<i32>().unwrap());
+    let (leader, descendant) = (ids.next().unwrap(), ids.next().unwrap());
+    assert!(reaped_and_gone(leader), "the leader was left unreaped");
+    assert!(
+        exits(descendant),
+        "the descendant outlived the cancelled call"
+    );
+
+    let never = directory.path().join("never");
+    let untouched = Invocation {
+        program: "/bin/sh".into(),
+        arguments: vec!["-c".into(), format!("touch {}", never.display()).into()],
+        working_directory: None,
+        environment: Vec::new(),
+    };
+    let error = SystemCommandRunner::new("/tmp")
+        .run_bounded_cancellable(&untouched, Duration::from_secs(30), &cancel)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    assert!(!never.exists(), "a cancelled token started the command");
+}
+
 /// Output beyond a pipe's buffer through both pipes is neither truncated nor
 /// deadlocked.
 #[test]

@@ -253,6 +253,19 @@ pub trait CommandRunner: Send + Sync {
     /// retains polling ownership and reports uncertainty.
     /// Long-lived attached jobs use [`Self::spawn_attached`] instead.
     fn run_bounded(&self, invocation: &Invocation, timeout: Duration) -> io::Result<CommandOutput>;
+    /// [`Self::run_bounded`] that also ends when `cancel` is cancelled: its
+    /// process group is signalled and the call fails with
+    /// `ConnectionAborted`. What the command started may still finish (a
+    /// stock create can land). Runners that cannot cancel run it bounded.
+    fn run_bounded_cancellable(
+        &self,
+        invocation: &Invocation,
+        timeout: Duration,
+        cancel: &Cancellation,
+    ) -> io::Result<CommandOutput> {
+        let _ = cancel;
+        self.run_bounded(invocation, timeout)
+    }
     fn spawn_attached(&self, invocation: &Invocation) -> io::Result<Attachment>;
     fn spawn_pty(&self, invocation: &Invocation) -> io::Result<Attachment> {
         self.spawn_attached(invocation)
@@ -984,6 +997,21 @@ impl CommandRunner for SystemCommandRunner {
 
     fn run_bounded(&self, invocation: &Invocation, timeout: Duration) -> io::Result<CommandOutput> {
         run_attachment_bounded(self.spawn_attached(invocation)?, timeout)
+    }
+
+    fn run_bounded_cancellable(
+        &self,
+        invocation: &Invocation,
+        timeout: Duration,
+        cancel: &Cancellation,
+    ) -> io::Result<CommandOutput> {
+        cancel.check()?;
+        run_attachment_interruptible(
+            self.spawn_attached(invocation)?,
+            Some(timeout),
+            cancel,
+            false,
+        )
     }
 
     fn spawn_attached(&self, invocation: &Invocation) -> io::Result<Attachment> {

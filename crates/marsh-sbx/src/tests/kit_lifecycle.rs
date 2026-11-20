@@ -1502,3 +1502,31 @@ fn closes_queued_for_a_stalled_worker_are_bounded() {
     assert!(queued() <= 1024, "{} closes queued", queued());
     input.release();
 }
+
+/// `marsh stop --force` (`KitInstall.tla` `StopBegin`): a Kit VM create in
+/// flight is cancelled at once; it may still land, so its name is
+/// quarantined as may-still-land and its intent kept; no other create is
+/// submitted afterwards. Fails when creates are not run cancellable.
+#[test]
+fn a_forced_stop_cancels_the_kit_create_in_flight_and_submits_no_other() {
+    let model = StockModel::new();
+    model.hold_creates_until_cancelled();
+    let adapter = Arc::new(model.adapter());
+    let kit = KitFixture::published(KIT);
+    let (creating, spec) = (Arc::clone(&adapter), kit.spec.clone());
+    let create = std::thread::spawn(move || creating.ensure_kit_vm(&spec));
+    model.wait_for_held_create();
+    adapter.cancel_creates();
+    let error = create.join().unwrap().unwrap_err();
+    assert!(matches!(error, SbxError::Io(_)), "{error}");
+    let quarantine = adapter.quarantined_vms()[KIT].clone();
+    assert!(quarantine.create_pending, "{quarantine:?}");
+    assert!(adapter.is_live_vm_name(KIT));
+
+    let other = KitFixture::local("marsh-kit-other");
+    assert!(matches!(
+        adapter.ensure_kit_vm(&other.spec),
+        Err(SbxError::Stopping)
+    ));
+    assert_eq!(model.count("create"), 1);
+}

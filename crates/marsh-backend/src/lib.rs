@@ -163,6 +163,9 @@ pub struct StockDaemonBackend {
     /// interleave another operation there).
     #[cfg(test)]
     reset_before_locks: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Called at named points of `install_command` (tests).
+    #[cfg(test)]
+    install_hook: Mutex<Option<InstallHook>>,
     /// Session-origin cloud placement (`docs/design/cloud-placement.md`).
     cloud: cloud::CloudPlacement,
     /// Automatic Kit updates; off unless [`Self::with_auto_update`].
@@ -505,6 +508,8 @@ impl StockDaemonBackend {
             running_installs: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             reset_before_locks: Mutex::new(None),
+            #[cfg(test)]
+            install_hook: Mutex::new(None),
             cloud: cloud::CloudPlacement::default(),
             auto_update: None,
             kit_updates: Mutex::new(()),
@@ -1248,18 +1253,15 @@ impl StockDaemonBackend {
         }
         let mut cold_boot = Some(cold_boot);
         let mut spec = spec.clone();
+        let mut observed = observed_validation;
         let mut chosen_again = false;
         loop {
             self.recover_then_choose(&mut spec, store, owner, install)?;
-            match self.prepare_flight(
-                &spec,
-                store,
-                ephemeral,
-                &mut cold_boot,
-                &key,
-                observed_validation,
-            ) {
+            match self.prepare_flight(&spec, store, ephemeral, &mut cold_boot, &key, observed) {
                 Err(_) if !chosen_again && !self.sbx.is_live_vm_name(&spec.name) => {
+                    // The failed flight is this caller's own: not a result
+                    // to share with its second choice.
+                    observed = self.observed_validation(owner)?;
                     chosen_again = true;
                 }
                 outcome => return outcome,
@@ -1570,6 +1572,10 @@ enum Replace {
 }
 
 /// Never quarantine, foreign ownership, or work in progress.
+/// A test's probe at a named point of `install_command`.
+#[cfg(test)]
+type InstallHook = Box<dyn Fn(&str) + Send + Sync>;
+
 /// Lock every Kit lock of [`StockDaemonBackend::kit_locks_in_order`].
 fn lock_in_order(locks: &[Arc<Mutex<()>>]) -> Vec<std::sync::MutexGuard<'_, ()>> {
     locks
@@ -5655,6 +5661,8 @@ impl StockDaemonBackend {
         let owner = workload.identity().to_owned();
         let kit_lock = store.map(|_| self.kit_lock_for_key(&owner)).transpose()?;
         let observed_validation = self.observed_validation(&owner)?;
+        #[cfg(test)]
+        self.install_hook_at("observed");
         let _kit = kit_lock.as_ref().map(|lock| {
             lock.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5690,6 +5698,8 @@ impl StockDaemonBackend {
             sources.insert(command.clone(), tag);
             kit_lifecycle::write_sources(&self.config.control_home, &sources)?;
         }
+        #[cfg(test)]
+        self.install_hook_at("publish");
         self.removed_commands
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5702,6 +5712,18 @@ impl StockDaemonBackend {
             attempt.published()?;
         }
         Ok(reference)
+    }
+
+    #[cfg(test)]
+    fn install_hook_at(&self, point: &str) {
+        if let Some(hook) = self
+            .install_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(point);
+        }
     }
 
     /// Packaged commands that an automatic update moved to a published image

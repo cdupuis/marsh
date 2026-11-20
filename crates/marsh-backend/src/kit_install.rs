@@ -292,8 +292,10 @@ mod tests {
         created: Mutex<Vec<String>>,
         removed: Mutex<Vec<String>>,
         before_create: Mutex<Option<Hook>>,
+        before_list: Mutex<Option<Hook>>,
         next_id: AtomicU64,
         hanging: std::sync::atomic::AtomicBool,
+        stopped: Mutex<std::collections::BTreeSet<String>>,
     }
 
     #[allow(clippy::unnecessary_wraps)] // A stock call's reply.
@@ -316,6 +318,11 @@ mod tests {
             *self.before_create.lock().unwrap() = Some(Box::new(hook));
         }
 
+        /// Run `hook` at the start of the next `sbx ls`.
+        pub(super) fn before_list(&self, hook: impl FnOnce() + Send + 'static) {
+            *self.before_list.lock().unwrap() = Some(Box::new(hook));
+        }
+
         fn land(&self, name: &str) {
             let id = self
                 .next_id
@@ -335,6 +342,17 @@ mod tests {
 
         /// A VM appears under `name` (one the daemon's map names).
         pub(super) fn seed(&self, name: &str) {
+            self.land(name);
+        }
+
+        /// Someone else's VM replaces the one listed under `name` (a new id).
+        pub(super) fn replace(&self, name: &str) {
+            self.land(name);
+        }
+
+        /// A stopped VM appears under `name`.
+        pub(super) fn seed_stopped(&self, name: &str) {
+            self.stopped.lock().unwrap().insert(name.to_owned());
             self.land(name);
         }
 
@@ -364,13 +382,22 @@ mod tests {
                 .collect::<Vec<_>>();
             match arguments.first().map(String::as_str) {
                 Some("ls") => {
+                    let hook = self.before_list.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
                     let rows = self
                         .vms
                         .lock()
                         .unwrap()
                         .iter()
                         .map(|(name, id)| {
-                            format!(r#"{{"name":"{name}","id":"{id}","status":"running"}}"#)
+                            let status = if self.stopped.lock().unwrap().contains(name) {
+                                "stopped"
+                            } else {
+                                "running"
+                            };
+                            format!(r#"{{"name":"{name}","id":"{id}","status":"{status}"}}"#)
                         })
                         .collect::<Vec<_>>()
                         .join(",");
@@ -1035,5 +1062,164 @@ mod tests {
         lab.reset(&["hf"]).unwrap();
         assert_eq!(lab.stock.listed(), NONE);
         assert_eq!(lab.records(), NONE);
+    }
+
+    /// Rule 2 (`InstPublish`): an install holds its Kit lock from its
+    /// decision until its command is registered, so no recovery, GC or reset
+    /// of the Kit acts between the VM's preparation and the registry write;
+    /// then its record ends. (The VM here is a validation flight that
+    /// completed while the install waited for the lock, whose Ready VM it
+    /// shares.) Fails when the lock is released before the registration.
+    #[test]
+    fn an_install_holds_its_kit_lock_until_its_command_is_registered() {
+        let lab = Lab::new();
+        let owner = reference('c');
+        let name = lab
+            .backend
+            .sbx
+            .vm_name(marsh_sbx::VmPurpose::Kit, &owner)
+            .unwrap();
+        let key = lab.backend.kit_lock_key(&owner).unwrap();
+        let lock = lab.backend.kit_lock_for_key(&owner).unwrap();
+        let held = lock.lock().unwrap();
+        let (observed_tx, observed) = std::sync::mpsc::channel();
+        let observed_tx = Mutex::new(observed_tx);
+        let locked_at_publish = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen, publish_lock) = (Arc::clone(&locked_at_publish), Arc::clone(&lock));
+        *lab.backend.install_hook.lock().unwrap() = Some(Box::new(move |point| match point {
+            "observed" => observed_tx.lock().unwrap().send(()).unwrap(),
+            "publish" => seen.store(
+                publish_lock.try_lock().is_err(),
+                std::sync::atomic::Ordering::SeqCst,
+            ),
+            _ => {}
+        }));
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let install = std::thread::spawn(move || {
+            backend.install_command("hf".into(), reference('c'), Some(&store))
+        });
+        observed.recv().unwrap();
+        let spec = lab
+            .backend
+            .kit_spec_for_workload_named(
+                marsh_sbx::NativeKitRef::immutable_oci(owner.clone()).unwrap(),
+                name.clone(),
+            )
+            .unwrap();
+        lab.backend.ready_kits.lock().unwrap().insert(
+            key.clone(),
+            marsh_sbx::ReadyKitVm {
+                name: name.clone(),
+                kit_ref: owner.clone(),
+                lifecycle_workspace: spec.lifecycle_workspace.clone(),
+                cold_started: false,
+                job_image: spec.workload_kit.workload_image().unwrap().clone(),
+                worker_binary: spec.worker_binary.clone(),
+            },
+        );
+        lab.backend.kit_validation_flights.lock().unwrap().insert(
+            key,
+            crate::KitFlightCompletion {
+                epoch: 1,
+                error: None,
+            },
+        );
+        drop(held);
+        install.join().unwrap().unwrap();
+        assert!(
+            locked_at_publish.load(std::sync::atomic::Ordering::SeqCst),
+            "the Kit lock was free before the command was registered"
+        );
+        assert_eq!(lab.records(), NONE, "the published attempt's record ended");
+        assert!(lab.backend.command_names().contains(&"hf".to_owned()));
+        assert_eq!(lab.stock.created(), NONE);
+    }
+
+    /// `Gc` under the lock: VM garbage collection takes the Kit lock of the
+    /// VM's ownership key whether or not a command names its Kit (here a
+    /// superseded Kit's stopped VM), so it cannot act inside a preparation's
+    /// window. Fails when GC locks only a current Kit's VM.
+    #[test]
+    fn garbage_collection_of_a_superseded_kit_vm_waits_for_its_kit_lock() {
+        let lab = Lab::new();
+        let owner = reference('e');
+        let vm = lab
+            .backend
+            .sbx
+            .vm_name(marsh_sbx::VmPurpose::Kit, &owner)
+            .unwrap();
+        lab.stock.seed_stopped(&vm);
+        let lock = lab.backend.kit_lock_for_key(&owner).unwrap();
+        let held = lock.lock().unwrap();
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let gc = std::thread::spawn(move || backend.gc_vms(false, &store));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            lab.stock.listed(),
+            std::slice::from_ref(&vm),
+            "collected under a held Kit lock"
+        );
+        drop(held);
+        let report = gc.join().unwrap().unwrap();
+        assert_eq!(lab.stock.removed(), [vm], "{report:?}");
+    }
+
+    /// Rule 4 (the create-time check, with `revalidateOnly_pass`'s unlocked
+    /// retirement): the Kit's VM is retired by a path that does not take the
+    /// Kit lock between the install's choice of its name and its create. The
+    /// create is refused under the retired name; the install chooses again,
+    /// re-points its record and creates under the new name, which stays
+    /// owned and reachable. Fails without the check (the VM is foreign) or
+    /// without the second choice (the install fails, creating nothing).
+    #[test]
+    fn a_name_retired_before_the_create_is_chosen_again_and_the_record_follows() {
+        let lab = Lab::new();
+        let owner = reference('c');
+        let old = lab
+            .backend
+            .sbx
+            .vm_name(marsh_sbx::VmPurpose::Kit, &owner)
+            .unwrap();
+        lab.stock.seed(&old);
+        lab.stock.script(&[Create::FailedListed]);
+        let (sbx, retired, key) = (lab.backend.sbx.clone(), old.clone(), owner.clone());
+        lab.stock.before_list(move || {
+            sbx.retire_kit_vm_named_before(
+                &retired,
+                &key,
+                std::time::Instant::now() + Duration::from_secs(30),
+                None,
+            )
+            .unwrap();
+        });
+        let error = lab.install("hf", &owner).unwrap_err();
+        let created = lab.stock.created();
+        assert_eq!(created.len(), 1, "{created:?} {error}");
+        assert_ne!(created[0], old);
+        lab.assert_every_vm_owned();
+        assert_eq!(lab.records(), [format!("{} hf", created[0])]);
+        lab.reset(&["hf"]).unwrap();
+        assert_eq!(lab.stock.listed(), NONE);
+    }
+
+    /// `removeUnowned` (`NoForeignRemoval`): a VM listed under an install's
+    /// recorded name that is not the VM the map recorded (another UUID) is
+    /// never removed, by `reset NAME` or `reset all`; the reset refuses.
+    /// Fails when a reset removes a recorded name's VM without the UUID
+    /// check.
+    #[test]
+    fn a_reset_never_removes_a_vm_the_map_did_not_record() {
+        let lab = Lab::new();
+        lab.stock.script(&[Create::FailedListed]);
+        lab.install("hf", &reference('c')).unwrap_err();
+        let vm = lab.stock.created()[0].clone();
+        // A fresh listing adopts the VM's UUID; then another VM takes the name.
+        lab.backend.sbx.stock_inventory(true).unwrap();
+        lab.stock.replace(&vm);
+        let named = lab.reset(&["hf"]).unwrap_err().to_string();
+        assert!(named.contains("not an owned"), "{named}");
+        lab.reset(&[]).unwrap_err();
+        assert_eq!(lab.stock.removed(), NONE);
+        assert_eq!(lab.stock.listed(), [vm]);
     }
 }

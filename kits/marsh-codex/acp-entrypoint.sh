@@ -113,6 +113,11 @@ if (process.argv[2] === "1") {
   // `agents.enabled`: both features are off too.
   config["features.multi_agent"] = false;
   config["features.multi_agent_v2"] = false;
+  // Codex 0.171 validates a server entry when it loads the config, before the
+  // session adds its servers: the entry must name its transport, so it
+  // carries the same command the proxy adds to each session.
+  config["mcp_servers.marsh.command"] = "/run/marsh/bin/marsh";
+  config["mcp_servers.marsh.args"] = ["task-mcp"];
   config["mcp_servers.marsh.tool_timeout_sec"] = 86400;
   // marsh'"'"'s own three task tools never ask for approval, whatever mode
   // the ACP client switches a session to; the proxy keeps the name `marsh`

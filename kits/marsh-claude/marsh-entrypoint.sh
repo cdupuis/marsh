@@ -25,27 +25,75 @@ export HOME=$selected
 # the Kit VM's image-declared home, which a job does not mount. So ask the
 # proxy: it answers the profile endpoint for the access-token sentinel
 # (claude.yaml, oauth.sentinels.accessToken) only when it holds that login.
-# A caller's own token or key and a selected home's own login are left alone,
-# and without the stock proxy there is nothing to ask.
+# Without the stock proxy there is nothing to ask.
+#
+# The job's own credential always wins over a login sbx holds, so the proxy
+# is not asked and no token is set when the job has any of: a key, token,
+# profile or provider in its environment; a saved login in Claude's config
+# directory; or a helper or such a variable in its user or project settings.
+# A custom endpoint (ANTHROPIC_BASE_URL) counts too: the placeholder works
+# only through the proxy, toward api.anthropic.com.
 claude_oauth_sentinel=sk-ant-oat01-proxy-managed
 anthropic_mode=${SBX_CRED_ANTHROPIC_MODE:-none}
-if [ "$anthropic_mode" = none ] && [ -n "${HTTPS_PROXY:-}" ] &&
-   [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ] &&
-   [ ! -e "$HOME/.claude/.credentials.json" ]; then
+if [ "$anthropic_mode" = oauth ] ||
+   { [ "$anthropic_mode" = none ] && [ -n "${HTTPS_PROXY:-}" ]; }; then
   # MARSH_* is reserved: a user shell can never forward this test override.
-  if node -e '
-      const [url, token] = process.argv.slice(1);
-      fetch(url, {headers: {authorization: `Bearer ${token}`},
-                  signal: AbortSignal.timeout(3000)})
-        .then(response => process.exit(response.status === 200 ? 0 : 1),
-              () => process.exit(1));
-    ' "${MARSH_TEST_CLAUDE_OAUTH_PROBE:-https://api.anthropic.com/api/oauth/profile}" \
-      "$claude_oauth_sentinel" 2>/dev/null; then
-    anthropic_mode=oauth
-  fi
+  anthropic_mode=$(node - "$anthropic_mode" \
+    "${MARSH_TEST_CLAUDE_OAUTH_PROBE:-https://api.anthropic.com/api/oauth/profile}" \
+    "$claude_oauth_sentinel" <<'NODE'
+const fs = require("node:fs");
+const nodePath = require("node:path");
+const [mode, url, sentinel] = process.argv.slice(2);
+const own = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+  "ANTHROPIC_PROFILE", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"];
+const configDir = process.env.CLAUDE_CONFIG_DIR ||
+  nodePath.join(process.env.HOME, ".claude");
+const settings = file => {
+  try {
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    return value !== null && typeof value === "object" ? value : {};
+  } catch (_) {
+    return {};
+  }
+};
+// "echo proxy-managed" is the helper this entrypoint writes for an API key.
+const hasOwn = own.some(name => process.env[name]) ||
+  fs.existsSync(nodePath.join(configDir, ".credentials.json")) ||
+  [nodePath.join(configDir, "settings.json"), ".claude/settings.json",
+   ".claude/settings.local.json"].map(settings).some(value =>
+    (value.apiKeyHelper !== undefined && value.apiKeyHelper !== "echo proxy-managed") ||
+    own.some(name => value.env?.[name]));
+const busy = status => status === 429 || status >= 500;
+// Only a direct 200 counts. A busy proxy is asked once more; all of it within
+// three seconds. Without an answer, say so: sbx may hold a login after all.
+const held = async () => {
+  if (hasOwn) return false;
+  if (mode === "oauth") return true;
+  const signal = AbortSignal.timeout(3000);
+  const ask = () => fetch(url, {headers: {authorization: `Bearer ${sentinel}`},
+                                redirect: "manual", signal}).then(response => response.status);
+  let status;
+  try {
+    status = await ask();
+    if (busy(status)) {
+      await require("node:timers/promises").setTimeout(500, undefined, {signal});
+      status = await ask();
+    }
+  } catch (_) {
+    status = "no answer";
+  }
+  if (status === "no answer" || busy(status)) {
+    console.error(`claude kit: could not confirm a claude.ai login held by Docker Sandboxes (${status}); this job starts signed out`);
+  }
+  return status === 200;
+};
+held().then(login => process.stdout.write(login ? "oauth" : "none", () => process.exit(0)));
+NODE
+  ) || anthropic_mode=none
 fi
 # The proxy replaces this placeholder with the Mac's login; nothing is written
-# to the selected home, so a later change of the binding leaves no stale state.
+# to the selected home.
 if [ "$anthropic_mode" = oauth ]; then
   export CLAUDE_CODE_OAUTH_TOKEN=$claude_oauth_sentinel
 fi
@@ -308,9 +356,13 @@ if (settings.skipDangerousModePermissionPrompt === undefined) {
 }
 // Use one proxy-managed auth path. Keep a different user-owned helper intact.
 // A claude.ai login travels as CLAUDE_CODE_OAUTH_TOKEN instead: a helper would
-// make Claude Code present the subscription as an API key.
+// make Claude Code present the subscription as an API key, and it outranks
+// that token. So the helper an API key binding wrote goes with the binding.
 if (credentialMode === "apikey" && settings.apiKeyHelper === undefined) {
   settings.apiKeyHelper = "echo proxy-managed";
+  settingsChanged = true;
+} else if (credentialMode !== "apikey" && settings.apiKeyHelper === "echo proxy-managed") {
+  delete settings.apiKeyHelper;
   settingsChanged = true;
 }
 if (settingsChanged) {

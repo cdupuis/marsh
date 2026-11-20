@@ -8,6 +8,13 @@ trap '[ -z "$probe_pid" ] || kill "$probe_pid" 2>/dev/null || :; rm -rf "$root"'
 # HTTPS_PROXY is set. Cases that test it name a local stand-in; no other case
 # may reach a real proxy from the machine running this test.
 unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy NODE_USE_ENV_PROXY
+# Nor may a credential, endpoint or binding of the machine running this test.
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN \
+  ANTHROPIC_PROFILE ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_ORGANIZATION_ID \
+  ANTHROPIC_BASE_URL CLAUDE_CONFIG_DIR CLAUDE_CODE_USE_BEDROCK \
+  CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY OPENAI_API_KEY \
+  SBX_CRED_ANTHROPIC_MODE SBX_CRED_OPENAI_MODE MCP_GATEWAY_URL \
+  MCP_SENTINEL_TOKEN_NAME MARSH_TEST_CLAUDE_OAUTH_PROBE
 bin="$root/bin"
 mkdir -p "$bin"
 
@@ -244,16 +251,42 @@ node -e '
 # Docker Sandboxes reports a claude.ai login as mode none. The entrypoint then
 # asks the proxy, here a stand-in that answers 200 only for the access-token
 # sentinel, and passes the placeholder as CLAUDE_CODE_OAUTH_TOKEN. Nothing is
-# written to the selected home: no helper and no credentials file.
+# written to the selected home: no helper and no credentials file. The
+# stand-in logs every request with the case that made it, so a case can show
+# that the proxy was not asked.
+probe_log="$root/probe.log"
+: >"$probe_log"
+# shellcheck disable=SC2016 # JavaScript, not shell
 node -e '
+  const fs = require("node:fs");
+  const [portFile, log] = process.argv.slice(1);
+  let busy = 0, slow = 0;
   const server = require("node:http").createServer((request, response) => {
-    const held = request.url === "/held" &&
-      request.headers.authorization === "Bearer sk-ant-oat01-proxy-managed";
-    response.writeHead(held ? 200 : 401).end();
+    fs.appendFileSync(log, `${request.method} ${request.url}\n`);
+    const held = request.headers.authorization === "Bearer sk-ant-oat01-proxy-managed";
+    switch (new URL(request.url, "http://stand-in").pathname) {
+      case "/held": response.writeHead(held ? 200 : 401).end(); break;
+      case "/redirect": response.writeHead(302, {location: "/held"}).end(); break;
+      case "/busy": response.writeHead(503).end(); break;
+      case "/busy-once": response.writeHead(!held ? 401 : busy++ ? 200 : 429).end(); break;
+      // Never answers; the connection closes long after the probe gives up.
+      case "/hang": setTimeout(() => request.socket.destroy(), 8000); break;
+      // Busy, slowly, then never answers: the retry stays within the bound.
+      case "/slow-busy":
+        if (slow++) setTimeout(() => request.socket.destroy(), 8000);
+        else setTimeout(() => response.writeHead(503).end(), 2000);
+        break;
+      default: response.writeHead(401).end();
+    }
+  });
+  // As the HTTPS proxy, record where the probe asks to go and refuse it.
+  server.on("connect", (request, socket) => {
+    fs.appendFileSync(log, `CONNECT ${request.url}\n`);
+    socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
   });
   server.listen(0, "127.0.0.1", () =>
-    require("node:fs").writeFileSync(process.argv[1], String(server.address().port)));
-' "$root/probe-port.tmp" &
+    fs.writeFileSync(portFile, String(server.address().port)));
+' "$root/probe-port.tmp" "$probe_log" &
 probe_pid=$!
 probe_wait=0
 until [ -s "$root/probe-port.tmp" ]; do
@@ -262,41 +295,194 @@ until [ -s "$root/probe-port.tmp" ]; do
   sleep 0.05
 done
 probe="http://127.0.0.1:$(cat "$root/probe-port.tmp")"
+claude_entry="$PWD/kits/marsh-claude/marsh-entrypoint.sh"
+# Each case starts from an empty environment, so a credential of the machine
+# running this test never reaches it, and runs in a project of its own.
 run_claude_probe() {
   name=$1; path=$2; shift 2
-  mkdir -p "$root/$name-home" "$root/$name-capture"
-  env PATH="$bin:$PATH" \
-    MARSH_TEST_CAPTURE="$root/$name-capture" \
-    MARSH_SELECTED_HOME="$root/$name-home" \
-    SBX_CRED_ANTHROPIC_MODE=none \
-    HTTPS_PROXY=http://127.0.0.1:9 \
-    MARSH_TEST_CLAUDE_OAUTH_PROBE="$probe$path" \
-    "$@" sh kits/marsh-claude/marsh-entrypoint.sh --version
+  mkdir -p "$root/$name-home" "$root/$name-capture" "$root/$name-project"
+  (
+    cd "$root/$name-project"
+    env -i PATH="$bin:$PATH" TMPDIR="${TMPDIR:-/tmp}" \
+      MARSH_TEST_CAPTURE="$root/$name-capture" \
+      MARSH_SELECTED_HOME="$root/$name-home" \
+      SBX_CRED_ANTHROPIC_MODE=none \
+      HTTPS_PROXY=http://127.0.0.1:9 \
+      MARSH_TEST_CLAUDE_OAUTH_PROBE="$probe$path?case=$name" \
+      "$@" sh "$claude_entry" --version 2>"$root/$name.err"
+  )
+}
+asked() {
+  grep -c "?case=$1\$" "$probe_log" || :
+}
+oauth_token() {
+  cat "$root/$1-capture/claude-oauth-token"
 }
 run_claude_probe claude-oauth /held
-test "$(cat "$root/claude-oauth-capture/claude-oauth-token")" = sk-ant-oat01-proxy-managed
+test "$(oauth_token claude-oauth)" = sk-ant-oat01-proxy-managed
 test -z "$(cat "$root/claude-oauth-capture/anthropic-key")"
 test ! -e "$root/claude-oauth-home/.claude/.credentials.json"
 node -e '
   if (Object.hasOwn(require(process.argv[1]), "apiKeyHelper")) process.exit(1);
 ' "$root/claude-oauth-home/.claude/settings.json"
+test ! -s "$root/claude-oauth.err"
 
 # A proxy that holds no login leaves the job signed out, so /login still works.
+# Only a direct 200 counts: a redirect that ends in one does not.
 run_claude_probe claude-unbound /none
-test -z "$(cat "$root/claude-unbound-capture/claude-oauth-token")"
+test -z "$(oauth_token claude-unbound)"
+test ! -s "$root/claude-unbound.err"
+run_claude_probe claude-redirect /redirect
+test -z "$(oauth_token claude-redirect)"
+test "$(asked claude-redirect)" = 1
 
-# The selected home's own login, and a caller's own key, are never overridden
-# and the proxy is not asked.
-mkdir -p "$root/claude-login-home/.claude"
+# A busy proxy is asked once more. If it is still busy, the job starts signed
+# out and says why; a proxy that never answers releases the launch within the
+# bound.
+run_claude_probe claude-busy-once /busy-once
+test "$(oauth_token claude-busy-once)" = sk-ant-oat01-proxy-managed
+test "$(asked claude-busy-once)" = 2
+run_claude_probe claude-busy /busy
+test -z "$(oauth_token claude-busy)"
+test "$(asked claude-busy)" = 2
+grep -Fq 'could not confirm' "$root/claude-busy.err"
+for stall in hang slow-busy; do
+  probe_start=$(date +%s)
+  run_claude_probe "claude-$stall" "/$stall"
+  test $(($(date +%s) - probe_start)) -le 4
+  test -z "$(oauth_token "claude-$stall")"
+  grep -Fq 'could not confirm' "$root/claude-$stall.err"
+done
+test "$(asked claude-slow-busy)" = 2
+
+# The probe goes to the Anthropic API through the proxy and nowhere else. This
+# needs a Node that honours NODE_USE_ENV_PROXY, as the Kit image's does; check
+# with a name that cannot resolve, so an older Node reaches nothing.
+env -i PATH="$PATH" HTTP_PROXY="$probe" NODE_USE_ENV_PROXY=1 node -e '
+  fetch("http://marsh-proxy-check.invalid/").catch(() => {});
+' 2>/dev/null || :
+if grep -Fqx 'GET http://marsh-proxy-check.invalid/' "$probe_log"; then
+  mkdir -p "$root/claude-route-home" "$root/claude-route-capture"
+  env -i PATH="$bin:$PATH" TMPDIR="${TMPDIR:-/tmp}" \
+    MARSH_TEST_CAPTURE="$root/claude-route-capture" \
+    MARSH_SELECTED_HOME="$root/claude-route-home" \
+    SBX_CRED_ANTHROPIC_MODE=none HTTPS_PROXY="$probe" NODE_USE_ENV_PROXY=1 \
+    sh "$claude_entry" --version 2>/dev/null
+  test "$(grep '^CONNECT ' "$probe_log")" = 'CONNECT api.anthropic.com:443'
+  test -z "$(oauth_token claude-route)"
+else
+  echo "selected-home: skipped the probe route case: this Node ignores NODE_USE_ENV_PROXY" >&2
+fi
+
+# Without the stock proxy there is nothing to ask.
+mkdir -p "$root/claude-noproxy-home" "$root/claude-noproxy-capture"
+env -i PATH="$bin:$PATH" TMPDIR="${TMPDIR:-/tmp}" \
+  MARSH_TEST_CAPTURE="$root/claude-noproxy-capture" \
+  MARSH_SELECTED_HOME="$root/claude-noproxy-home" SBX_CRED_ANTHROPIC_MODE=none \
+  MARSH_TEST_CLAUDE_OAUTH_PROBE="$probe/held?case=claude-noproxy" \
+  sh "$claude_entry" --version
+test -z "$(oauth_token claude-noproxy)"
+test "$(asked claude-noproxy)" = 0
+
+# The job's own credential or endpoint always wins over the login sbx holds:
+# the proxy is not asked, and the caller's value reaches Claude unchanged.
+for variable in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN \
+    ANTHROPIC_PROFILE ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_BASE_URL \
+    CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY; do
+  run_claude_probe "claude-own-$variable" /held "$variable=caller-value"
+  test "$(asked "claude-own-$variable")" = 0
+  if [ "$variable" = CLAUDE_CODE_OAUTH_TOKEN ]; then
+    test "$(oauth_token "claude-own-$variable")" = caller-value
+  else
+    test -z "$(oauth_token "claude-own-$variable")"
+  fi
+done
+test "$(cat "$root/claude-own-ANTHROPIC_API_KEY-capture/anthropic-key")" = caller-value
+# A saved login, in the selected home or in CLAUDE_CONFIG_DIR.
+mkdir -p "$root/claude-login-home/.claude" "$root/claude-config-dir"
 printf '%s\n' '{"claudeAiOauth":{}}' >"$root/claude-login-home/.claude/.credentials.json"
+printf '%s\n' '{"claudeAiOauth":{}}' >"$root/claude-config-dir/.credentials.json"
 run_claude_probe claude-login /held
-test -z "$(cat "$root/claude-login-capture/claude-oauth-token")"
-run_claude_probe claude-key /held ANTHROPIC_API_KEY=caller-key
-test -z "$(cat "$root/claude-key-capture/claude-oauth-token")"
-test "$(cat "$root/claude-key-capture/anthropic-key")" = caller-key
+run_claude_probe claude-config-dir /held CLAUDE_CONFIG_DIR="$root/claude-config-dir"
+# A helper of the user's own, or a credential or endpoint in a settings env,
+# in the user's or the project's settings.
+mkdir -p "$root/claude-helper-home/.claude" "$root/claude-settings-env-home/.claude" \
+  "$root/claude-project-helper-project/.claude"
+printf '%s\n' '{"apiKeyHelper":"my-vault-helper"}' \
+  >"$root/claude-helper-home/.claude/settings.json"
+printf '%s\n' '{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example"}}' \
+  >"$root/claude-settings-env-home/.claude/settings.json"
+printf '%s\n' '{"apiKeyHelper":"my-vault-helper"}' \
+  >"$root/claude-project-helper-project/.claude/settings.local.json"
+run_claude_probe claude-helper /held
+run_claude_probe claude-settings-env /held
+run_claude_probe claude-project-helper /held
+for own in login config-dir helper settings-env project-helper; do
+  test "$(asked "claude-$own")" = 0
+  test -z "$(oauth_token "claude-$own")"
+done
+node -e '
+  if (require(process.argv[1]).apiKeyHelper !== "my-vault-helper") process.exit(1);
+' "$root/claude-helper-home/.claude/settings.json"
+
+# A mode of oauth takes the token path without asking, and also leaves a
+# caller's own token alone.
+run_claude_probe claude-mode-oauth /held SBX_CRED_ANTHROPIC_MODE=oauth
+test "$(oauth_token claude-mode-oauth)" = sk-ant-oat01-proxy-managed
+test "$(asked claude-mode-oauth)" = 0
+run_claude_probe claude-mode-oauth-own /held SBX_CRED_ANTHROPIC_MODE=oauth \
+  CLAUDE_CODE_OAUTH_TOKEN=caller-token
+test "$(oauth_token claude-mode-oauth-own)" = caller-token
+run_claude_probe claude-mode-oauth-key /held SBX_CRED_ANTHROPIC_MODE=oauth \
+  ANTHROPIC_API_KEY=caller-key
+test -z "$(oauth_token claude-mode-oauth-key)"
+test "$(cat "$root/claude-mode-oauth-key-capture/anthropic-key")" = caller-key
+
+# ACP mode passes the login the same way, never as an API key.
+real_node=$(command -v node)
+mkdir -p "$root/acp-bin"
+cat >"$root/acp-bin/node" <<NODE
+#!/bin/sh
+if [ "\${1:-}" = /opt/marsh/claude-acp/mcp-gateway-proxy.mjs ]; then
+  printf '%s\n' "\${ANTHROPIC_API_KEY:-}" >"\$MARSH_TEST_CAPTURE/anthropic-key"
+  printf '%s\n' "\${CLAUDE_CODE_OAUTH_TOKEN:-}" >"\$MARSH_TEST_CAPTURE/claude-oauth-token"
+  exit 0
+fi
+exec "$real_node" "\$@"
+NODE
+chmod 755 "$root/acp-bin/node"
+mkdir -p "$root/claude-acp-home" "$root/claude-acp-capture"
+env -i PATH="$root/acp-bin:$bin:$PATH" TMPDIR="${TMPDIR:-/tmp}" \
+  MARSH_TEST_CAPTURE="$root/claude-acp-capture" \
+  MARSH_SELECTED_HOME="$root/claude-acp-home" SBX_CRED_ANTHROPIC_MODE=none \
+  HTTPS_PROXY=http://127.0.0.1:9 \
+  MARSH_TEST_CLAUDE_OAUTH_PROBE="$probe/held?case=claude-acp" \
+  sh "$claude_entry" --acp 2>"$root/claude-acp.err"
+test "$(oauth_token claude-acp)" = sk-ant-oat01-proxy-managed
+test -z "$(cat "$root/claude-acp-capture/anthropic-key")"
+grep -Fqx 'marsh-auth-mode=oauth' "$root/claude-acp.err"
 
 # An API key binding keeps the helper and never the OAuth placeholder.
 test -z "$(cat "$root/claude-capture/claude-oauth-token")"
+
+# A selected home keeps no stale state when the binding changes: the helper an
+# API key binding wrote goes once the binding is a login, or nothing.
+run_claude_probe claude-switch /held SBX_CRED_ANTHROPIC_MODE=apikey
+node -e '
+  if (require(process.argv[1]).apiKeyHelper !== "echo proxy-managed") process.exit(1);
+' "$root/claude-switch-home/.claude/settings.json"
+run_claude_probe claude-switch /held
+test "$(oauth_token claude-switch)" = sk-ant-oat01-proxy-managed
+node -e '
+  const settings = require(process.argv[1]);
+  if (Object.hasOwn(settings, "apiKeyHelper") || settings.themeId !== 1) process.exit(1);
+' "$root/claude-switch-home/.claude/settings.json"
+run_claude_probe claude-switch /held SBX_CRED_ANTHROPIC_MODE=apikey
+run_claude_probe claude-switch /none
+test -z "$(oauth_token claude-switch)"
+node -e '
+  if (Object.hasOwn(require(process.argv[1]), "apiKeyHelper")) process.exit(1);
+' "$root/claude-switch-home/.claude/settings.json"
 kill "$probe_pid" 2>/dev/null || :
 probe_pid=
 

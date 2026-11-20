@@ -110,11 +110,30 @@ state, never raw keys.
 
 Docker Sandboxes reports `SBX_CRED_ANTHROPIC_MODE` as `apikey` or `none`. A
 Mac whose only Anthropic credential is a claude.ai login shows as `none`, so
-the Claude entrypoint asks the proxy: with no key, token or saved login of its
-own, it requests `api.anthropic.com/api/oauth/profile` with the access-token
-sentinel, and a 200 means the proxy holds a login. The job then runs with that
-sentinel in `CLAUDE_CODE_OAUTH_TOKEN`. Nothing is written to the selected home.
-The request adds about 0.3 seconds to a launch in that case only.
+the Claude entrypoint asks the proxy: it requests
+`api.anthropic.com/api/oauth/profile` through the proxy with the access-token
+sentinel, and only a direct 200 (not a redirect) means the proxy holds a login.
+The job then runs with that sentinel in `CLAUDE_CODE_OAUTH_TOKEN`. A busy
+answer (429 or 5xx) is asked once more. If there is still no clear answer, the
+job starts signed out and prints one line on stderr saying so. Nothing is
+written to the selected home, and an `apiKeyHelper` that an earlier API key
+binding wrote there (`echo proxy-managed`) is removed. A helper of any other
+value is left alone. The request adds about 0.3 seconds to a launch in that case
+only, and at most 3 seconds if the proxy does not answer.
+
+The job's own credential always wins over a login that `sbx` holds. If the job
+has any of these, the proxy is not asked and the token is not set, also when
+the mode is `oauth`:
+
+- `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `ANTHROPIC_PROFILE` or `ANTHROPIC_FEDERATION_RULE_ID`;
+- a cloud provider (`CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY`);
+- a custom endpoint, `ANTHROPIC_BASE_URL`, since the sentinel works only
+  through the proxy, toward `api.anthropic.com`;
+- a saved login, `.credentials.json` in `${CLAUDE_CONFIG_DIR:-$HOME/.claude}`;
+- an `apiKeyHelper` of its own, or one of these variables in the `env` of
+  the user settings in that directory, or of the project's
+  `.claude/settings.json` or `.claude/settings.local.json`.
 
 Claude's old outer-only block volumes were removed. Selected-home persistence
 is the single state mechanism for nested jobs, avoiding hidden state that the

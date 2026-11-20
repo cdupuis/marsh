@@ -37,6 +37,13 @@
 (* uses and releases it in one step; the install keeps its lock across    *)
 (* steps but waits for nothing; reset and the switch take two and have a   *)
 (* wait state, so TLC sees every wait-for cycle (NoDeadlock).              *)
+(*                                                                         *)
+(* Review round 1 of the code: a reset's listing is a step of its own (a   *)
+(* VM may land, and a concurrent listing adopt it, before the reset acts:  *)
+(* staleAbsence); an ephemeral-home session's Kit VM, keyed by the session *)
+(* (Kit "e"), noted before the lock and closed with the session            *)
+(* (ephStaleName); a two-step background Kit pass that lifecycle admission *)
+(* and the forced stop's drain must cover (bgUnadmitted).                  *)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS NN,            \* number of VM names (1..NN)
@@ -45,19 +52,19 @@ CONSTANTS NN,            \* number of VM names (1..NN)
           MaxLate,       \* creates that time out or fail and land later
           FailedMayLand, \* a create stock reported failed may still land
           InstallKits,   \* the Kits an attempt may install H from
-          Actors,        \* which of "job", "sw", "rcv", "gc", "td", "stop", "restart" act
+          Actors,        \* which of "job", "sw", "rcv", "gc", "td", "stop", "restart", "eph", "bg" act
           Bug
 
 None == "none"
-Kits == {"a", "b"}
-KitOrder == <<"a", "b">>        \* the lock key order
+Kits == {"a", "b", "e"}         \* "e": an ephemeral-home session's key (`IDENTITY:ephemeral:SESSION`)
+KitOrder == <<"a", "b", "e">>   \* the lock key order
 H == "h"                         \* the command `marsh kit install` installs
 C == "c"                         \* a registered command (switched by Switch)
 Cmds == {C, H}
 NameIds == 1..NN
 NameSeq == [j \in 1..NN |-> j]
 Att == 1..MaxAttempts
-Procs == {"inst", "job", "rst", "sw"}
+Procs == {"inst", "job", "rst", "sw", "eph", "bg"}
 Live == "live"
 Active == {"running", "settled"}
 
@@ -66,10 +73,10 @@ Bugs == {"none", "lateLandingLost", "oldAttemptErasesNew", "recoveryKeepsRecord"
          "switchAbba", "removeUnowned", "recoveryNoLock", "resetIgnoresRecords",
          "forgetFailedIntent", "restartLosesUncertainty", "recordsInMemory",
          "forceStopForgetsIntents", "resetNoop", "resetNoLock", "noReplan",
-         "switchKeepsRecord", "narrowResetAll",
+         "switchKeepsRecord", "narrowResetAll", "staleAbsence", "ephStaleName", "bgUnadmitted",
          "lockOnly", "revalidateOnly"}    \* the last two are positive: one safeguard each
 ASSUME Bug \in Bugs /\ InstallKits \subseteq Kits
-ASSUME Actors \subseteq {"job", "sw", "rcv", "gc", "td", "stop", "restart"}
+ASSUME Actors \subseteq {"job", "sw", "rcv", "gc", "td", "stop", "restart", "eph", "bg"}
 
 (* Each control is a deviation of the reviewed code (or a tempting fix)   *)
 (* set against the clean design; one that needs two names both (README).  *)
@@ -98,6 +105,12 @@ StopForgets    == Bug = "forceStopForgetsIntents"                    \* the forc
 ResetNoop      == Bug = "resetNoop"                                  \* a reset that is not refused removes nothing
 SwitchKeepsRec == Bug = "switchKeepsRecord"                          \* the switch retires the old VM, keeps its records
 NarrowAll      == Bug = "narrowResetAll"                             \* reset all = commands' VMs + records + quarantined
+StaleAbsence   == Bug = "staleAbsence"                               \* reset forgets a name its (older) listing found
+                                                                    \* empty, though a newer listing adopted a VM there
+EphStaleName   == Bug = "ephStaleName"                               \* session close removes only the name noted
+                                                                    \* before the Kit lock (`ephemeral_kits`)
+BgUnadmitted   == Bug = "bgUnadmitted"                               \* a background Kit pass is not admitted: it starts
+                                                                    \* during a forced stop, which does not drain it
 
 VARIABLES
   st,        \* [NameIds -> "free" | "live" | "retired"] ownership map (persisted)
@@ -114,20 +127,27 @@ VARIABLES
   iAtt, iK, iN,          \* install: current attempt, its Kit, its name
   jK, jN, jRuns,         \* job (jobPathStaleName: decided before the lock)
   rMode, rL, rT, rHad, rRuns, \* reset: mode, locks still to take, snapshot targets, snapshot had a record
+  rSeen,     \* reset: the targets its listing found listed (RstObserve)
   sFrom, sTo, sL, sRuns, \* switch
+  eN, eState, eRuns,     \* ephemeral session: the name noted before the lock, off/open/closed, preparations
+  bN,                    \* background pass: the quarantined name it works on
   tdRuns, stopping, stops, restarts, lates,
   bad,       \* ghost: a VM was removed although the map did not prove it the daemon's
-  rstBad     \* ghost: a reset that was not refused left a target listed under a live name
+  rstBad,    \* ghost: a reset that was not refused left a target listed under a live name
+  ephLeft,   \* ghost: a closed session left a VM of its key listed
+  tdBad      \* ghost: a teardown ran while a process held a Kit lock
 
 vars == <<st, kit, stock, inflight, mk, unsure, quar, rec, reg, owner, pc, iAtt, iK, iN,
-          jK, jN, jRuns, rMode, rL, rT, rHad, rRuns, sFrom, sTo, sL, sRuns, tdRuns,
-          stopping, stops, restarts, lates, bad, rstBad>>
+          jK, jN, jRuns, rMode, rL, rT, rHad, rRuns, rSeen, sFrom, sTo, sL, sRuns, tdRuns,
+          stopping, stops, restarts, lates, bad, rstBad, eN, eState, eRuns, bN, ephLeft, tdBad>>
 world == <<st, kit, stock, inflight, mk, unsure, quar, rec, bad>>
 iVars == <<iAtt, iK, iN>>
 jVars == <<jK, jN, jRuns>>
-rVars == <<rMode, rL, rT, rHad, rRuns>>
+rVars == <<rMode, rL, rT, rHad, rRuns, rSeen>>
 sVars == <<sFrom, sTo, sL, sRuns>>
 eVars == <<tdRuns, stopping, stops, restarts, lates, rstBad>>
+xVars == <<eN, eState, eRuns, ephLeft>>
+bVars == <<bN, tdBad>>
 
 NoRec == [st |-> "none", vm |-> 0]
 
@@ -141,6 +161,7 @@ TypeOK ==
   /\ reg \in [Cmds -> Kits \cup {None}]
   /\ owner \in [Kits -> Procs \cup {None}]
   /\ bad \in BOOLEAN /\ rstBad \in BOOLEAN /\ stopping \in BOOLEAN
+  /\ ephLeft \in BOOLEAN /\ tdBad \in BOOLEAN /\ eState \in {"off", "open", "closed"}
 
 Init ==
   /\ st = [n \in NameIds |-> "free"] /\ kit = [n \in NameIds |-> None]
@@ -156,6 +177,7 @@ Init ==
   /\ sFrom = "a" /\ sTo = "a" /\ sL = <<>> /\ sRuns = 0
   /\ tdRuns = 0 /\ stopping = FALSE /\ stops = 0 /\ restarts = 0 /\ lates = 0
   /\ bad = FALSE /\ rstBad = FALSE
+  /\ rSeen = {} /\ eN = 0 /\ eState = "off" /\ eRuns = 0 /\ bN = 0 /\ ephLeft = FALSE /\ tdBad = FALSE
 
 ---------------------------------------------------------------------------
 (* The daemon's state as a record, so that one step can compose effects.  *)
@@ -259,7 +281,7 @@ InstDecideEarly ==
        /\ iK' = k /\ iN' = a.n
   /\ iAtt' = iAtt + 1
   /\ pc' = [pc EXCEPT !["inst"] = "wait"]
-  /\ UNCHANGED <<reg, owner, jVars, rVars, sVars, eVars>>
+  /\ UNCHANGED <<reg, owner, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 InstPrep ==
   /\ ~stopping
@@ -278,7 +300,7 @@ InstPrep ==
           /\ owner' = [owner EXCEPT ![k] = "inst"]
           /\ iAtt' = i /\ iK' = k /\ iN' = n
   /\ pc' = [pc EXCEPT !["inst"] = "create"]
-  /\ UNCHANGED <<reg, jVars, rVars, sVars, eVars>>
+  /\ UNCHANGED <<reg, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 \* Ends the install without its lock (and, for "wait", holding none).
 InstEnd(W) == /\ SetW(Settle(W, iAtt)) /\ Release("inst") /\ pc' = [pc EXCEPT !["inst"] = "idle"]
@@ -300,7 +322,7 @@ InstSubmit ==
            ELSE IF Wr.inflight[n] THEN InstEnd(FailedW(Wr, n))      \* A2: refused, a definite failure
            ELSE /\ SetW([Wr EXCEPT !.inflight[n] = TRUE, !.mk[n] = i])
                 /\ pc' = [pc EXCEPT !["inst"] = "flight"] /\ UNCHANGED owner
-  /\ UNCHANGED <<reg, iAtt, iK, jVars, rVars, sVars, eVars>>
+  /\ UNCHANGED <<reg, iAtt, iK, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 \* The reply of the submitted create. Its create may have landed meanwhile
 \* (inflight is then FALSE), and the VM may even be gone again: a reply
@@ -326,21 +348,25 @@ InstReply ==
              [] o = "failNoVm" -> InstEnd(FailedW([W0 EXCEPT !.inflight[n] = FALSE], n))
              [] o = "failLands" -> InstEnd(FailedW(W0, n))
              [] o = "timeout" -> InstEnd(TimedOutW(W0, n))
-  /\ UNCHANGED <<reg, iVars, jVars, rVars, sVars, tdRuns, stopping, stops, restarts, rstBad>>
+  /\ UNCHANGED <<reg, iVars, jVars, rVars, sVars, tdRuns, stopping, stops, restarts, rstBad, xVars, bVars>>
 
+\* Publication ends the attempt's record and every other record of H on the
+\* same name: the registered command now reaches that VM (`published`).
 InstPublish ==
   /\ pc["inst"] = "publish" /\ ~stopping
-  /\ SetW([W0 EXCEPT !.rec[iAtt].st = "ended"])
+  /\ SetW(EndRecs([W0 EXCEPT !.rec[iAtt].st = "ended"], {iN}, Active))
   /\ reg' = [reg EXCEPT ![H] = iK]
   /\ Release("inst")
   /\ pc' = [pc EXCEPT !["inst"] = "idle"]
-  /\ UNCHANGED <<iVars, jVars, rVars, sVars, eVars>>
+  /\ UNCHANGED <<iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 \* A forced stop: before the submit, before the publication, or waiting.
+\* An attempt stopped before its submit created nothing: its record ends
+\* (a create of an earlier attempt under the name keeps that one's record).
 InstAbort ==
   /\ stopping /\ pc["inst"] \in {"wait", "create", "publish"}
-  /\ InstEnd(W0)
-  /\ UNCHANGED <<reg, iVars, jVars, rVars, sVars, eVars>>
+  /\ InstEnd(IF pc["inst"] = "create" THEN [W0 EXCEPT !.rec[iAtt].st = "ended"] ELSE W0)
+  /\ UNCHANGED <<reg, iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 ---------------------------------------------------------------------------
 (* A job of the registered command C prepares its Kit's VM (the job path: *)
@@ -352,7 +378,7 @@ JobDecideEarly ==    \* jobPathStaleName: the name before the lock and the recov
        /\ a.n # 0 /\ SetW(a.w) /\ jK' = reg[C] /\ jN' = a.n
   /\ jRuns' = jRuns + 1
   /\ pc' = [pc EXCEPT !["job"] = "wait"]
-  /\ UNCHANGED <<reg, owner, iVars, rVars, sVars, eVars>>
+  /\ UNCHANGED <<reg, owner, iVars, rVars, sVars, eVars, xVars, bVars>>
 
 JobRun ==
   /\ Acts("job")
@@ -370,12 +396,12 @@ JobRun ==
           IN /\ n0 # 0 /\ a.n # 0 /\ SetW(res.w) /\ Late(res.made)
   /\ jRuns' = IF JobEarly THEN jRuns ELSE jRuns + 1
   /\ pc' = [pc EXCEPT !["job"] = "idle"]
-  /\ UNCHANGED <<reg, owner, iVars, jK, jN, rVars, sVars, tdRuns, stopping, stops, restarts, rstBad>>
+  /\ UNCHANGED <<reg, owner, iVars, jK, jN, rVars, sVars, tdRuns, stopping, stops, restarts, rstBad, xVars, bVars>>
 
 JobAbort ==
   /\ stopping /\ pc["job"] = "wait"
   /\ pc' = [pc EXCEPT !["job"] = "idle"]
-  /\ UNCHANGED <<world, reg, owner, iVars, jVars, rVars, sVars, eVars>>
+  /\ UNCHANGED <<world, reg, owner, iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 ---------------------------------------------------------------------------
 (* `marsh workers reset NAME|all`. Clean: from the state, the Kits it may *)
@@ -420,14 +446,14 @@ RstStart ==
        /\ rHad' = (ForgetByName /\ T \cap RecVMs # {})
        /\ rL' = IF ResetNoLock THEN <<>> ELSE IF PerVmLocks THEN PerVm(T) ELSE SortKits(NeedKits(m))
   /\ pc' = [pc EXCEPT !["rst"] = "lock"]
-  /\ UNCHANGED <<world, reg, owner, iVars, jVars, rRuns, sVars, eVars>>
+  /\ UNCHANGED <<world, reg, owner, iVars, jVars, rRuns, rSeen, sVars, eVars, xVars, bVars>>
 
 RstLock ==
   /\ pc["rst"] = "lock" /\ rL # <<>>
   /\ owner[Head(rL)] = None          \* a Mutex is not reentrant: held by rst itself, it waits forever
   /\ owner' = [owner EXCEPT ![Head(rL)] = "rst"]
   /\ rL' = Tail(rL)
-  /\ UNCHANGED <<world, reg, pc, iVars, jVars, rMode, rT, rHad, rRuns, sVars, eVars>>
+  /\ UNCHANGED <<world, reg, pc, iVars, jVars, rMode, rT, rHad, rRuns, rSeen, sVars, eVars, xVars, bVars>>
 
 Planned == ResetSnapshot \/ PerVmLocks \/ ResetNoLock \/ NoReplan
 
@@ -436,16 +462,32 @@ RstReplan ==
   /\ ~(NeedKits(rMode) \subseteq Held("rst"))
   /\ Release("rst")
   /\ rL' = SortKits(NeedKits(rMode))
-  /\ UNCHANGED <<world, reg, pc, iVars, jVars, rMode, rT, rHad, rRuns, sVars, eVars>>
+  /\ UNCHANGED <<world, reg, pc, iVars, jVars, rMode, rT, rHad, rRuns, rSeen, sVars, eVars, xVars, bVars>>
 
-RstAct ==
+\* The reset's fresh listing, under its locks: which targets are listed. A
+\* VM may land after it, and a listing by someone else (GC, status, a
+\* recovery: none takes this Kit's lock) adopt it, before the reset acts.
+RstObserve ==
   /\ pc["rst"] = "lock" /\ rL = <<>>
   /\ Planned \/ NeedKits(rMode) \subseteq Held("rst")
+  /\ rSeen' = {t \in NameIds : stock[t]}
+  /\ pc' = [pc EXCEPT !["rst"] = "act"]
+  /\ UNCHANGED <<world, reg, owner, iVars, jVars, rMode, rL, rT, rHad, rRuns, sVars, eVars, xVars, bVars>>
+
+\* Acting on that listing: a target it found listed is removed (by its
+\* recorded UUID); one it found empty keeps its intent and records, even
+\* if a VM is listed there now (staleAbsence: the code forgot such a name,
+\* adopted meanwhile, as if its absence had been observed after the adoption).
+RstAct ==
+  /\ pc["rst"] = "act"
   /\ LET T0 == IF ResetSnapshot \/ PerVmLocks THEN rT ELSE Targets(rMode)
          busy == ~ResetSnapshot /\ ~NoRunSkip /\ rMode = "name" /\ RunVMs # {}
          T == IF rMode = "all" /\ ~ResetSnapshot /\ ~NoRunSkip THEN T0 \ RunVMs ELSE T0
-         Rm == {t \in T : stock[t] /\ (st[t] = Live \/ RemoveUnowned)}
-         W1 == RemoveW(W0, Rm, {"settled"})
+         Rm == {t \in T : t \in rSeen /\ stock[t] /\ (st[t] = Live \/ RemoveUnowned)}
+         Stale == IF StaleAbsence THEN {t \in T : t \notin rSeen /\ stock[t] /\ st[t] = Live} ELSE {}
+         W1s == RemoveW(W0, Rm, {"settled"})
+         W1 == EndRecs([W1s EXCEPT !.st = [n \in NameIds |-> IF n \in Stale THEN "retired" ELSE W1s.st[n]]],
+                       Stale, Active)
          W2 == [W1 EXCEPT !.quar = W1.quar \ T]
          Gone == {t \in T : W2.st[t] # Live}
          W3 == IF rHad THEN [W2 EXCEPT !.rec = [i \in Att |-> IF W2.rec[i].st \in Active
@@ -455,11 +497,11 @@ RstAct ==
          W4 == IF ResetNoop THEN W0 ELSE W3
      IN IF busy \/ Refuses(T) THEN UNCHANGED <<world, rstBad>>
         ELSE /\ SetW(W4)
-             /\ rstBad' = (rstBad \/ \E t \in T : W4.stock[t] /\ W4.st[t] = Live)
+             /\ rstBad' = (rstBad \/ \E t \in T \cap rSeen : W4.stock[t] /\ W4.st[t] = Live)
   /\ Release("rst")
   /\ rRuns' = rRuns + 1
   /\ pc' = [pc EXCEPT !["rst"] = "idle"]
-  /\ UNCHANGED <<reg, iVars, jVars, rMode, rL, rT, rHad, sVars, tdRuns, stopping, stops, restarts, lates>>
+  /\ UNCHANGED <<reg, iVars, jVars, rMode, rL, rT, rHad, rSeen, sVars, tdRuns, stopping, stops, restarts, lates, xVars, bVars>>
 
 ---------------------------------------------------------------------------
 (* A Kit switch of C (update, install/uninstall, move to shipped Kits):   *)
@@ -474,14 +516,14 @@ SwStart ==
   /\ sFrom' = reg[C] /\ sTo' = Other(reg[C])
   /\ sL' = IF Abba THEN <<reg[C], Other(reg[C])>> ELSE SortKits({reg[C], Other(reg[C])})
   /\ pc' = [pc EXCEPT !["sw"] = "lock"]
-  /\ UNCHANGED <<world, reg, owner, iVars, jVars, rVars, sRuns, eVars>>
+  /\ UNCHANGED <<world, reg, owner, iVars, jVars, rVars, sRuns, eVars, xVars, bVars>>
 
 SwLock ==
   /\ pc["sw"] = "lock" /\ sL # <<>>
   /\ owner[Head(sL)] = None
   /\ owner' = [owner EXCEPT ![Head(sL)] = "sw"]
   /\ sL' = Tail(sL)
-  /\ UNCHANGED <<world, reg, pc, iVars, jVars, rVars, sFrom, sTo, sRuns, eVars>>
+  /\ UNCHANGED <<world, reg, pc, iVars, jVars, rVars, sFrom, sTo, sRuns, eVars, xVars, bVars>>
 
 SwAct ==
   /\ pc["sw"] = "lock" /\ sL = <<>>
@@ -498,7 +540,7 @@ SwAct ==
   /\ Release("sw")
   /\ sRuns' = sRuns + 1
   /\ pc' = [pc EXCEPT !["sw"] = "idle"]
-  /\ UNCHANGED <<iVars, jVars, rVars, sFrom, sTo, sL, tdRuns, stopping, stops, restarts, rstBad>>
+  /\ UNCHANGED <<iVars, jVars, rVars, sFrom, sTo, sL, tdRuns, stopping, stops, restarts, rstBad, xVars, bVars>>
 
 ---------------------------------------------------------------------------
 (* Single-step actors and the environment.                                 *)
@@ -510,7 +552,7 @@ RecoverBg ==
   /\ \E n \in quar :
        /\ owner[kit[n]] = None \/ (RecoveryNoLock /\ ~\E c \in Cmds : reg[c] = kit[n])
        /\ SetW(Recovery(W0, n))
-  /\ UNCHANGED <<reg, owner, pc, iVars, jVars, rVars, sVars, eVars>>
+  /\ UNCHANGED <<reg, owner, pc, iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 \* VM garbage collection: a recorded, unquarantined VM, under its Kit lock
 \* (more permissive than the code, which keeps running VMs: safety only).
@@ -519,7 +561,7 @@ Gc ==
   /\ \E n \in NameIds :
        /\ st[n] = Live /\ stock[n] /\ n \notin quar /\ owner[kit[n]] = None
        /\ SetW(RemoveW(W0, {n}, Active))
-  /\ UNCHANGED <<reg, owner, pc, iVars, jVars, rVars, sVars, eVars>>
+  /\ UNCHANGED <<reg, owner, pc, iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 \* Remove every VM listed under a live name; intents stay (a VM that lands
 \* later is adopted and owned).
@@ -536,7 +578,8 @@ Teardown ==
   /\ Acts("td") /\ tdRuns < MaxTeardowns /\ Quiescent
   /\ SetW(TeardownW(W0))
   /\ tdRuns' = tdRuns + 1
-  /\ UNCHANGED <<reg, owner, pc, iVars, jVars, rVars, sVars, stopping, stops, restarts, lates, rstBad>>
+  /\ tdBad' = (tdBad \/ \E k \in Kits : owner[k] # None)
+  /\ UNCHANGED <<reg, owner, pc, iVars, jVars, rVars, sVars, stopping, stops, restarts, lates, rstBad, xVars, bN>>
 
 \* A daemon restart's effect: every process ends and every lock is free; the
 \* quarantine and uncertainty marks (in memory) are lost; the ownership map,
@@ -557,7 +600,7 @@ Restart ==
   /\ "restart" \in Actors /\ restarts < MaxRestarts
   /\ RestartVars(W0)
   /\ restarts' = restarts + 1 /\ stopping' = FALSE
-  /\ UNCHANGED <<reg, iVars, jVars, rMode, rT, rHad, rRuns, sFrom, sTo, sRuns, tdRuns, stops, lates, rstBad>>
+  /\ UNCHANGED <<reg, iVars, jVars, rMode, rT, rHad, rRuns, rSeen, sFrom, sTo, sRuns, tdRuns, stops, lates, rstBad, xVars, bVars>>
 
 \* `marsh stop --force`: admission closes (no new request, background pass
 \* or install; plain `marsh stop`/`reset` stay refused while one runs); the
@@ -565,14 +608,17 @@ Restart ==
 StopBegin ==
   /\ Acts("stop") /\ stops < MaxStops
   /\ stopping' = TRUE /\ stops' = stops + 1
-  /\ UNCHANGED <<world, reg, owner, pc, iVars, jVars, rVars, sVars, tdRuns, restarts, lates, rstBad>>
+  /\ UNCHANGED <<world, reg, owner, pc, iVars, jVars, rVars, sVars, tdRuns, restarts, lates, rstBad, xVars, bVars>>
 
 \* Every request has drained: teardown, then the daemon ends (restart).
+\* bgUnadmitted: the drain counts requests only, not the background pass.
 StopEnd ==
-  /\ stopping /\ Quiescent
+  /\ stopping
+  /\ IF BgUnadmitted THEN \A p \in Procs \ {"bg"} : pc[p] = "idle" ELSE Quiescent
   /\ RestartVars(TeardownW(W0))
   /\ stopping' = FALSE
-  /\ UNCHANGED <<reg, iVars, jVars, rMode, rT, rHad, rRuns, sFrom, sTo, sRuns, tdRuns, stops, restarts, lates, rstBad>>
+  /\ tdBad' = (tdBad \/ \E k \in Kits : owner[k] # None)
+  /\ UNCHANGED <<reg, iVars, jVars, rMode, rT, rHad, rRuns, rSeen, sFrom, sTo, sRuns, tdRuns, stops, restarts, lates, rstBad, xVars, bN>>
 
 \* A forced stop whose requests do not drain within its bound gives up:
 \* admission opens again, the requests go on, nothing is torn down (the code
@@ -580,7 +626,61 @@ StopEnd ==
 StopGiveUp ==
   /\ stopping /\ ~Quiescent
   /\ stopping' = FALSE
-  /\ UNCHANGED <<world, reg, owner, pc, iVars, jVars, rVars, sVars, tdRuns, stops, restarts, lates, rstBad>>
+  /\ UNCHANGED <<world, reg, owner, pc, iVars, jVars, rVars, sVars, tdRuns, stops, restarts, lates, rstBad, xVars, bVars>>
+
+---------------------------------------------------------------------------
+(* An ephemeral-home session's Kit VM (key "e"): the session notes a name  *)
+(* before the Kit lock (`kit_spec_for_session`); its preparations recover *)
+(* and choose under the lock, as a job does, so the VM may get another    *)
+(* name; closing the session removes, under the lock, every VM its key   *)
+(* owns (ephStaleName: only the noted name).                               *)
+
+EphOpen ==
+  /\ Acts("eph") /\ eState = "off"
+  /\ LET a == AssignW(W0, "e") IN /\ a.n # 0 /\ SetW(a.w) /\ eN' = a.n
+  /\ eState' = "open"
+  /\ UNCHANGED <<reg, owner, pc, iVars, jVars, rVars, sVars, eVars, eRuns, ephLeft, bVars>>
+
+EphRun ==
+  /\ Acts("eph") /\ eState = "open" /\ eRuns < MaxJobs /\ owner["e"] = None
+  /\ \E ok \in BOOLEAN, o \in Outs :
+       LET W1 == RecoverCur(W0, "e", ok)
+           a == AssignW(W1, "e")
+           res == Create(a.w, a.n, 0, o)
+       IN /\ a.n # 0 /\ SetW(res.w) /\ Late(res.made)
+  /\ eRuns' = eRuns + 1
+  /\ UNCHANGED <<reg, owner, pc, iVars, jVars, rVars, sVars, tdRuns, stopping, stops, restarts, rstBad,
+                 eN, eState, ephLeft, bVars>>
+
+EphClose ==
+  /\ Acts("eph") /\ eState = "open" /\ owner["e"] = None
+  /\ LET S == IF EphStaleName THEN {eN} ELSE {n \in NameIds : st[n] = Live /\ kit[n] = "e"}
+         W1 == RemoveW(W0, {n \in S : stock[n] /\ st[n] = Live}, Active)
+     IN /\ SetW(W1)
+        /\ ephLeft' = (ephLeft \/ \E n \in NameIds : kit[n] = "e" /\ W1.stock[n])
+  /\ eState' = "closed"
+  /\ UNCHANGED <<reg, owner, pc, iVars, jVars, rVars, sVars, eVars, eN, eRuns, bVars>>
+
+---------------------------------------------------------------------------
+(* A background Kit pass in two steps (automatic recovery, the retired-VM *)
+(* pass, a Kit update): it takes a Kit lock, then acts and lets go. It is *)
+(* admitted like a request: it starts only while admission is open, and   *)
+(* the forced stop's drain waits for it (bgUnadmitted: neither).          *)
+
+BgStart ==
+  /\ "bg" \in Actors /\ (~stopping \/ BgUnadmitted) /\ pc["bg"] = "idle"
+  /\ \E n \in quar :
+       /\ kit[n] # None /\ owner[kit[n]] = None
+       /\ owner' = [owner EXCEPT ![kit[n]] = "bg"] /\ bN' = n
+  /\ pc' = [pc EXCEPT !["bg"] = "act"]
+  /\ UNCHANGED <<world, reg, iVars, jVars, rVars, sVars, eVars, xVars, tdBad>>
+
+BgEnd ==
+  /\ pc["bg"] = "act"
+  /\ SetW(Recovery(W0, bN))
+  /\ Release("bg")
+  /\ pc' = [pc EXCEPT !["bg"] = "idle"]
+  /\ UNCHANGED <<reg, iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 \* Environment: a create that did not report lands (stock: A2, it was absent).
 Land(n) ==
@@ -588,12 +688,13 @@ Land(n) ==
   /\ stock' = [stock EXCEPT ![n] = TRUE]
   /\ inflight' = [inflight EXCEPT ![n] = FALSE]
   /\ unsure' = [unsure EXCEPT ![n] = FALSE]
-  /\ UNCHANGED <<st, kit, mk, quar, rec, bad, reg, owner, pc, iVars, jVars, rVars, sVars, eVars>>
+  /\ UNCHANGED <<st, kit, mk, quar, rec, bad, reg, owner, pc, iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 Next ==
   \/ InstDecideEarly \/ InstPrep \/ InstSubmit \/ InstReply \/ InstPublish \/ InstAbort
   \/ JobDecideEarly \/ JobRun \/ JobAbort
-  \/ RstStart \/ RstLock \/ RstReplan \/ RstAct
+  \/ RstStart \/ RstLock \/ RstReplan \/ RstObserve \/ RstAct
+  \/ EphOpen \/ EphRun \/ EphClose \/ BgStart \/ BgEnd
   \/ SwStart \/ SwLock \/ SwAct
   \/ RecoverBg \/ Gc \/ Teardown \/ Restart \/ StopBegin \/ StopEnd \/ StopGiveUp
   \/ \E n \in NameIds : Land(n)
@@ -637,4 +738,11 @@ NoStaleRefusal == Quiescent => ~Refuses(Targets("name")) /\ ~Refuses(Targets("al
 \* (e2) A reset that is not refused leaves none of its targets listed under a
 \* live name.
 ResetRemovesTargets == ~rstBad
+
+\* (f) Closing an ephemeral-home session leaves no VM of its key listed (one
+\* whose create was still in flight may land later; the map owns it).
+SessionLeavesNoVm == ~ephLeft
+
+\* (g) A teardown runs alone: no process holds a Kit lock.
+TeardownAlone == ~tdBad
 =============================================================================

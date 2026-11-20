@@ -46,3 +46,5 @@ Workspace_depth3_pass.cfg 110000000
 Workspace_lanes_pass.cfg 82000
 Workspace_live_pass.cfg 200000
 Workspace_restart_pass.cfg 10000
+KitInstall_eph_pass.cfg 410000
+KitInstall_bg_pass.cfg 350000

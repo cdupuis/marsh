@@ -240,9 +240,11 @@ and `marsh workers reset` or `marsh stop` removes it.
 | `marsh stop --force` | As `marsh stop`, after cancelling the VM creates in flight (a hung `marsh kit install`) and waiting up to 30 seconds for requests to end |
 
 `reset` and `stop` refuse while shells or jobs are open, and, after waiting
-briefly, while another request (a `marsh kit install`) or marsh's background
-Kit pass (updates, recovery, garbage collection) is running;
-`stop --force` cancels such a request's VM create instead. Each prints the VMs
+briefly, while another request (a `marsh kit install`) is running;
+`stop --force` cancels such a request's VM create instead. When the only thing
+running is marsh's background Kit pass (updates, recovery, garbage
+collection), `reset` and `stop` cancel its VM create (a Kit update's), wait up
+to 30 seconds for it to end, and go ahead. Each prints the VMs
 it removed.
 
 If a removal could not be verified, the command names what is left and exits

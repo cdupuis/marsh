@@ -572,6 +572,9 @@ waits for a lock it holds itself.
      opens again, the requests go on, and nothing is torn down.
    - The background Kit pass is admitted like a request: none starts once the stop began, and
      the drain waits for the one running (`bgUnadmitted`).
+   - A plain stop or reset that finds only the background pass in flight cancels that pass's
+     creates (a Kit update's create), and waits for it; the cancelled create keeps its intent
+     (`bgCancelForgets`), and the teardown still runs alone.
 9. **Ephemeral-home sessions.** A session's Kit VM is keyed by the session. Closing it removes,
    under the session's Kit locks, every VM its keys own, not only the name it noted before a
    preparation chose (`ephStaleName`).
@@ -617,6 +620,7 @@ waits for a lock it holds itself.
 | `ResetRemovesTargets` | `resetNoop` | A reset that is not refused removes nothing |
 | `EveryDaemonVMOwned` | `staleAbsence` | Code review round 1 (GPT): a reset's listing finds a timed-out create's name empty; the VM lands and another listing (GC) adopts it before the reset acts; the reset forgets the name as gone, and the VM is nobody's |
 | `SessionLeavesNoVm` | `ephStaleName` | Code review round 1 (both): an ephemeral session notes its Kit VM's name before the lock; a preparation recovers that VM and creates under a new name; closing the session removes only the noted name |
+| `EveryDaemonVMOwned` | `bgCancelForgets` | Code review round 2: a background Kit update's create that a plain stop cancelled forgets its intent; the VM lands foreign |
 | `TeardownAlone` | `bgUnadmitted` | Code review round 1 (GPT): the background Kit pass is not admitted, so `marsh stop --force`'s drain does not wait for it and the teardown overlaps its Kit work |
 
 **What each invariant says.**
@@ -658,8 +662,9 @@ Positive configs:
   switch. About 3.55 M states.
 - `KitInstall_eph_pass.cfg`: an ephemeral-home session (key "e") with two preparations,
   recovery, GC and a teardown. About 0.82 M states.
-- `KitInstall_bg_pass.cfg`: the two-step background pass with a forced stop and a restart.
-  About 0.70 M states.
+- `KitInstall_bg_pass.cfg`: the two-step background pass, recovering or creating (a Kit
+  update), with a forced stop, a plain teardown that cancels its create, and a restart; one
+  install attempt, no job or switch. About 0.34 M states.
 - `KitInstall_lockOnly_pass.cfg` and `KitInstall_revalidateOnly_pass.cfg`, as above.
 - `KitInstall_wide_pass.cfg` (slow): every actor of round 0, stop and restart (not the
   ephemeral session or the two-step background pass, which have their own configs). Not
@@ -687,7 +692,7 @@ Not modeled:
 | Gc | `marsh-backend/src/vm_gc.rs` `remove_recorded`: the Kit lock of the VM's ownership key, always; stopped VMs only |
 | Teardown | `marsh-backend/src/lib.rs` `teardown_scope` and `reset_stale_scope_components` -> marsh-sbx `lib.rs` `reset_stale_scope_kit_vms_before` (intents and their records stay; it reads the UUIDs before its listing, `owned_kit_uuids`, for `forget_absent`); it is admitted by marsh-daemon `lib.rs` `begin_lifecycle_request`, which refuses while any request, an install or the background pass included, is in flight |
 | EphOpen / EphRun / EphClose | `marsh-backend/src/ephemeral.rs` `kit_spec_for_session` notes a name before the lock; preparation is `prepare_one_unnoted` (key `IDENTITY:ephemeral:SESSION`); `close_ephemeral_kits` takes the session's Kit locks (deduplicated, key order) and removes every live entry of its keys (`live_kit_entries`), not only the noted names |
-| BgStart / BgEnd | marsh-daemon `lib.rs` `spawn_kit_updater`: each background pass (`DaemonBackend::auto_update_kits`: retired-VM removal, draining retirement, recovery, Kit updates, VM GC) holds a `begin_background_request` admission for its whole run |
+| BgStart / BgStartUpd / BgEnd / TdCancelBg | marsh-daemon `lib.rs` `spawn_kit_updater`: each background pass (`DaemonBackend::auto_update_kits`: retired-VM removal, draining retirement, recovery, Kit updates, VM GC) holds a `begin_background_request` admission for its whole run; its creates run under the background cancellation (marsh-sbx `lib.rs` `in_background`). A plain stop, reset or restart runs `drain_background_pass` first: when only the pass is in flight, `DaemonBackend::cancel_background_creates` (`cancel_background_creates`), a wait within `FORCED_STOP_DRAIN`, then `begin_lifecycle_request` |
 | StopBegin / StopEnd / StopGiveUp (`marsh stop --force`) | marsh-daemon `lib.rs` `begin_forced_stop` closes admission (refused while shells are attached or jobs run, as `marsh stop`), then `handle_forced_stop`: `DaemonBackend::cancel_creates` (marsh-sbx `lib.rs` `cancel_creates`: `run_create` runs every Kit VM create through `run_bounded_cancellable`, which kills the process group; a cancelled create fails as may-still-land, and no new one is submitted), `wait_for_requests` up to `FORCED_STOP_DRAIN`, then `handle_scope_lifecycle` (teardown and stop); a request still running gives up: `resume_creates`, nothing torn down |
 | Restart | daemon start: marsh-sbx `vm_ownership.rs` `persisted` loads the map (schema 2; a schema 3 map an earlier build wrote is read and rewritten), its intents and the install records (`read_installs`, dropping a record whose name has no entry); the retired names, the quarantine and the running attempts (marsh-backend `running_installs`) are in memory, so a running record becomes settled |
 | Land, listing | stock SBX; marsh-sbx `vm_ownership.rs` `store_view` adopts a listed intent, and `classify` reports a VM listed under a forgotten name as foreign |

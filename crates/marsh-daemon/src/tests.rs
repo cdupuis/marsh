@@ -6855,6 +6855,107 @@ fn a_plain_stop_cancels_the_background_pass_and_stops() {
     );
 }
 
+#[test]
+fn review_v2c_plain_stop_with_background_and_user_install_cancels_neither() {
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        review_background: true,
+        ..InstallInFlight::default()
+    }));
+    let (home, end, task) = serve_with_held_background_pass(&backend, Duration::from_millis(200));
+    let install = install_in_flight(&backend, home.path());
+    let refused = Client::connect(home.path())
+        .unwrap()
+        .scope_lifecycle_with_timeout(PublicRequest::StopScope, PATIENCE);
+    let user_cancelled = backend.0.cancelled.load(Ordering::Acquire);
+    let background_cancelled = backend.0.background_cancelled.load(Ordering::Acquire);
+    let install_ended = install.is_finished();
+    let teardown = backend.0.calls.lock().unwrap().clone();
+    backend.0.released.store(true, Ordering::Release);
+    backend
+        .0
+        .review_background_released
+        .store(true, Ordering::Release);
+    install.join().unwrap().unwrap_err();
+    end.store(true, Ordering::Release);
+    task.join().unwrap();
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(!user_cancelled && !background_cancelled);
+    assert!(!install_ended);
+    assert_eq!(teardown, Vec::new());
+}
+
+#[test]
+fn review_v2c_plain_stop_preserves_running_job_when_it_cancels_background() {
+    let home = home();
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        review_background: true,
+        ..InstallInFlight::default()
+    }));
+    let server = Server::bind(home.path())
+        .unwrap()
+        .with_backend(Arc::new(backend.clone()))
+        .with_forced_stop_drain(Duration::from_millis(200));
+    let store = server.store();
+    let session = store.attach_shell(std::process::id(), authority("/", home.path()));
+    store
+        .register_worker(WorkerStatus {
+            worker_id: "worker".into(),
+            vm_id: "vm".into(),
+            scope_id: store.status(None).scope_id,
+            kit_ref: "kit:test".into(),
+            kits: vec!["hf".into()],
+            warm: true,
+            health: WorkerHealth::Ready,
+            container_capacity: 8,
+            active_container_ids: vec![],
+            quarantine: None,
+        })
+        .unwrap();
+    let (job, _) = store
+        .begin_job(NewJob {
+            label: None,
+            session_id: session,
+            command: "hf".into(),
+            kit_ref: "kit:test".into(),
+            workload_image: "kit:test".into(),
+            mounts: vec![],
+        })
+        .unwrap();
+    store.reserve_worker(&job, "worker", "vm").unwrap();
+    store
+        .mark_running(&job, "worker", "vm", &"a".repeat(64))
+        .unwrap();
+    let end = Arc::new(AtomicBool::new(false));
+    let ending = end.clone();
+    let task = thread::spawn(move || {
+        server
+            .serve_until(|| ending.load(Ordering::Acquire))
+            .unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !backend.0.review_background_entered.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let refused = Client::connect(home.path())
+        .unwrap()
+        .scope_lifecycle_with_timeout(PublicRequest::StopScope, PATIENCE);
+    let running = store.job(&job).unwrap().state;
+    let cancel_requested = store.cancel_requested(&job);
+    end.store(true, Ordering::Release);
+    backend
+        .0
+        .review_background_released
+        .store(true, Ordering::Release);
+    task.join().unwrap();
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(running, JobState::Running);
+    assert!(!cancel_requested);
+    assert!(backend.0.background_cancelled.load(Ordering::Acquire));
+    assert!(!backend.0.cancelled.load(Ordering::Acquire));
+    assert!(backend.0.calls.lock().unwrap().is_empty());
+}
+
 /// A background pass that does not end within the bound keeps a plain reset
 /// refused (nothing torn down), and the refusal says what `--force` does.
 #[test]

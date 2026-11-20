@@ -398,6 +398,7 @@ mod tests {
         next_id: AtomicU64,
         hanging: std::sync::atomic::AtomicBool,
         stopped: Mutex<std::collections::BTreeSet<String>>,
+        review_registry_image: Mutex<Option<String>>,
     }
 
     #[allow(clippy::unnecessary_wraps)] // A stock call's reply.
@@ -476,12 +477,36 @@ mod tests {
             self.run_bounded(invocation, Duration::from_secs(1))
         }
 
+        #[allow(clippy::too_many_lines)] // One scripted stock CLI.
         fn run_bounded(&self, invocation: &Invocation, _: Duration) -> io::Result<CommandOutput> {
             let arguments = invocation
                 .arguments
                 .iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
+            if let Some(image) = self.review_registry_image.lock().unwrap().as_ref() {
+                let reply = if invocation.program == std::ffi::OsStr::new("docker") {
+                    let day = if arguments.iter().any(|arg| arg == image) {
+                        "02"
+                    } else {
+                        "01"
+                    };
+                    Some(format!(
+                        r#"{{"config":{{"Labels":{{"org.marsh.kit.contract":"1"}}}},"created":"2026-01-{day}T00:00:00Z"}}"#
+                    ))
+                } else if arguments.first().is_some_and(|arg| arg == "kit") {
+                    Some(format!(r#"{{"sandbox":{{"image":"{image}"}}}}"#))
+                } else {
+                    None
+                };
+                if let Some(reply) = reply {
+                    return Ok(CommandOutput {
+                        exit_code: Some(0),
+                        stdout: reply.into_bytes(),
+                        stderr: vec![],
+                    });
+                }
+            }
             match arguments.first().map(String::as_str) {
                 Some("ls") => {
                     let hook = self.before_list.lock().unwrap().take();
@@ -735,20 +760,180 @@ mod tests {
 
     #[test]
     fn review_v2b_reset_all_skips_unverified_job_cleanup_and_makes_progress() {
-        reset_all_with_a_quarantined_job(true);
+        reset_with_a_quarantined_job(true, false);
     }
 
     #[test]
     fn review_v2b_reset_all_skips_running_job_and_makes_progress() {
-        reset_all_with_a_quarantined_job(false);
+        reset_with_a_quarantined_job(false, false);
     }
 
-    fn reset_all_with_a_quarantined_job(complete: bool) {
+    #[test]
+    fn review_v2c_reset_name_must_not_retire_a_quarantined_running_job() {
+        reset_with_a_quarantined_job(false, true);
+    }
+
+    #[test]
+    fn review_v2c_reset_name_releases_terminal_uncertain_cleanup_by_design() {
+        reset_with_a_quarantined_job(true, true);
+    }
+
+    #[test]
+    fn review_v2c_real_auto_update_pass_cancellation_keeps_late_vm_resettable() {
+        let mut lab = Lab::new();
+        lab.register("hf", &reference('c'));
+        *lab.stock.review_registry_image.lock().unwrap() = Some(reference('d'));
+        crate::kit_lifecycle::write_sources(
+            &lab.backend.config.control_home,
+            &BTreeMap::from([(
+                "hf".to_owned(),
+                marsh_contracts::kit_source::KitTag::parse("example/hf:stable").unwrap(),
+            )]),
+        )
+        .unwrap();
+        lab.backend = Arc::new(
+            Arc::try_unwrap(lab.backend)
+                .unwrap_or_else(|_| panic!("backend was shared"))
+                .with_auto_update(None, lab.home.path().to_owned()),
+        );
+        lab.stock.script(&[Create::HangsUntilCancelled]);
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let pass = std::thread::spawn(move || backend.auto_update_kits(&store));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !lab.stock.hanging.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the actual updater never created a VM"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        lab.backend.cancel_background_creates();
+        pass.join().unwrap();
+        let vm = lab.stock.created()[0].clone();
+        assert!(lab.backend.sbx.quarantined_vms()[&vm].create_pending);
+        assert!(lab.backend.sbx.is_live_vm_name(&vm));
+        assert!(
+            lab.records().is_empty(),
+            "automatic update has no install-name record"
+        );
+        lab.reset(&[]).unwrap();
+        assert!(lab.backend.sbx.is_live_vm_name(&vm));
+        lab.restart();
+        lab.stock.land_pending();
+        lab.assert_every_vm_owned();
+        lab.reset(&[]).unwrap();
+        assert_eq!(lab.stock.listed(), NONE);
+        assert!(lab.stock.removed().contains(&vm));
+    }
+
+    #[test]
+    fn review_v2c_reset_all_skips_install_started_after_plan_and_removes_idle() {
+        let lab = Lab::new();
+        lab.register("g", &reference('c'));
+        let idle = lab
+            .backend
+            .sbx
+            .vm_name(marsh_sbx::VmPurpose::Kit, &reference('d'))
+            .unwrap();
+        lab.stock.seed(&idle);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        lab.stock.script(&[Create::FailedListed]);
+        lab.stock.before_create(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let install = Arc::new(Mutex::new(None));
+        let (slot, backend, store) = (install.clone(), lab.backend.clone(), lab.store().clone());
+        *lab.backend.reset_before_locks.lock().unwrap() = Some(Box::new(move || {
+            *slot.lock().unwrap() = Some(std::thread::spawn(move || {
+                backend.install_command("hf".into(), reference('c'), Some(&store))
+            }));
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        }));
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reset = std::thread::spawn(move || {
+            let reply = backend.reset_workers(&LoadSelection::All, store);
+            done_tx.send(()).unwrap();
+            reply
+        });
+        let prompt = done.recv_timeout(Duration::from_millis(500));
+        release.send(()).unwrap();
+        let reply = reset.join().unwrap().unwrap();
+        install
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap_err();
+        assert!(prompt.is_ok(), "reset all waited for the install");
+        assert!(lab.stock.removed().contains(&idle));
+        assert!(
+            reply
+                .iter()
+                .any(|line| line.contains("still running") && line.contains("skipped")),
+            "{reply:?}"
+        );
+    }
+
+    #[test]
+    fn review_v2c_stable_lock_contention_releases_prefix_but_is_not_round_bounded() {
+        let lab = Lab::new();
+        for digit in ['c', 'd'] {
+            let vm = lab
+                .backend
+                .sbx
+                .vm_name(marsh_sbx::VmPurpose::Kit, &reference(digit))
+                .unwrap();
+            lab.stock.seed(&vm);
+        }
+        let first = lab.backend.kit_lock_for_key(&reference('c')).unwrap();
+        let last = lab.backend.kit_lock_for_key(&reference('d')).unwrap();
+        let held = last.lock().unwrap();
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reset = std::thread::spawn(move || {
+            let result = backend.reset_workers(&LoadSelection::All, store);
+            done_tx.send(()).unwrap();
+            result
+        });
+        let early = done.recv_timeout(Duration::from_millis(300));
+        let deadline = std::time::Instant::now() + Duration::from_millis(300);
+        let prefix_free = loop {
+            if first.try_lock().is_ok() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        drop(held);
+        reset.join().unwrap().unwrap();
+        assert!(
+            early.is_err(),
+            "stable contention unexpectedly consumed the four planning rounds"
+        );
+        assert!(
+            prefix_free,
+            "the reset kept an earlier lock while waiting on a later lock"
+        );
+        assert_eq!(lab.stock.listed(), NONE);
+    }
+
+    #[allow(clippy::too_many_lines)] // One store scenario: worker, jobs, quarantine, reset.
+    fn reset_with_a_quarantined_job(complete: bool, named: bool) {
         use marsh_daemon::{
             CleanupState, ExitStatus, NewJob, SessionAuthority, TimingReport, WorkerHealth,
             WorkerStatus,
         };
         let lab = Lab::new();
+        if named {
+            lab.register("hf", &reference('c'));
+        }
         let vm = lab
             .backend
             .sbx
@@ -792,7 +977,7 @@ mod tests {
         let (job, _) = store
             .begin_job(NewJob {
                 label: None,
-                session_id: session,
+                session_id: session.clone(),
                 command: "hf".into(),
                 kit_ref: reference('c'),
                 workload_image: reference('c'),
@@ -801,6 +986,36 @@ mod tests {
             .unwrap();
         store.reserve_worker(&job, &vm, &vm).unwrap();
         store.mark_running(&job, &vm, &vm, &"a".repeat(64)).unwrap();
+        if named && !complete {
+            // One concurrent job fails cleanup and quarantines the whole VM;
+            // the first job is still running on it.
+            let (sibling, _) = store
+                .begin_job(NewJob {
+                    label: None,
+                    session_id: session,
+                    command: "hf".into(),
+                    kit_ref: reference('c'),
+                    workload_image: reference('c'),
+                    mounts: vec![],
+                })
+                .unwrap();
+            store.reserve_worker(&sibling, &vm, &vm).unwrap();
+            store
+                .mark_running(&sibling, &vm, &vm, &"b".repeat(64))
+                .unwrap();
+            store
+                .finish_job(
+                    &sibling,
+                    ExitStatus {
+                        code: Some(125),
+                        cause: "cleanup_failed".into(),
+                    },
+                    false,
+                    CleanupState::Uncertain,
+                    TimingReport::default(),
+                )
+                .unwrap();
+        }
         if complete {
             store
                 .finish_job(
@@ -819,6 +1034,21 @@ mod tests {
             .quarantine_worker(&vm, "container may still run")
             .unwrap();
         assert!(store.vm_jobs_unsettled(&vm));
+        if named {
+            let reply = lab.reset(&["hf"]);
+            if complete {
+                reply.unwrap();
+                assert!(lab.stock.removed().contains(&vm));
+            } else {
+                assert!(
+                    lab.stock.listed().contains(&vm),
+                    "reset NAME removed a quarantined VM with a RUNNING job: reply={reply:?}, removed={:?}",
+                    lab.stock.removed()
+                );
+                assert!(reply.is_err());
+            }
+            return;
+        }
         let reply = lab.reset(&[]).unwrap();
         assert!(
             lab.stock.removed().contains(&idle),

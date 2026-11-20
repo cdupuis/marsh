@@ -3875,6 +3875,13 @@ impl DaemonStore {
             )));
         }
         for worker_id in worker_ids {
+            // Unconditional, registered worker or not: never retire a VM a
+            // job is still running on.
+            if Self::job_running_on(&state, worker_id) {
+                return Err(DaemonError::InvalidState(format!(
+                    "worker {worker_id} has a running job; wait for it before resetting"
+                )));
+            }
             let Some(worker) = state.workers.get(worker_id) else {
                 continue;
             };
@@ -3885,8 +3892,14 @@ impl DaemonStore {
             // A quarantined worker's containers are cleanup-uncertain, not
             // live: retiring the VM is the operator's release action. Their
             // receipts are left exactly as uncertain as they already are.
+            // Never a job that is still running, though, whatever the
+            // quarantine (a sibling's uncertain cleanup quarantines the whole
+            // VM): `KitInstall.tla` `releaseRunning`.
             let quarantined = worker.health == WorkerHealth::Quarantined;
-            if reserved || (!quarantined && !worker.active_container_ids.is_empty()) {
+            if reserved
+                || Self::job_running_on(&state, &worker.vm_id)
+                || (!quarantined && !worker.active_container_ids.is_empty())
+            {
                 return Err(DaemonError::InvalidState(format!(
                     "worker {worker_id} has active jobs; wait for them before resetting"
                 )));
@@ -3946,6 +3959,15 @@ impl DaemonStore {
 
     /// Whether a job recorded on `vm` is unfinished or its cleanup pending or
     /// uncertain (a container of it may still run there).
+    /// Whether a job recorded on `vm` (worker or VM id) is queued or
+    /// running: its container may be live.
+    fn job_running_on(state: &State, vm: &str) -> bool {
+        state.jobs.values().any(|job| {
+            (job.worker_id.as_deref() == Some(vm) || job.vm_id.as_deref() == Some(vm))
+                && matches!(job.state, JobState::Queued | JobState::Running)
+        })
+    }
+
     fn recorded_busy(state: &State, vm: &str) -> bool {
         state.jobs.values().any(|job| {
             (job.worker_id.as_deref() == Some(vm) || job.vm_id.as_deref() == Some(vm))

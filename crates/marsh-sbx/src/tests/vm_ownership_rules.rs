@@ -912,7 +912,7 @@ fn install(attempt: &str, command: &str) -> crate::InstallRecord {
     }
 }
 
-/// KitInstall rule 6 (`recordsInMemory`): install records are persisted with
+/// `KitInstall.tla` rule 6 (`recordsInMemory`): install records are persisted with
 /// the entry they name, so a restarted daemon still reaches a failed
 /// install's VM by the install's name; the schema is 3 only while a record
 /// exists, and a version 2 map still loads.
@@ -957,7 +957,7 @@ fn install_records_are_persisted_with_their_entry_and_survive_a_restart() {
     );
 }
 
-/// KitInstall rules 5 and 6: forgetting a removed VM's name ends the records
+/// `KitInstall.tla` rules 5 and 6: forgetting a removed VM's name ends the records
 /// naming it in the same write; an intent (a create that may still land) is
 /// never forgotten, and neither are its records. A record is only written
 /// under a live entry.
@@ -990,7 +990,7 @@ fn install_records_end_with_their_retired_name_and_stay_with_an_intent() {
     ));
 }
 
-/// KitInstall rule 4 (create-time check): a create is never submitted under
+/// `KitInstall.tla` rule 4 (create-time check): a create is never submitted under
 /// a name that is not a live entry of the map: not under one forgotten after
 /// it was chosen, and (persisted map) not under one the map never gave out.
 #[test]

@@ -341,7 +341,7 @@ impl StockDaemonBackend {
             let (action, reason) = match decide(&candidate, now_ms, idle_ms) {
                 Err(reason) => ("kept", reason),
                 Ok(reason) if dry_run => ("would_remove", reason),
-                Ok(reason) => match self.remove_recorded(vm, &candidate, store, &live) {
+                Ok(reason) => match self.remove_recorded(vm, store, &live) {
                     Ok(()) => ("removed", reason),
                     Err(Removal::Kept(why)) => ("kept", why),
                     Err(Removal::Failed(error)) => {
@@ -430,7 +430,6 @@ impl StockDaemonBackend {
     fn remove_recorded(
         &self,
         vm: &RecordedVm,
-        candidate: &Candidate,
         store: &DaemonStore,
         live: &BTreeSet<String>,
     ) -> Result<(), Removal> {
@@ -451,21 +450,15 @@ impl StockDaemonBackend {
                 .map(|_| ())
                 .map_err(|error| Removal::Kept(error.to_string()));
         }
-        // A current Kit's preparation holds its Kit lock: no job starts on
-        // the VM while it is removed.
-        let spec = candidate
-            .current
-            .then(|| self.spec_for_recorded_kit(&vm.name))
-            .flatten();
-        let lock = spec
-            .as_ref()
-            .map(|spec| self.kit_lock(spec))
-            .transpose()
+        // The Kit lock of the VM's ownership key, whether or not a command
+        // names it: no preparation of the Kit starts on the VM, or chooses
+        // its name, while it is removed (`docs/model/KitInstall.tla`).
+        let lock = self
+            .kit_lock_for_key(&vm.key)
             .map_err(|error| Removal::Failed(error.to_string()))?;
-        let _guard = lock.as_ref().map(|lock| {
-            lock.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let registered = store
             .begin_automatic_retire(&vm.name)
             .map_err(|error| Removal::Kept(error.to_string()))?;
@@ -497,14 +490,6 @@ impl StockDaemonBackend {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|_, ready| ready.name != vm.name);
         Ok(())
-    }
-
-    /// The spec of the registered command whose Kit VM is `vm`.
-    fn spec_for_recorded_kit(&self, vm: &str) -> Option<marsh_sbx::KitVmSpec> {
-        self.command_names()
-            .into_iter()
-            .filter_map(|name| self.kit_spec(&name).ok())
-            .find(|spec| spec.name == vm)
     }
 }
 

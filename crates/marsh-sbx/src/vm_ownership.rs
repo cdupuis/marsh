@@ -143,6 +143,18 @@ pub struct InstallRecord {
     pub command: String,
 }
 
+impl InstallRecord {
+    /// A new attempt of `command` with a fresh random id: never reused, also
+    /// across a daemon restart, so no attempt overwrites a persisted record.
+    #[must_use]
+    pub fn new_attempt(command: &str) -> Self {
+        Self {
+            attempt: uuid::Uuid::new_v4().to_string(),
+            command: command.to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry {

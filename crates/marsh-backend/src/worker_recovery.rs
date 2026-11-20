@@ -46,7 +46,7 @@ impl StockDaemonBackend {
         let mut commands = Vec::new();
         let mut found = None;
         for command in self.command_names() {
-            if let Ok(spec) = self.kit_spec(&command)
+            if let Some(spec) = self.kit_spec_lookup(&command)
                 && spec.name == vm
             {
                 commands.push(command);
@@ -119,8 +119,9 @@ impl StockDaemonBackend {
     }
 
     /// Retire one quarantined Kit VM if it is verifiably safe to. `Ok` is the
-    /// recorded recovery; `Err` says why the VM stays quarantined. The caller
-    /// must not hold the Kit's preparation lock.
+    /// recorded recovery; `Err` says why the VM stays quarantined. It takes
+    /// the Kit lock of the VM's ownership key, whether or not a command names
+    /// the VM (`recoveryNoLock`): the caller must not hold it.
     pub(super) fn recover_quarantined_vm(
         &self,
         store: &DaemonStore,
@@ -129,12 +130,27 @@ impl StockDaemonBackend {
         if !self.vm_quarantined(store, vm) {
             return Err("it is not quarantined".into());
         }
+        let owner = self.sbx.vm_ownership_key(vm).unwrap_or_default();
+        let lock = self
+            .kit_lock_for_key(&owner)
+            .map_err(|error| error.to_string())?;
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.recover_quarantined_vm_locked(store, vm)
+    }
+
+    /// [`Self::recover_quarantined_vm`] for a caller that holds the Kit lock
+    /// of `vm`'s ownership key.
+    pub(super) fn recover_quarantined_vm_locked(
+        &self,
+        store: &DaemonStore,
+        vm: &str,
+    ) -> Result<WorkerRecovery, String> {
+        if !self.vm_quarantined(store, vm) {
+            return Err("it is not quarantined".into());
+        }
         let (commands, spec) = self.spec_for_vm(vm);
-        let lock = spec.as_ref().and_then(|spec| self.kit_lock(spec).ok());
-        let _guard = lock.as_ref().map(|lock| {
-            lock.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
         let outcome = (|| {
             if store.worker_has_unfinished_jobs(vm) {
                 return Err("a job on it has not finished yet".to_owned());

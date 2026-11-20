@@ -2,6 +2,11 @@
 //! private-slot token/ledger, not this in-memory cleanup map.
 use super::*;
 
+/// The ownership key of a session's ephemeral Kit VM.
+fn ephemeral_ownership_key(identity: &str, session: &str) -> String {
+    format!("{identity}:ephemeral:{session}")
+}
+
 impl StockDaemonBackend {
     pub(super) fn kit_spec_for_session(
         &self,
@@ -27,11 +32,7 @@ impl StockDaemonBackend {
             .sbx
             .vm_name(
                 VmPurpose::Kit,
-                &format!(
-                    "{}:ephemeral:{}",
-                    spec.workload_kit.identity(),
-                    session.session_id
-                ),
+                &ephemeral_ownership_key(spec.workload_kit.identity(), &session.session_id),
             )
             .map_err(backend_error)?;
         // Reusing the private leaf also for the implicit Kit Create workspace
@@ -46,6 +47,7 @@ impl StockDaemonBackend {
         Ok(spec)
     }
 
+    #[allow(clippy::too_many_lines)] // Locks, retires and forgets one session's Kit VMs.
     pub(super) fn close_ephemeral_kits(
         &self,
         session: &str,
@@ -61,11 +63,17 @@ impl StockDaemonBackend {
             .get(session)
             .cloned()
             .unwrap_or_default();
-        let scope = selected_home_identity(&self.config.daemon_home).map_err(backend_error)?;
+        // The Kit lock key of each VM's ownership key, as its preparation
+        // takes it (`kit_lock_key`).
         let keys = specs
             .values()
-            .map(|spec| format!("{scope}:{}:{}", spec.workload_kit.identity(), spec.name))
-            .collect::<Vec<_>>();
+            .map(|spec| {
+                self.kit_lock_key(&ephemeral_ownership_key(
+                    spec.workload_kit.identity(),
+                    session,
+                ))
+            })
+            .collect::<Result<Vec<_>, DaemonError>>()?;
         let locks = {
             let mut all = self
                 .kit_locks

@@ -2364,6 +2364,13 @@ impl StockSbx {
         self.ownership.end_install(attempt)
     }
 
+    /// Whether a Kit VM create may be submitted under `name` (an entry of the
+    /// ownership map; see the create-time check).
+    #[must_use]
+    pub fn is_live_vm_name(&self, name: &str) -> bool {
+        self.ownership.is_live(name)
+    }
+
     /// Every persisted install record as `(name, ownership key, record)`.
     #[must_use]
     pub fn install_records(&self) -> Vec<(String, String, InstallRecord)> {
@@ -2381,29 +2388,6 @@ impl StockSbx {
     #[must_use]
     pub fn live_kit_entries(&self) -> Vec<(String, String)> {
         self.ownership.live_kit_entries()
-    }
-
-    /// Lift the quarantine of a Kit VM name under which nothing is listed (a
-    /// create that may still land). The intent stays, so a VM landing later
-    /// is adopted. Returns whether the name was absent.
-    ///
-    /// # Errors
-    /// Fails when stock SBX cannot list its VMs.
-    pub fn release_absent_quarantine(&self, name: &str) -> Result<bool, SbxError> {
-        validate_name(name)?;
-        let (vm_transition, _vm_cleanup) =
-            weak_rw_transition_lock(&self.grant_vm_transition_locks, name.to_owned());
-        let _vm_transition = vm_transition
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.classify_vm(name, true)? != VmClass::Absent {
-            return Ok(false);
-        }
-        self.quarantined_workers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(name);
-        Ok(true)
     }
 
     /// The recorded name of `(purpose, key)`, never assigning one.
@@ -2778,30 +2762,47 @@ impl StockSbx {
         deadline: Instant,
         live: Option<(&BTreeSet<String>, bool)>,
     ) -> Result<bool, SbxError> {
-        validate_name(&spec.name)?;
+        self.retire_kit_vm_named_before(&spec.name, spec.workload_kit.identity(), deadline, live)
+    }
+
+    /// [`Self::retire_kit_vm_before`] by name and ownership key, for a VM no
+    /// registered command names (a failed install's, a live entry of the
+    /// map). A name under which nothing is listed keeps its intent (its
+    /// create may still land) and loses its quarantine: `Ok(false)`.
+    ///
+    /// # Errors
+    /// As [`Self::retire_kit_vm_before`].
+    pub fn retire_kit_vm_named_before(
+        &self,
+        name: &str,
+        identity: &str,
+        deadline: Instant,
+        live: Option<(&BTreeSet<String>, bool)>,
+    ) -> Result<bool, SbxError> {
+        validate_name(name)?;
         let (vm_transition, _vm_cleanup) =
-            weak_rw_transition_lock(&self.grant_vm_transition_locks, spec.name.clone());
+            weak_rw_transition_lock(&self.grant_vm_transition_locks, name.to_owned());
         let _vm_transition = fence_write_before(
             &vm_transition,
             self.admission_deadline(deadline),
             "retire a Kit VM",
         )?;
         let (stock_operation, _stock_cleanup) =
-            weak_mutex_transition_lock(&self.grant_stock_operation_locks, spec.name.clone());
+            weak_mutex_transition_lock(&self.grant_stock_operation_locks, name.to_owned());
         let _stock_operation = stock_operation_before(
             &stock_operation,
             self.admission_deadline(deadline),
             "retire a Kit VM",
         )?;
-        let quarantined = self.reject_quarantined(&spec.name).is_err();
-        match self.classify_vm_before(&spec.name, true, deadline)? {
+        let quarantined = self.reject_quarantined(name).is_err();
+        match self.classify_vm_before(name, true, deadline)? {
             VmClass::Absent => {
-                self.drop_worker_lease(&spec.name)?;
-                self.clear_worker_generation(spec);
-                self.ownership.forget(&spec.name)?;
+                self.drop_worker_lease(name)?;
+                self.clear_worker_generation_named(name, identity);
+                self.ownership.forget(name)?;
                 return Ok(false);
             }
-            VmClass::Foreign => return Err(SbxError::ForeignVm(spec.name.clone())),
+            VmClass::Foreign => return Err(SbxError::ForeignVm(name.to_owned())),
             VmClass::Owned { .. } => {}
         }
         // The recorded UUID is the ownership authority (trusted stock SBX,
@@ -2813,7 +2814,7 @@ impl StockSbx {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let in_use = references.iter().any(|((vm, _), reference)| {
-                vm == &spec.name
+                vm == name
                     && match live {
                         None => reference.active_jobs > 0 || !reference.pinned_sessions.is_empty(),
                         Some((sessions, caller_quarantined)) => {
@@ -2826,14 +2827,14 @@ impl StockSbx {
                     }
             });
             if !quarantined && in_use {
-                return Err(SbxError::ActiveWorkerState(spec.name.clone()));
+                return Err(SbxError::ActiveWorkerState(name.to_owned()));
             }
             // Idle retained mounts end with the VM.
-            references.retain(|(vm, _), _| vm != &spec.name);
+            references.retain(|(vm, _), _| vm != name);
         }
-        self.drop_worker_lease_before(&spec.name, deadline)?;
-        self.remove_observed_kit(&spec.name, deadline)?;
-        self.clear_worker_generation(spec);
+        self.drop_worker_lease_before(name, deadline)?;
+        self.remove_observed_kit(name, deadline)?;
+        self.clear_worker_generation_named(name, identity);
         Ok(true)
     }
 

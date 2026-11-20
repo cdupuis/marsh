@@ -120,6 +120,10 @@ pub const FEATURES: &[&str] = &[
 // operations. Keep the batch above those ordinary per-command limits while
 // still giving its caller one finite aggregate deadline.
 const SCOPE_LIFECYCLE_EXECUTION_TIMEOUT: Duration = Duration::from_mins(8);
+/// How long `marsh stop --force` waits for the requests in flight to end
+/// once their VM creates were cancelled; with the teardown's bound it stays
+/// within the client's reply timeout.
+const FORCED_STOP_DRAIN: Duration = Duration::from_secs(30);
 const SCOPE_LIFECYCLE_REPLY_TIMEOUT: Duration = Duration::from_mins(9);
 const RESIDENT_SHUTDOWN_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
 const RESIDENT_SHUTDOWN_RETRY_INTERVAL: Duration = Duration::from_millis(10);
@@ -847,6 +851,11 @@ pub enum PublicRequest {
         confirmed: Vec<String>,
     },
     StopScope,
+    /// `marsh stop --force`: close admission, cancel the VM creates in
+    /// flight (a `kit install`'s, a job's, a Kit switch's), wait a bounded
+    /// time for the requests in flight to end, then stop as `StopScope`.
+    /// Host only.
+    ForceStopScope,
     Prepare {
         selection: LoadSelection,
         session: SessionSpec,
@@ -1794,6 +1803,11 @@ pub trait DaemonBackend: Send + Sync + 'static {
     fn forget_cloud_create(&self, _name: &str) -> Result<(), DaemonError> {
         Err(DaemonError::BackendUnavailable)
     }
+    /// `marsh stop --force`: cancel every VM create in flight (it may still
+    /// land) and submit no new one, until [`Self::resume_creates`].
+    fn cancel_creates(&self) {}
+    /// A forced stop that did not go ahead: creates may run again.
+    fn resume_creates(&self) {}
     fn teardown_scope(
         &self,
         action: ScopeLifecycleAction,
@@ -2851,7 +2865,8 @@ impl PublicRequest {
             | Self::UninstallKit { .. }
             | Self::ResetScope
             | Self::ResetScopeIncludingServices { .. }
-            | Self::StopScope => RequestAuthority::HostLifecycle,
+            | Self::StopScope
+            | Self::ForceStopScope => RequestAuthority::HostLifecycle,
             Self::AcpPublishedPrompt { .. }
             | Self::AcpPublishedStatus { .. }
             | Self::AcpPublishedCancel { .. }
@@ -3311,6 +3326,48 @@ impl DaemonStore {
                 }
             })
             .collect()
+    }
+
+    /// `marsh stop --force`: close admission now (no new request or daemon
+    /// work starts), though requests are in flight; they end on their own,
+    /// [`Self::wait_for_requests`]. Refused while shells are attached or
+    /// jobs run, as for `marsh stop`.
+    fn begin_forced_stop(&self) -> Result<RequestAdmission, DaemonError> {
+        let mut state = self.lock();
+        if state.lifecycle_active {
+            return Err(DaemonError::InvalidState(
+                "daemon lifecycle transition is already active".into(),
+            ));
+        }
+        let live = state
+            .shells
+            .values()
+            .any(|shell| shell.state == ShellState::Attached)
+            || state
+                .jobs
+                .values()
+                .any(|job| matches!(job.state, JobState::Queued | JobState::Running));
+        if live {
+            return Err(DaemonError::InvalidState(BUSY_LIFECYCLE_MESSAGE.into()));
+        }
+        state.lifecycle_active = true;
+        Ok(RequestAdmission {
+            store: self.clone(),
+            lifecycle: true,
+            id: 0,
+        })
+    }
+
+    /// Wait until no request is in flight, or `deadline`: what is still in
+    /// flight then.
+    fn wait_for_requests(&self, deadline: Instant) -> Vec<String> {
+        loop {
+            let in_flight = self.requests_in_flight();
+            if in_flight.is_empty() || Instant::now() >= deadline {
+                return in_flight;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn begin_lifecycle_request(&self) -> Result<RequestAdmission, DaemonError> {
@@ -5180,6 +5237,7 @@ pub struct Server {
     /// Connections the accept loop has admitted and not yet finished.
     open_connections: Arc<AtomicUsize>,
     scope_lifecycle_timeout: Duration,
+    forced_stop_drain: Duration,
     acp: Arc<AcpSessionManager>,
     mcp_host: Option<McpHostControl>,
     /// The stock SBX executable this daemon's identity pins.
@@ -5292,6 +5350,7 @@ impl Server {
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             open_connections: Arc::new(AtomicUsize::new(0)),
             scope_lifecycle_timeout: SCOPE_LIFECYCLE_EXECUTION_TIMEOUT,
+            forced_stop_drain: FORCED_STOP_DRAIN,
             acp: Arc::new(AcpSessionManager::new()?),
             mcp_host: None,
             stock_sbx: None,
@@ -5412,6 +5471,12 @@ impl Server {
     #[cfg(test)]
     fn with_scope_lifecycle_timeout(mut self, timeout: Duration) -> Self {
         self.scope_lifecycle_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_forced_stop_drain(mut self, drain: Duration) -> Self {
+        self.forced_stop_drain = drain;
         self
     }
 
@@ -5896,6 +5961,7 @@ impl Server {
             build_identity: self.build_identity.clone(),
             shutdown_requested: Arc::clone(&self.shutdown_requested),
             scope_lifecycle_timeout: self.scope_lifecycle_timeout,
+            forced_stop_drain: self.forced_stop_drain,
             acp: Arc::clone(&self.acp),
             mcp_host: self.mcp_host.clone(),
             stock_sbx: self.stock_sbx.clone(),
@@ -6007,6 +6073,7 @@ struct ConnectionHandler {
     build_identity: String,
     shutdown_requested: Arc<AtomicBool>,
     scope_lifecycle_timeout: Duration,
+    forced_stop_drain: Duration,
     acp: Arc<AcpSessionManager>,
     mcp_host: Option<McpHostControl>,
     /// The stock SBX executable this daemon's identity pins.
@@ -6512,6 +6579,45 @@ impl ConnectionHandler {
         Ok(())
     }
 
+    /// `marsh stop --force` (`docs/model/KitInstall.tla`, `StopBegin` /
+    /// `StopEnd`). Admission is already closed. Every VM create in flight is
+    /// cancelled (a `kit install`'s fails, keeping its intent and record;
+    /// the VM may still land and the next daemon adopts it), the requests in
+    /// flight get a bounded time to end, and then the scope is torn down and
+    /// the daemon stops, as for `marsh stop`. A request that does not end in
+    /// time leaves everything in place: nothing is torn down under it.
+    fn handle_forced_stop(&self, stream: &mut UnixStream) -> Result<(), DaemonError> {
+        self.backend.cancel_creates();
+        let in_flight = self
+            .store
+            .wait_for_requests(Instant::now() + self.forced_stop_drain);
+        if !in_flight.is_empty() || !self.store.can_recover() {
+            self.backend.resume_creates();
+            let blocking = if in_flight.is_empty() {
+                BUSY_LIFECYCLE_MESSAGE.to_owned()
+            } else {
+                format!(
+                    "{} still running after {:?}: {}; nothing was stopped or removed",
+                    if in_flight.len() == 1 {
+                        "a request is"
+                    } else {
+                        "requests are"
+                    },
+                    self.forced_stop_drain,
+                    in_flight.join(", ")
+                )
+            };
+            return write_frame(
+                stream,
+                &PublicReply::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: blocking,
+                },
+            );
+        }
+        self.handle_scope_lifecycle(stream, ScopeLifecycleAction::Stop, None)
+    }
+
     #[allow(clippy::too_many_lines)] // One linear dispatch over the public request variants.
     fn handle_authorized(
         &self,
@@ -6780,6 +6886,7 @@ impl ConnectionHandler {
             PublicRequest::StopScope => {
                 self.handle_scope_lifecycle(&mut stream, ScopeLifecycleAction::Stop, None)
             }
+            PublicRequest::ForceStopScope => self.handle_forced_stop(&mut stream),
             PublicRequest::Execute(spec) => {
                 // authorize_request_session has replaced caller-supplied roots
                 // with retained authority. Inspect only guest path syntax and
@@ -7487,6 +7594,7 @@ impl ConnectionHandler {
             PublicRequest::ResetScope
                 | PublicRequest::ResetScopeIncludingServices { .. }
                 | PublicRequest::StopScope
+                | PublicRequest::ForceStopScope
                 | PublicRequest::Shutdown
         );
         if lifecycle_request
@@ -7509,6 +7617,7 @@ impl ConnectionHandler {
                 PublicRequest::ResetScope
                     | PublicRequest::ResetScopeIncludingServices { .. }
                     | PublicRequest::StopScope
+                    | PublicRequest::ForceStopScope
             );
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
@@ -7525,7 +7634,9 @@ impl ConnectionHandler {
                 self.release_departed_clients();
             }
         }
-        let admission = if lifecycle_request {
+        let admission = if request.body == PublicRequest::ForceStopScope {
+            self.store.begin_forced_stop()
+        } else if lifecycle_request {
             self.store.begin_lifecycle_request()
         } else {
             self.store
@@ -7917,6 +8028,7 @@ fn authorize_request_session(
         | PublicRequest::ResetScope
         | PublicRequest::ResetScopeIncludingServices { .. }
         | PublicRequest::StopScope
+        | PublicRequest::ForceStopScope
         | PublicRequest::AttachShell { .. }
         | PublicRequest::AttachPinnedShell { .. }
         | PublicRequest::AttachEphemeralShell { .. }
@@ -7963,7 +8075,8 @@ fn dispatch_request(
         PublicRequest::Shutdown
         | PublicRequest::ResetScope
         | PublicRequest::ResetScopeIncludingServices { .. }
-        | PublicRequest::StopScope => PublicReply::Error {
+        | PublicRequest::StopScope
+        | PublicRequest::ForceStopScope => PublicReply::Error {
             code: ErrorCode::Internal,
             message: "request was not handled by the host lifecycle path".into(),
         },
@@ -9252,6 +9365,26 @@ impl Client {
 
     pub fn stop_scope(&self) -> Result<ScopeLifecycleReport, DaemonError> {
         let mut report = self.scope_lifecycle(&PublicRequest::StopScope)?;
+        if report.cleanup_complete && wait_for_owner_release(&self.paths).is_err() {
+            report.cleanup_complete = false;
+            report.components.push(ScopeCleanupComponent {
+                kind: "scope".into(),
+                label: "daemon".into(),
+                state: ScopeCleanupState::CleanupUncertain,
+                vm: None,
+                detail: Some("daemon termination could not be verified".into()),
+            });
+        }
+        Ok(report)
+    }
+
+    /// `marsh stop --force`: cancel the VM creates in flight, wait a bounded
+    /// time for the requests in flight, then stop as [`Self::stop_scope`].
+    pub fn force_stop_scope(&self) -> Result<ScopeLifecycleReport, DaemonError> {
+        let mut report = self.scope_lifecycle_with_timeout(
+            PublicRequest::ForceStopScope,
+            SCOPE_LIFECYCLE_REPLY_TIMEOUT,
+        )?;
         if report.cleanup_complete && wait_for_owner_release(&self.paths).is_err() {
             report.cleanup_complete = false;
             report.components.push(ScopeCleanupComponent {

@@ -1231,8 +1231,9 @@ pub struct StockSbx {
     shell_mount_references: Mutex<BTreeMap<(String, PathBuf, PathBuf), Arc<ShellMountReference>>>,
     ownership: VmOwnership,
     /// Cancelled by `marsh stop --force` ([`Self::cancel_creates`]): every
-    /// Kit VM create in flight ends, and no new one is submitted.
-    create_cancel: marsh_runtime::Cancellation,
+    /// Kit VM create in flight ends, and no new one is submitted until
+    /// [`Self::resume_creates`].
+    create_cancel: Mutex<marsh_runtime::Cancellation>,
     shell_recovery_specs: Mutex<BTreeMap<String, ShellVmSpec>>,
     active_shell_sessions: Mutex<BTreeMap<String, Arc<AtomicUsize>>>,
     // Quarantine retains admitted directory handles and mount references until
@@ -1397,7 +1398,7 @@ impl StockSbx {
             installed_shell_artifacts: Mutex::new(BTreeMap::new()),
             shell_mount_references: Mutex::new(BTreeMap::new()),
             ownership: VmOwnership::in_memory(),
-            create_cancel: marsh_runtime::Cancellation::default(),
+            create_cancel: Mutex::new(marsh_runtime::Cancellation::default()),
             shell_recovery_specs: Mutex::new(BTreeMap::new()),
             active_shell_sessions: Mutex::new(BTreeMap::new()),
             uncertain_shell_grants: Mutex::new(BTreeMap::new()),
@@ -7673,14 +7674,22 @@ impl StockSbx {
         invocation: &Invocation,
     ) -> Result<CommandOutput, SbxError> {
         let timeout = self.preparation_timeouts.create;
+        let cancel = self.create_cancellation();
         self.runner
-            .run_bounded_cancellable(invocation, timeout, &self.create_cancel)
+            .run_bounded_cancellable(invocation, timeout, &cancel)
             .map_err(|error| stock_call_error(error, operation, timeout))
     }
 
     /// Refuse to submit a Kit VM create once `marsh stop --force` began.
+    fn create_cancellation(&self) -> marsh_runtime::Cancellation {
+        self.create_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn refuse_create_when_stopping(&self) -> Result<(), SbxError> {
-        if self.create_cancel.is_cancelled() {
+        if self.create_cancellation().is_cancelled() {
             return Err(SbxError::Stopping);
         }
         Ok(())
@@ -7688,9 +7697,18 @@ impl StockSbx {
 
     /// `marsh stop --force`: end every Kit VM create in flight (its stock
     /// process group is killed; the VM may still land, and its intent stays)
-    /// and submit no new one. For the rest of this daemon's life.
+    /// and submit no new one until [`Self::resume_creates`].
     pub fn cancel_creates(&self) {
-        self.create_cancel.cancel();
+        self.create_cancellation().cancel();
+    }
+
+    /// A forced stop that did not go ahead: creates are submitted again.
+    pub fn resume_creates(&self) {
+        *self
+            .create_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            marsh_runtime::Cancellation::default();
     }
 
     fn run_bounded_os<I, S>(

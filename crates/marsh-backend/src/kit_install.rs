@@ -275,6 +275,9 @@ mod tests {
         FailedNone,
         /// Reported failed with nothing listed, but it lands later.
         FailedLandsLater,
+        /// Hangs until creates are cancelled (`marsh stop --force`); the VM
+        /// lands later anyway.
+        HangsUntilCancelled,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -290,6 +293,7 @@ mod tests {
         removed: Mutex<Vec<String>>,
         before_create: Mutex<Option<Hook>>,
         next_id: AtomicU64,
+        hanging: std::sync::atomic::AtomicBool,
     }
 
     #[allow(clippy::unnecessary_wraps)] // A stock call's reply.
@@ -413,6 +417,9 @@ mod tests {
                             self.pending.lock().unwrap().push(name);
                             output(1, "create failed")
                         }
+                        Create::HangsUntilCancelled => {
+                            panic!("a hanging create must run cancellable")
+                        }
                     }
                 }
                 Some("rm") => {
@@ -427,6 +434,51 @@ mod tests {
                     "unexpected stock call {arguments:?}"
                 ))),
             }
+        }
+
+        fn run_bounded_cancellable(
+            &self,
+            invocation: &Invocation,
+            timeout: Duration,
+            cancel: &marsh_runtime::Cancellation,
+        ) -> io::Result<CommandOutput> {
+            let hangs = matches!(
+                self.outcomes.lock().unwrap().front(),
+                Some(Create::HangsUntilCancelled)
+            ) && invocation
+                .arguments
+                .first()
+                .is_some_and(|verb| verb == "create");
+            if !hangs {
+                return self.run_bounded(invocation, timeout);
+            }
+            self.outcomes.lock().unwrap().pop_front();
+            let arguments = invocation
+                .arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let name = arguments
+                .iter()
+                .position(|argument| argument == "--name")
+                .map(|index| arguments[index + 1].clone())
+                .unwrap();
+            self.created.lock().unwrap().push(name.clone());
+            self.hanging
+                .store(true, std::sync::atomic::Ordering::Release);
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !cancel.is_cancelled() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the create was never cancelled"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.pending.lock().unwrap().push(name);
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "owned I/O cancelled",
+            ))
         }
 
         fn spawn_attached(&self, _: &Invocation) -> io::Result<Attachment> {
@@ -950,5 +1002,38 @@ mod tests {
         );
         assert!(lab.backend.sbx.is_live_vm_name(&vm));
         assert_eq!(lab.records(), [format!("{vm} hf")]);
+    }
+
+    /// `marsh stop --force` through the real backend: the install's create
+    /// hangs; cancelling creates ends it (the install fails, keeping its
+    /// intent and record); the forced stop's teardown keeps them; the record
+    /// survives the restart; the VM landing afterwards is owned and removed
+    /// by `reset NAME` of the next daemon.
+    #[test]
+    fn a_forced_stop_cancels_a_hung_install_whose_late_vm_the_next_daemon_resets() {
+        let mut lab = Lab::new();
+        lab.stock.script(&[Create::HangsUntilCancelled]);
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let install = std::thread::spawn(move || {
+            backend.install_command("hf".into(), reference('c'), Some(&store))
+        });
+        while !lab.stock.hanging.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        lab.backend.cancel_creates();
+        install.join().unwrap().unwrap_err();
+        let vm = lab.stock.created()[0].clone();
+        lab.backend.teardown_scope(
+            marsh_daemon::ScopeLifecycleAction::Stop,
+            lab.store().clone(),
+            std::time::Instant::now() + Duration::from_secs(30),
+        );
+        lab.restart();
+        assert_eq!(lab.records(), [format!("{vm} hf")]);
+        lab.stock.land_pending();
+        lab.assert_every_vm_owned();
+        lab.reset(&["hf"]).unwrap();
+        assert_eq!(lab.stock.listed(), NONE);
+        assert_eq!(lab.records(), NONE);
     }
 }

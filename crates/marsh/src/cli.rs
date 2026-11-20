@@ -56,8 +56,11 @@ pub enum ProductCommand {
         yes: bool,
     },
     /// `marsh stop`: remove the selected home's VMs and stop its daemon.
+    /// `force` (`marsh stop --force`) first cancels the VM creates in flight
+    /// (a hung `marsh kit install`'s) instead of refusing while they run.
     Stop {
         json: bool,
+        force: bool,
     },
     /// `marsh restart`: restart this home's idle daemon on the installed
     /// marsh, keeping its VMs.
@@ -485,9 +488,20 @@ fn parse_product_command(args: &[String], argv0: &OsStr) -> Result<Option<Parsed
                 yes: flags.iter().any(|flag| flag == "--yes"),
             }
         }
-        [name] if name == "stop" => ProductCommand::Stop { json: false },
+        [name, flags @ ..]
+            if name == "stop"
+                && flags.len() <= 2
+                && flags
+                    .iter()
+                    .all(|flag| matches!(flag.as_str(), "--json" | "--force"))
+                && !(flags.len() == 2 && flags[0] == flags[1]) =>
+        {
+            ProductCommand::Stop {
+                json: flags.iter().any(|flag| flag == "--json"),
+                force: flags.iter().any(|flag| flag == "--force"),
+            }
+        }
         [name] if name == "restart" => ProductCommand::Restart,
-        [name, json] if name == "stop" && json == "--json" => ProductCommand::Stop { json: true },
         [name, help] if name == "workers" && matches!(help.as_str(), "-h" | "--help") => {
             ProductCommand::WorkersHelp
         }
@@ -643,7 +657,7 @@ fn parse_product_command(args: &[String], argv0: &OsStr) -> Result<Option<Parsed
             return Err(CliError("usage: marsh restart".into()));
         }
         [name, ..] if name == "stop" => {
-            return Err(CliError("usage: marsh stop [--json]".into()));
+            return Err(CliError("usage: marsh stop [--force] [--json]".into()));
         }
         [name, ..] if name == "gc" => {
             return Err(CliError("usage: marsh gc [--dry-run] [--json]".into()));
@@ -1111,10 +1125,24 @@ mod tests {
                     yes: false,
                 }
             } else {
-                ProductCommand::Stop { json }
+                ProductCommand::Stop { json, force: false }
             };
             assert_eq!(command, expected);
         }
+        for argv in [
+            &["marsh", "stop", "--force"][..],
+            &["marsh", "stop", "--force", "--json"],
+            &["marsh", "stop", "--json", "--force"],
+        ] {
+            assert_eq!(
+                parse(strings(argv)).unwrap().command,
+                ProductCommand::Stop {
+                    json: argv.contains(&"--json"),
+                    force: true
+                }
+            );
+        }
+        assert!(parse(strings(&["marsh", "stop", "--force", "--force"])).is_err());
         assert!(parse(strings(&["marsh", "stop", "now"])).is_err());
         assert!(parse(strings(&["marsh", "reset", "--all"])).is_err());
         // Like `status`, a script with a lifecycle name runs by path. The

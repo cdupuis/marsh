@@ -148,6 +148,10 @@ pub trait DaemonClient: Send + Sync + 'static {
     fn stop_scope(&self) -> Result<marsh_daemon::ScopeLifecycleReport, ClientError> {
         Err(ClientError("stop is unavailable".into()))
     }
+    /// `marsh stop --force`.
+    fn force_stop_scope(&self) -> Result<marsh_daemon::ScopeLifecycleReport, ClientError> {
+        Err(ClientError("stop is unavailable".into()))
+    }
     /// `marsh services ...`: the daemon's JSON document.
     fn services(&self, _request: &marsh_daemon::ServicesRequest) -> Result<Value, ClientError> {
         Err(ClientError("services are unavailable".into()))
@@ -1644,6 +1648,10 @@ impl DaemonClient for LocalDaemonClient {
 
     fn stop_scope(&self) -> Result<marsh_daemon::ScopeLifecycleReport, ClientError> {
         self.0.stop_scope().map_err(map_daemon_error)
+    }
+
+    fn force_stop_scope(&self) -> Result<marsh_daemon::ScopeLifecycleReport, ClientError> {
+        self.0.force_stop_scope().map_err(map_daemon_error)
     }
 
     fn services(&self, request: &marsh_daemon::ServicesRequest) -> Result<Value, ClientError> {

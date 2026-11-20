@@ -6499,3 +6499,183 @@ fn receipt_journal_is_owner_only_and_keeps_no_job_or_prompt_content() {
         }
     }
 }
+
+/// A backend whose `kit install` is a VM create in flight: it ends when
+/// creates are cancelled, or (`ignores_cancel`) only when released.
+#[derive(Default)]
+struct InstallInFlight {
+    ignores_cancel: bool,
+    entered: AtomicBool,
+    cancelled: AtomicBool,
+    released: AtomicBool,
+    resumed: AtomicBool,
+    calls: Mutex<Vec<ScopeLifecycleAction>>,
+}
+
+#[derive(Clone)]
+struct InstallInFlightBackend(Arc<InstallInFlight>);
+
+impl DaemonBackend for InstallInFlightBackend {
+    fn registered_commands(&self) -> Result<Vec<String>, DaemonError> {
+        Ok(Vec::new())
+    }
+
+    fn install_kit(
+        &self,
+        _command: String,
+        _reference: String,
+        _store: DaemonStore,
+    ) -> Result<String, DaemonError> {
+        self.0.entered.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if self.0.released.load(Ordering::Acquire)
+                || (!self.0.ignores_cancel && self.0.cancelled.load(Ordering::Acquire))
+            {
+                return Err(DaemonError::InvalidState(
+                    "its VM create was cancelled".into(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the install's create was never cancelled");
+    }
+
+    fn cancel_creates(&self) {
+        self.0.cancelled.store(true, Ordering::Release);
+    }
+
+    fn resume_creates(&self) {
+        self.0.resumed.store(true, Ordering::Release);
+    }
+
+    fn teardown_scope(
+        &self,
+        action: ScopeLifecycleAction,
+        _store: DaemonStore,
+        _deadline: Instant,
+    ) -> ScopeLifecycleReport {
+        self.0.calls.lock().unwrap().push(action);
+        ScopeLifecycleReport {
+            action,
+            cleanup_complete: true,
+            components: Vec::new(),
+        }
+    }
+
+    fn prepare(
+        &self,
+        _selection: &LoadSelection,
+        _session: &SessionSpec,
+        _progress: PreparationProgress,
+        _store: DaemonStore,
+    ) -> Result<PreparationResult, DaemonError> {
+        unreachable!()
+    }
+
+    fn execute(
+        &self,
+        _request: ExecuteSpec,
+        _attachment: ServerAttachment,
+        _store: DaemonStore,
+    ) -> Result<(), DaemonError> {
+        unreachable!()
+    }
+
+    fn open_shell(
+        &self,
+        _request: ShellSpec,
+        _attachment: ServerAttachment,
+        _store: DaemonStore,
+    ) -> Result<(), DaemonError> {
+        unreachable!()
+    }
+}
+
+fn install_in_flight(
+    backend: &InstallInFlightBackend,
+    home: &Path,
+) -> thread::JoinHandle<Result<String, DaemonError>> {
+    let client = Client::connect(home).unwrap();
+    let install = thread::spawn(move || client.install_kit("hf", "example/hf@sha256:0"));
+    while !backend.0.entered.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    install
+}
+
+/// `marsh stop --force` (`KitInstall.tla` `StopBegin`/`StopEnd`): plain
+/// `marsh stop` stays refused while a `kit install` is in flight; the forced
+/// stop cancels its create, waits for the install to end, tears the scope
+/// down and stops the daemon. Fails when the forced stop does not cancel
+/// creates (it waits out its drain bound and refuses).
+#[test]
+fn a_forced_stop_cancels_an_install_in_flight_then_stops() {
+    let home = home();
+    let backend = InstallInFlightBackend(Arc::default());
+    let server = Server::bind(home.path())
+        .unwrap()
+        .with_backend(Arc::new(backend.clone()))
+        .with_forced_stop_drain(Duration::from_secs(5));
+    let task = thread::spawn(move || server.serve_until(|| false).unwrap());
+    let install = install_in_flight(&backend, home.path());
+    let client = Client::connect(home.path()).unwrap();
+
+    let refused = client
+        .scope_lifecycle_with_timeout(PublicRequest::StopScope, PATIENCE)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("a request was still being served"),
+        "{refused}"
+    );
+    assert!(!backend.0.cancelled.load(Ordering::Acquire));
+
+    let report = client.force_stop_scope().unwrap();
+    assert!(report.cleanup_complete, "{report:?}");
+    assert!(backend.0.cancelled.load(Ordering::Acquire));
+    let installed = install.join().unwrap().unwrap_err().to_string();
+    assert!(installed.contains("cancelled"), "{installed}");
+    assert_eq!(
+        *backend.0.calls.lock().unwrap(),
+        [ScopeLifecycleAction::Stop]
+    );
+    task.join().unwrap();
+    assert!(Client::connect_if_running(home.path()).unwrap().is_none());
+}
+
+/// The forced stop's wait is bounded: a request that does not end in time
+/// leaves everything in place (nothing torn down, creates resumed, the
+/// daemon serving), and says what is still running.
+#[test]
+fn a_forced_stop_whose_requests_do_not_end_tears_nothing_down() {
+    let home = home();
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        ignores_cancel: true,
+        ..InstallInFlight::default()
+    }));
+    let server = Arc::new(
+        Server::bind(home.path())
+            .unwrap()
+            .with_backend(Arc::new(backend.clone()))
+            .with_forced_stop_drain(Duration::from_millis(300)),
+    );
+    let serving = Arc::clone(&server);
+    let task = thread::spawn(move || serving.serve_until(|| false).unwrap());
+    let install = install_in_flight(&backend, home.path());
+    let client = Client::connect(home.path()).unwrap();
+
+    let refused = client.force_stop_scope().unwrap_err().to_string();
+    assert!(
+        refused.contains("still running after 300ms") && refused.contains("nothing was stopped"),
+        "{refused}"
+    );
+    assert!(backend.0.resumed.load(Ordering::Acquire));
+    assert!(backend.0.calls.lock().unwrap().is_empty());
+    assert!(!server.shutdown_requested.load(Ordering::Acquire));
+
+    backend.0.released.store(true, Ordering::Release);
+    install.join().unwrap().unwrap_err();
+    client.stop_scope().unwrap();
+    task.join().unwrap();
+}

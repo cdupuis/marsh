@@ -310,7 +310,10 @@ they do with Bash. After **-c** or **--**, marsh interprets nothing.
 
 **workers reset** *KIT*[,*KIT*...]|**all**
 : Remove idle Kit VMs, including quarantined ones. The next use creates a new
-  VM. **workers reset cloud** deletes every Docker Cloud sandbox this daemon
+  VM. *KIT* may also be the name of a **kit install** that failed: that removes
+  the VM its create left, also after a restart or when the create landed
+  late; while the install still runs it refuses (**still running**), and
+  **all** skips it. **workers reset cloud** deletes every Docker Cloud sandbox this daemon
   owns and verifies they are gone, except detached runs' sandboxes; with
   **--detached** those runs are discarded too.
 
@@ -366,11 +369,15 @@ they do with Bash. After **-c** or **--**, marsh interprets nothing.
   The guest home and results are kept. Exits nonzero if any cleanup could not
   be verified.
 
-**stop** [**--json**] [**--detached**]
+**stop** [**--force**] [**--json**] [**--detached**]
 : Remove the Kit and shell VMs this scope owns (detached cloud runs are kept,
   and collected when the daemon starts again, unless **--detached** is given)
   and stop its daemon. Docker VMs are **stopped, not removed**: their disks
-  and data stay. Refuses while shells or jobs are active. The guest home and
+  and data stay. Refuses while shells or jobs are active, and while another
+  request runs (for example a **kit install** whose VM create hangs). With
+  **--force**, it first cancels every VM create in flight and waits up to 30
+  seconds for the requests to end; a cancelled VM that still appears later is
+  removed by **workers reset** *NAME* or the next **stop**. The guest home and
   results are kept. Exits nonzero if any cleanup could not be verified. With no
   daemon running, **reset** and **stop** start it when this scope has VMs
   recorded, then remove them; with none they print **nothing to stop**

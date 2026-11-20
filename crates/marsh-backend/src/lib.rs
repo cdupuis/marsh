@@ -2015,6 +2015,14 @@ impl DaemonBackend for StockDaemonBackend {
         self.cloud.forget(self, name)
     }
 
+    fn cancel_creates(&self) {
+        self.sbx.cancel_creates();
+    }
+
+    fn resume_creates(&self) {
+        self.sbx.resume_creates();
+    }
+
     fn reset_workers(
         &self,
         selection: &LoadSelection,

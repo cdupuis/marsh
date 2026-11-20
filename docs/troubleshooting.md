@@ -186,8 +186,25 @@ that (for example a container is still running, or `sbx` cannot reach the VM),
 the VM stays quarantined and the status line says why.
 
 To clear it yourself, run `marsh workers reset KIT`, using the Kit name in the
-message, or `marsh workers reset all` to retire all idle or quarantined Kit
-VMs, including one left by a `marsh kit install` that failed.
+message, or `marsh workers reset all` to retire every Kit VM this scope owns
+that is idle or quarantined.
+
+For a `marsh kit install NAME` that failed, use the name it was given:
+`marsh workers reset NAME` removes the VM its create left. That works after a
+daemon restart too, and for a create that lands after the install gave up:
+marsh records the install with the VM's name before the create and keeps the
+record until the VM is removed. If nothing is listed under the name yet, the
+reset removes nothing and says the create may still land; run it again later.
+While the install itself is still running, `marsh workers reset NAME` refuses
+with `still running` and `marsh workers reset all` skips it.
+
+A `marsh kit install` whose VM create hangs keeps its request open for up to
+an hour. `marsh stop` and `marsh reset` do not clear it: they wait briefly for
+requests in flight, then refuse. `marsh stop --force` cancels the create (and
+any other VM create in flight), waits up to 30 seconds for the requests to
+end, then stops like `marsh stop`. The cancelled VM may still appear later;
+the next daemon recognizes it as its own, and `marsh workers reset NAME`
+removes it.
 
 Either way the uncertain jobs stay uncertain, and files the job wrote to your
 project stay as they are. Review them with `git status` and `git diff`, or
@@ -201,7 +218,9 @@ that did not complete (its container never started, and marsh removes it by
 label), a worker that is slow to answer while busy, reinstalling marsh while
 jobs run (they keep the worker they started on), and a closing shell whose
 mount bookkeeping is busy. A VM create that `sbx` did not report on is held
-back for two minutes in case it still lands, then removed or retried.
+back for two minutes in case it still lands. After that the quarantine is
+lifted but marsh keeps the VM's name: a VM that lands later is still its own,
+and `marsh workers reset` or `marsh stop` removes it.
 
 ## Removing VMs
 
@@ -214,9 +233,12 @@ back for two minutes in case it still lands, then removed or retried.
 | `marsh workers reset cloud` | Delete every [Docker Cloud](cloud.md) sandbox this daemon owns |
 | `marsh reset` | Remove the scope's Kit and shell VMs; keep the daemon running. [Services VMs](design/services.md) are skipped; `marsh reset --include-services` lists the projects whose services data it would delete and asks first (`--yes` skips the question) |
 | `marsh stop` | Remove the scope's Kit and shell VMs and stop its daemon. Services VMs are stopped and kept, with their data |
+| `marsh stop --force` | As `marsh stop`, after cancelling the VM creates in flight (a hung `marsh kit install`) and waiting up to 30 seconds for requests to end |
 
-`reset` and `stop` refuse while shells or jobs are open. Each prints the VMs it
-removed.
+`reset` and `stop` refuse while shells or jobs are open, and, after waiting
+briefly, while another request (a `marsh kit install`) is running;
+`stop --force` cancels such a request's VM create instead. Each prints the VMs
+it removed.
 
 If a removal could not be verified, the command names what is left and exits
 nonzero.

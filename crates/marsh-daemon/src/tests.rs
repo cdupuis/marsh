@@ -6504,6 +6504,10 @@ fn receipt_journal_is_owner_only_and_keeps_no_job_or_prompt_content() {
 /// creates are cancelled, or (`ignores_cancel`) only when released.
 #[derive(Default)]
 struct InstallInFlight {
+    review_background: bool,
+    review_background_entered: AtomicBool,
+    review_background_released: AtomicBool,
+    review_teardown_overlapped_background: AtomicBool,
     ignores_cancel: bool,
     cleanup_uncertain: bool,
     entered: AtomicBool,
@@ -6517,6 +6521,23 @@ struct InstallInFlight {
 struct InstallInFlightBackend(Arc<InstallInFlight>);
 
 impl DaemonBackend for InstallInFlightBackend {
+    fn auto_update_kits(&self, _store: &DaemonStore) {
+        if !self.0.review_background {
+            return;
+        }
+        self.0
+            .review_background_entered
+            .store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.0.review_background_released.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "review background never released"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn registered_commands(&self) -> Result<Vec<String>, DaemonError> {
         Ok(Vec::new())
     }
@@ -6556,6 +6577,13 @@ impl DaemonBackend for InstallInFlightBackend {
         _store: DaemonStore,
         _deadline: Instant,
     ) -> ScopeLifecycleReport {
+        if self.0.review_background_entered.load(Ordering::Acquire)
+            && !self.0.review_background_released.load(Ordering::Acquire)
+        {
+            self.0
+                .review_teardown_overlapped_background
+                .store(true, Ordering::Release);
+        }
         self.0.calls.lock().unwrap().push(action);
         ScopeLifecycleReport {
             action,
@@ -6675,6 +6703,9 @@ fn a_forced_stop_whose_requests_do_not_end_tears_nothing_down() {
     assert!(backend.0.calls.lock().unwrap().is_empty());
     assert!(!server.shutdown_requested.load(Ordering::Acquire));
 
+    // Admission really reopened while the old request is still in flight.
+    assert_eq!(client.registered_commands().unwrap(), Vec::<String>::new());
+
     backend.0.released.store(true, Ordering::Release);
     install.join().unwrap().unwrap_err();
     client.stop_scope().unwrap();
@@ -6707,4 +6738,45 @@ fn a_forced_stop_that_keeps_the_daemon_resumes_creates() {
     assert!(backend.0.cancelled.load(Ordering::Acquire));
     assert!(backend.0.resumed.load(Ordering::Acquire));
     assert!(!server.shutdown_requested.load(Ordering::Acquire));
+}
+
+#[test]
+fn review_forced_stop_must_drain_background_kit_work_before_teardown() {
+    let home = home();
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        review_background: true,
+        ..InstallInFlight::default()
+    }));
+    let server = Server::bind(home.path())
+        .unwrap()
+        .with_backend(Arc::new(backend.clone()))
+        .with_forced_stop_drain(Duration::from_millis(200));
+    let end = Arc::new(AtomicBool::new(false));
+    let ending = end.clone();
+    let task = thread::spawn(move || {
+        server
+            .serve_until(|| ending.load(Ordering::Acquire))
+            .unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !backend.0.review_background_entered.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let result = Client::connect(home.path())
+        .unwrap()
+        .scope_lifecycle_with_timeout(PublicRequest::ForceStopScope, PATIENCE);
+    backend
+        .0
+        .review_background_released
+        .store(true, Ordering::Release);
+    end.store(true, Ordering::Release);
+    task.join().unwrap();
+    assert!(
+        !backend
+            .0
+            .review_teardown_overlapped_background
+            .load(Ordering::Acquire),
+        "teardown ran during background Kit work: {result:?}"
+    );
 }

@@ -5723,10 +5723,20 @@ impl Server {
                     let (Some(backend), Some(store)) = (backend.upgrade(), store.upgrade()) else {
                         return;
                     };
-                    // A panic in one pass is logged; the next pass still runs.
-                    let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        backend.auto_update_kits(&DaemonStore(store));
-                    }));
+                    let store = DaemonStore(store);
+                    // The pass is admitted like a request (`KitInstall.tla`
+                    // `bgUnadmitted`): none starts once a lifecycle
+                    // transition began, and `marsh stop --force` (and plain
+                    // stop or reset) waits for, or is refused by, the one
+                    // running: a teardown never overlaps its Kit/VM work.
+                    let pass = match store.begin_background_request("the background Kit pass") {
+                        Ok(_admission) => {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                backend.auto_update_kits(&store);
+                            }))
+                        }
+                        Err(_) => Ok(()),
+                    };
                     if pass.is_err() {
                         eprintln!(
                             "marshd: a background Kit/VM pass panicked; it runs again in a minute"

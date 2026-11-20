@@ -43,7 +43,9 @@
 (* staleAbsence); an ephemeral-home session's Kit VM, keyed by the session *)
 (* (Kit "e"), noted before the lock and closed with the session            *)
 (* (ephStaleName); a two-step background Kit pass that lifecycle admission *)
-(* and the forced stop's drain must cover (bgUnadmitted).                  *)
+(* and the forced stop's drain must cover (bgUnadmitted). Round 2: the    *)
+(* background pass also creates (a Kit update), and a plain stop or reset *)
+(* cancels that create and waits for the pass (bgCancelForgets).           *)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS NN,            \* number of VM names (1..NN)
@@ -74,6 +76,7 @@ Bugs == {"none", "lateLandingLost", "oldAttemptErasesNew", "recoveryKeepsRecord"
          "forgetFailedIntent", "restartLosesUncertainty", "recordsInMemory",
          "forceStopForgetsIntents", "resetNoop", "resetNoLock", "noReplan",
          "switchKeepsRecord", "narrowResetAll", "staleAbsence", "ephStaleName", "bgUnadmitted",
+         "bgCancelForgets",
          "lockOnly", "revalidateOnly"}    \* the last two are positive: one safeguard each
 ASSUME Bug \in Bugs /\ InstallKits \subseteq Kits
 ASSUME Actors \subseteq {"job", "sw", "rcv", "gc", "td", "stop", "restart", "eph", "bg"}
@@ -111,6 +114,8 @@ EphStaleName   == Bug = "ephStaleName"                               \* session 
                                                                     \* before the Kit lock (`ephemeral_kits`)
 BgUnadmitted   == Bug = "bgUnadmitted"                               \* a background Kit pass is not admitted: it starts
                                                                     \* during a forced stop, which does not drain it
+BgCancelForgets == Bug = "bgCancelForgets"                           \* a background create a plain stop cancelled
+                                                                    \* forgets its intent (as if it could not land)
 
 VARIABLES
   st,        \* [NameIds -> "free" | "live" | "retired"] ownership map (persisted)
@@ -130,7 +135,8 @@ VARIABLES
   rSeen,     \* reset: the targets its listing found listed (RstObserve)
   sFrom, sTo, sL, sRuns, \* switch
   eN, eState, eRuns,     \* ephemeral session: the name noted before the lock, off/open/closed, preparations
-  bN,                    \* background pass: the quarantined name it works on
+  bN, bKind, bRuns,      \* background pass: its name, "rcv" (recovery) or "upd" (an update's create), updates
+  bgCancel,              \* a plain stop or reset cancelled the background pass's creates
   tdRuns, stopping, stops, restarts, lates,
   bad,       \* ghost: a VM was removed although the map did not prove it the daemon's
   rstBad,    \* ghost: a reset that was not refused left a target listed under a live name
@@ -139,7 +145,8 @@ VARIABLES
 
 vars == <<st, kit, stock, inflight, mk, unsure, quar, rec, reg, owner, pc, iAtt, iK, iN,
           jK, jN, jRuns, rMode, rL, rT, rHad, rRuns, rSeen, sFrom, sTo, sL, sRuns, tdRuns,
-          stopping, stops, restarts, lates, bad, rstBad, eN, eState, eRuns, bN, ephLeft, tdBad>>
+          stopping, stops, restarts, lates, bad, rstBad, eN, eState, eRuns, bN, bKind, bRuns,
+          bgCancel, ephLeft, tdBad>>
 world == <<st, kit, stock, inflight, mk, unsure, quar, rec, bad>>
 iVars == <<iAtt, iK, iN>>
 jVars == <<jK, jN, jRuns>>
@@ -147,7 +154,7 @@ rVars == <<rMode, rL, rT, rHad, rRuns, rSeen>>
 sVars == <<sFrom, sTo, sL, sRuns>>
 eVars == <<tdRuns, stopping, stops, restarts, lates, rstBad>>
 xVars == <<eN, eState, eRuns, ephLeft>>
-bVars == <<bN, tdBad>>
+bVars == <<bN, bKind, bRuns, bgCancel, tdBad>>
 
 NoRec == [st |-> "none", vm |-> 0]
 
@@ -178,6 +185,7 @@ Init ==
   /\ tdRuns = 0 /\ stopping = FALSE /\ stops = 0 /\ restarts = 0 /\ lates = 0
   /\ bad = FALSE /\ rstBad = FALSE
   /\ rSeen = {} /\ eN = 0 /\ eState = "off" /\ eRuns = 0 /\ bN = 0 /\ ephLeft = FALSE /\ tdBad = FALSE
+  /\ bKind = "rcv" /\ bRuns = 0 /\ bgCancel = FALSE
 
 ---------------------------------------------------------------------------
 (* The daemon's state as a record, so that one step can compose effects.  *)
@@ -579,7 +587,9 @@ Teardown ==
   /\ SetW(TeardownW(W0))
   /\ tdRuns' = tdRuns + 1
   /\ tdBad' = (tdBad \/ \E k \in Kits : owner[k] # None)
-  /\ UNCHANGED <<reg, owner, pc, iVars, jVars, rVars, sVars, stopping, stops, restarts, lates, rstBad, xVars, bN>>
+  /\ bgCancel' = FALSE
+  /\ UNCHANGED <<reg, owner, pc, iVars, jVars, rVars, sVars, stopping, stops, restarts, lates, rstBad, xVars,
+                 bN, bKind, bRuns>>
 
 \* A daemon restart's effect: every process ends and every lock is free; the
 \* quarantine and uncertainty marks (in memory) are lost; the ownership map,
@@ -599,8 +609,9 @@ RestartVars(W) ==
 Restart ==
   /\ "restart" \in Actors /\ restarts < MaxRestarts
   /\ RestartVars(W0)
-  /\ restarts' = restarts + 1 /\ stopping' = FALSE
-  /\ UNCHANGED <<reg, iVars, jVars, rMode, rT, rHad, rRuns, rSeen, sFrom, sTo, sRuns, tdRuns, stops, lates, rstBad, xVars, bVars>>
+  /\ restarts' = restarts + 1 /\ stopping' = FALSE /\ bgCancel' = FALSE
+  /\ UNCHANGED <<reg, iVars, jVars, rMode, rT, rHad, rRuns, rSeen, sFrom, sTo, sRuns, tdRuns, stops, lates, rstBad, xVars,
+                 bN, bKind, bRuns, tdBad>>
 
 \* `marsh stop --force`: admission closes (no new request, background pass
 \* or install; plain `marsh stop`/`reset` stay refused while one runs); the
@@ -618,7 +629,9 @@ StopEnd ==
   /\ RestartVars(TeardownW(W0))
   /\ stopping' = FALSE
   /\ tdBad' = (tdBad \/ \E k \in Kits : owner[k] # None)
-  /\ UNCHANGED <<reg, iVars, jVars, rMode, rT, rHad, rRuns, rSeen, sFrom, sTo, sRuns, tdRuns, stops, restarts, lates, rstBad, xVars, bN>>
+  /\ bgCancel' = FALSE
+  /\ UNCHANGED <<reg, iVars, jVars, rMode, rT, rHad, rRuns, rSeen, sFrom, sTo, sRuns, tdRuns, stops, restarts, lates, rstBad, xVars,
+                 bN, bKind, bRuns>>
 
 \* A forced stop whose requests do not drain within its bound gives up:
 \* admission opens again, the requests go on, nothing is torn down (the code
@@ -672,15 +685,47 @@ BgStart ==
   /\ \E n \in quar :
        /\ kit[n] # None /\ owner[kit[n]] = None
        /\ owner' = [owner EXCEPT ![kit[n]] = "bg"] /\ bN' = n
+  /\ bKind' = "rcv"
   /\ pc' = [pc EXCEPT !["bg"] = "act"]
-  /\ UNCHANGED <<world, reg, iVars, jVars, rVars, sVars, eVars, xVars, tdBad>>
+  /\ UNCHANGED <<world, reg, iVars, jVars, rVars, sVars, eVars, xVars, bRuns, bgCancel, tdBad>>
 
+\* A Kit update in the background pass: under the new Kit's lock it chooses
+\* the name; its create is the next step (BgEnd), and it may take long.
+BgStartUpd ==
+  /\ "bg" \in Actors /\ (~stopping \/ BgUnadmitted) /\ pc["bg"] = "idle" /\ bRuns < MaxJobs
+  /\ \E k \in {"a", "b"}, ok \in BOOLEAN :
+       LET a == AssignW(RecoverCur(W0, k, ok), k) IN
+       /\ owner[k] = None /\ a.n # 0
+       /\ SetW(a.w) /\ owner' = [owner EXCEPT ![k] = "bg"] /\ bN' = a.n
+  /\ bKind' = "upd" /\ bRuns' = bRuns + 1
+  /\ pc' = [pc EXCEPT !["bg"] = "act"]
+  /\ UNCHANGED <<reg, iVars, jVars, rVars, sVars, eVars, xVars, bgCancel, tdBad>>
+
+\* The pass's step ends: a recovery, or the update's create, whose reply
+\* is a timeout once a stop cancelled it (forced: `stopping`; plain:
+\* `bgCancel`); its intent stays (bgCancelForgets: forgotten).
 BgEnd ==
   /\ pc["bg"] = "act"
-  /\ SetW(Recovery(W0, bN))
+  /\ IF bKind = "rcv"
+     THEN SetW(Recovery(W0, bN)) /\ UNCHANGED lates
+     ELSE \E o \in (IF stopping \/ bgCancel THEN {"timeout"} ELSE Outs) :
+            LET res == Create(W0, bN, 0, o)
+                W1 == IF BgCancelForgets /\ bgCancel /\ res.made
+                      THEN EndRecs([res.w EXCEPT !.st[bN] = "retired", !.quar = res.w.quar \ {bN}], {bN}, Active)
+                      ELSE res.w
+            IN /\ SetW(W1) /\ Late(res.made)
   /\ Release("bg")
   /\ pc' = [pc EXCEPT !["bg"] = "idle"]
-  /\ UNCHANGED <<reg, iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
+  /\ UNCHANGED <<reg, iVars, jVars, rVars, sVars, tdRuns, stopping, stops, restarts, rstBad, xVars, bVars>>
+
+\* A plain `marsh stop`/`marsh reset` (or the restart probe) that finds only
+\* the background pass in flight cancels its creates and waits for it; the
+\* teardown then runs at quiescence (Teardown), which lets creates run again.
+TdCancelBg ==
+  /\ Acts("td") /\ tdRuns < MaxTeardowns /\ ~bgCancel /\ pc["bg"] # "idle"
+  /\ \A p \in Procs \ {"bg"} : pc[p] = "idle"
+  /\ bgCancel' = TRUE
+  /\ UNCHANGED <<world, reg, owner, pc, iVars, jVars, rVars, sVars, eVars, xVars, bN, bKind, bRuns, tdBad>>
 
 \* Environment: a create that did not report lands (stock: A2, it was absent).
 Land(n) ==
@@ -694,7 +739,7 @@ Next ==
   \/ InstDecideEarly \/ InstPrep \/ InstSubmit \/ InstReply \/ InstPublish \/ InstAbort
   \/ JobDecideEarly \/ JobRun \/ JobAbort
   \/ RstStart \/ RstLock \/ RstReplan \/ RstObserve \/ RstAct
-  \/ EphOpen \/ EphRun \/ EphClose \/ BgStart \/ BgEnd
+  \/ EphOpen \/ EphRun \/ EphClose \/ BgStart \/ BgStartUpd \/ BgEnd \/ TdCancelBg
   \/ SwStart \/ SwLock \/ SwAct
   \/ RecoverBg \/ Gc \/ Teardown \/ Restart \/ StopBegin \/ StopEnd \/ StopGiveUp
   \/ \E n \in NameIds : Land(n)

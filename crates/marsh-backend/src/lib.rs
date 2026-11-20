@@ -1571,7 +1571,6 @@ enum Replace {
     Always,
 }
 
-/// Never quarantine, foreign ownership, or work in progress.
 /// A test's probe at a named point of `install_command`.
 #[cfg(test)]
 type InstallHook = Box<dyn Fn(&str) + Send + Sync>;
@@ -1587,6 +1586,7 @@ fn lock_in_order(locks: &[Arc<Mutex<()>>]) -> Vec<std::sync::MutexGuard<'_, ()>>
         .collect()
 }
 
+/// Never quarantine, foreign ownership, or work in progress.
 const fn replace_after(error: &marsh_sbx::SbxError) -> Replace {
     match error {
         marsh_sbx::SbxError::WorkerNotReady(_) => Replace::Always,

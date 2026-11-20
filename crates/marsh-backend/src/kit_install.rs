@@ -130,10 +130,24 @@ impl StockDaemonBackend {
             if !plan.keys.is_subset(&keys) {
                 continue;
             }
+            // A name whose create was submitted (an install recorded it, or a
+            // failed create quarantined it) and under which nothing is listed
+            // is reported: its create may still land. A mere intent is not.
+            let mut submitted = self
+                .sbx
+                .quarantined_vms()
+                .into_keys()
+                .collect::<BTreeSet<_>>();
+            submitted.extend(
+                self.sbx
+                    .install_records()
+                    .into_iter()
+                    .map(|(name, _, _)| name),
+            );
             let claim = Self::claim_retirement(store, plan.targets.keys().cloned().collect())?;
             let may_land = self.retire_claimed_named(store, &plan.targets, &claim)?;
             let mut reply = plan.selected;
-            reply.extend(may_land.into_iter().map(|vm| {
+            reply.extend(may_land.into_iter().filter(|vm| submitted.contains(vm)).map(|vm| {
                 format!("{vm}: nothing is listed under it yet; its VM create may still land, and a later reset removes it")
             }));
             return Ok(reply);

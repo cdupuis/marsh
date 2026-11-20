@@ -29,10 +29,11 @@ export HOME=$selected
 #
 # The job's own credential always wins over a login sbx holds, so the proxy
 # is not asked and no token is set when the job has any of: a key, token,
-# profile or provider in its environment; a saved login in Claude's config
-# directory; or a helper or such a variable in its user or project settings.
-# A custom endpoint (ANTHROPIC_BASE_URL) counts too: the placeholder works
-# only through the proxy, toward api.anthropic.com.
+# profile or provider in its environment; a saved login or Console key in
+# Claude's config directory; an active Anthropic profile; or a helper or such
+# a variable in its user, project or command-line settings. A custom endpoint
+# (ANTHROPIC_BASE_URL) counts too: the placeholder works only through the
+# proxy, toward api.anthropic.com. kits/README.md lists what is not checked.
 claude_oauth_sentinel=sk-ant-oat01-proxy-managed
 anthropic_mode=${SBX_CRED_ANTHROPIC_MODE:-none}
 if [ "$anthropic_mode" = oauth ] ||
@@ -40,30 +41,65 @@ if [ "$anthropic_mode" = oauth ] ||
   # MARSH_* is reserved: a user shell can never forward this test override.
   anthropic_mode=$(node - "$anthropic_mode" \
     "${MARSH_TEST_CLAUDE_OAUTH_PROBE:-https://api.anthropic.com/api/oauth/profile}" \
-    "$claude_oauth_sentinel" <<'NODE'
+    "$claude_oauth_sentinel" "$@" <<'NODE'
 const fs = require("node:fs");
 const nodePath = require("node:path");
-const [mode, url, sentinel] = process.argv.slice(2);
+const [mode, url, sentinel, ...args] = process.argv.slice(2);
 const own = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
   "ANTHROPIC_PROFILE", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_BASE_URL",
   "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"];
-const configDir = process.env.CLAUDE_CONFIG_DIR ||
-  nodePath.join(process.env.HOME, ".claude");
-const settings = file => {
+const home = process.env.HOME;
+const configDir = process.env.CLAUDE_CONFIG_DIR || nodePath.join(home, ".claude");
+const anthropicDir = process.env.ANTHROPIC_CONFIG_DIR ||
+  nodePath.join(home, ".config", "anthropic");
+// Read only a regular file, of at most 16 MiB. O_NONBLOCK keeps the open of a
+// FIFO from blocking, and fstat checks what was actually opened.
+const readRegular = file => {
+  let fd;
   try {
-    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > 16 << 20) return undefined;
+    const buffer = Buffer.alloc(stat.size);
+    return buffer.subarray(0, fs.readSync(fd, buffer, 0, stat.size, 0)).toString("utf8");
+  } catch (_) {
+    return undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+};
+const parse = text => {
+  try {
+    const value = JSON.parse(text);
     return value !== null && typeof value === "object" ? value : {};
   } catch (_) {
     return {};
   }
 };
+// The --settings option of Claude takes a JSON object or a file, given as
+// `--settings X` or `--settings=X`.
+const cliSettings = [];
+for (let index = 0; index < args.length && args[index] !== "--"; index += 1) {
+  if (args[index] === "--settings" && index + 1 < args.length) cliSettings.push(args[++index]);
+  else if (args[index].startsWith("--settings=")) cliSettings.push(args[index].slice(11));
+}
+const settings = [
+  ...[nodePath.join(configDir, "settings.json"), ".claude/settings.json",
+      ".claude/settings.local.json"].map(file => parse(readRegular(file))),
+  ...cliSettings.map(value =>
+    parse(value.trim().startsWith("{") ? value : readRegular(value))),
+];
+const set = value => typeof value === "string" && value !== "";
 // "echo proxy-managed" is the helper this entrypoint writes for an API key.
-const hasOwn = own.some(name => process.env[name]) ||
+const hasOwn = own.some(name => set(process.env[name])) ||
   fs.existsSync(nodePath.join(configDir, ".credentials.json")) ||
-  [nodePath.join(configDir, "settings.json"), ".claude/settings.json",
-   ".claude/settings.local.json"].map(settings).some(value =>
-    (value.apiKeyHelper !== undefined && value.apiKeyHelper !== "echo proxy-managed") ||
-    own.some(name => value.env?.[name]));
+  set(parse(readRegular(nodePath.join(process.env.CLAUDE_CONFIG_DIR || home,
+                                      ".claude.json"))).primaryApiKey) ||
+  fs.existsSync(nodePath.join(anthropicDir, "active_config")) ||
+  fs.existsSync(nodePath.join(anthropicDir, "configs", "default.json")) ||
+  settings.some(value =>
+    (set(value.apiKeyHelper) && value.apiKeyHelper !== "echo proxy-managed") ||
+    own.some(name => set(value.env?.[name])));
 const busy = status => status === 429 || status >= 500;
 // Only a direct 200 counts. A busy proxy is asked once more; all of it within
 // three seconds. Without an answer, say so: sbx may hold a login after all.

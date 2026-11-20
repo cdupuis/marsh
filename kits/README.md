@@ -131,9 +131,27 @@ the mode is `oauth`:
 - a custom endpoint, `ANTHROPIC_BASE_URL`, since the sentinel works only
   through the proxy, toward `api.anthropic.com`;
 - a saved login, `.credentials.json` in `${CLAUDE_CONFIG_DIR:-$HOME/.claude}`;
+- a Console API key that `/login` saved as `primaryApiKey` in Claude's global
+  config, `${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json`;
+- an active Anthropic profile: `active_config` or `configs/default.json` in
+  `${ANTHROPIC_CONFIG_DIR:-$HOME/.config/anthropic}`;
 - an `apiKeyHelper` of its own, or one of these variables in the `env` of
-  the user settings in that directory, or of the project's
-  `.claude/settings.json` or `.claude/settings.local.json`.
+  the user settings (`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json`), of
+  the project's `.claude/settings.json` or `.claude/settings.local.json`, or
+  of settings given on the command line (`--settings`, as JSON or a file).
+
+Any non-empty value of these counts, even a provider flag set to `0`. Only
+regular files of up to 16 MiB are read: a settings path that is not a regular
+file, such as a FIFO, is ignored rather than allowed to block the launch. The
+check errs toward the job's own configuration and does not cover:
+
+- managed settings (`/etc/claude-code/managed-settings.json` and its `.d`
+  directory), which the Kit image does not ship;
+- `--setting-sources`. A helper or variable in a scope that this option leaves
+  out still counts, so the job starts with its own configuration and not with
+  the login that `sbx` holds;
+- an ACP-only home. ACP mode starts before the settings merge, so a stale
+  `echo proxy-managed` helper is removed only by a CLI launch.
 
 Claude's old outer-only block volumes were removed. Selected-home persistence
 is the single state mechanism for nested jobs, avoiding hidden state that the

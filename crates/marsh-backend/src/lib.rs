@@ -1789,14 +1789,26 @@ impl DaemonBackend for StockDaemonBackend {
     }
 
     fn auto_update_kits(&self, store: &DaemonStore) {
-        self.remove_retired_vms();
-        self.retire_drained(store);
-        self.sbx.release_deferred_session_pins();
-        self.recover_quarantined(store);
-        self.bring_shipped_kits(store, unix_millis(SystemTime::now()));
-        self.move_retired_kits(store, unix_millis(SystemTime::now()));
-        self.auto_update_pass(store, unix_millis(SystemTime::now()));
-        self.gc_pass(store, unix_millis(SystemTime::now()));
+        // Its Kit VM creates (shipped and automatic updates) run under the
+        // background cancellation (`StockSbx::in_background`).
+        self.sbx.in_background(|| {
+            self.remove_retired_vms();
+            self.retire_drained(store);
+            self.sbx.release_deferred_session_pins();
+            self.recover_quarantined(store);
+            self.bring_shipped_kits(store, unix_millis(SystemTime::now()));
+            self.move_retired_kits(store, unix_millis(SystemTime::now()));
+            self.auto_update_pass(store, unix_millis(SystemTime::now()));
+            self.gc_pass(store, unix_millis(SystemTime::now()));
+        });
+    }
+
+    fn cancel_background_creates(&self) {
+        self.sbx.cancel_background_creates();
+    }
+
+    fn resume_background_creates(&self) {
+        self.sbx.resume_background_creates();
     }
 
     fn gc_vms(
@@ -6333,7 +6345,9 @@ impl StockDaemonBackend {
 
     /// One automatic update of one Kit: the new image is prepared before the
     /// old Kit is locked, so its jobs keep starting meanwhile; then the switch
-    /// is the upgrade's own, under an ordinary request admission. Running jobs
+    /// is the upgrade's own. The whole background pass runs under one
+    /// admission (`spawn_kit_updater`), and its creates under the background
+    /// cancellation, which a plain stop or reset cancels. Running jobs
     /// do not hold it back: they finish on the old VM (see `apply_upgrade`).
     fn auto_update_one(
         &self,

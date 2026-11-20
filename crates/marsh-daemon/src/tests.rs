@@ -6503,8 +6503,12 @@ fn receipt_journal_is_owner_only_and_keeps_no_job_or_prompt_content() {
 /// A backend whose `kit install` is a VM create in flight: it ends when
 /// creates are cancelled, or (`ignores_cancel`) only when released.
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent switches of one fake.
 struct InstallInFlight {
     review_background: bool,
+    /// The background pass does not end when its creates are cancelled.
+    background_ignores_cancel: bool,
+    background_cancelled: AtomicBool,
     review_background_entered: AtomicBool,
     review_background_released: AtomicBool,
     review_teardown_overlapped_background: AtomicBool,
@@ -6565,6 +6569,15 @@ impl DaemonBackend for InstallInFlightBackend {
 
     fn cancel_creates(&self) {
         self.0.cancelled.store(true, Ordering::Release);
+    }
+
+    fn cancel_background_creates(&self) {
+        self.0.background_cancelled.store(true, Ordering::Release);
+        if !self.0.background_ignores_cancel {
+            self.0
+                .review_background_released
+                .store(true, Ordering::Release);
+        }
     }
 
     fn resume_creates(&self) {
@@ -6779,4 +6792,93 @@ fn review_forced_stop_must_drain_background_kit_work_before_teardown() {
             .load(Ordering::Acquire),
         "teardown ran during background Kit work: {result:?}"
     );
+}
+
+/// A server whose background pass is held, with `backend`.
+fn serve_with_held_background_pass(
+    backend: &InstallInFlightBackend,
+    drain: Duration,
+) -> (tempfile::TempDir, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let home = home();
+    let server = Server::bind(home.path())
+        .unwrap()
+        .with_backend(Arc::new(backend.clone()))
+        .with_forced_stop_drain(drain);
+    let end = Arc::new(AtomicBool::new(false));
+    let ending = end.clone();
+    let task = thread::spawn(move || {
+        server
+            .serve_until(|| ending.load(Ordering::Acquire))
+            .unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !backend.0.review_background_entered.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    (home, end, task)
+}
+
+/// Claude's round 2 (`KitInstall.tla` `TdCancelBg`): while the background
+/// Kit pass runs (a Kit update's create can take an hour), ordinary requests
+/// are served, and a plain stop cancels the pass's creates, waits for it,
+/// and stops; its teardown does not overlap the pass. GPT's probe, which
+/// showed the stop refused for the pass's whole run. Fails when a plain stop
+/// does not cancel background creates.
+#[test]
+fn a_plain_stop_cancels_the_background_pass_and_stops() {
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        review_background: true,
+        ..InstallInFlight::default()
+    }));
+    let (home, end, task) = serve_with_held_background_pass(&backend, Duration::from_secs(5));
+    let client = Client::connect(home.path()).unwrap();
+    assert_eq!(client.registered_commands().unwrap(), Vec::<String>::new());
+    let report = client.stop_scope().unwrap();
+    end.store(true, Ordering::Release);
+    task.join().unwrap();
+    assert!(report.cleanup_complete, "{report:?}");
+    assert!(backend.0.background_cancelled.load(Ordering::Acquire));
+    assert!(
+        !backend.0.cancelled.load(Ordering::Acquire),
+        "user creates were cancelled"
+    );
+    assert_eq!(
+        *backend.0.calls.lock().unwrap(),
+        [ScopeLifecycleAction::Stop]
+    );
+    assert!(
+        !backend
+            .0
+            .review_teardown_overlapped_background
+            .load(Ordering::Acquire)
+    );
+}
+
+/// A background pass that does not end within the bound keeps a plain reset
+/// refused (nothing torn down), and the refusal says what `--force` does.
+#[test]
+fn a_background_pass_that_does_not_end_refuses_a_plain_reset_with_the_force_hint() {
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        review_background: true,
+        background_ignores_cancel: true,
+        ..InstallInFlight::default()
+    }));
+    let (home, end, task) = serve_with_held_background_pass(&backend, Duration::from_millis(200));
+    let client = Client::connect(home.path()).unwrap();
+    let refused = client
+        .scope_lifecycle_with_timeout(PublicRequest::ResetScope, Duration::from_secs(5))
+        .unwrap_err()
+        .to_string();
+    backend
+        .0
+        .review_background_released
+        .store(true, Ordering::Release);
+    end.store(true, Ordering::Release);
+    task.join().unwrap();
+    assert!(
+        refused.contains("the background Kit pass") && refused.contains("marsh stop --force"),
+        "{refused}"
+    );
+    assert!(backend.0.calls.lock().unwrap().is_empty());
 }

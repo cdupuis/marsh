@@ -124,6 +124,8 @@ const SCOPE_LIFECYCLE_EXECUTION_TIMEOUT: Duration = Duration::from_mins(8);
 /// once their VM creates were cancelled; with the teardown's bound it stays
 /// within the client's reply timeout.
 const FORCED_STOP_DRAIN: Duration = Duration::from_secs(30);
+/// The in-flight label of the daemon's background Kit pass.
+const BACKGROUND_PASS: &str = "the background Kit pass";
 const SCOPE_LIFECYCLE_REPLY_TIMEOUT: Duration = Duration::from_mins(9);
 const RESIDENT_SHUTDOWN_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
 const RESIDENT_SHUTDOWN_RETRY_INTERVAL: Duration = Duration::from_millis(10);
@@ -1808,6 +1810,12 @@ pub trait DaemonBackend: Send + Sync + 'static {
     fn cancel_creates(&self) {}
     /// A forced stop that did not go ahead: creates may run again.
     fn resume_creates(&self) {}
+    /// A plain stop, reset or restart found only the background Kit pass in
+    /// flight: cancel that pass's VM creates (they may still land) so it
+    /// ends, never a user's install or job.
+    fn cancel_background_creates(&self) {}
+    /// The background pass may create again.
+    fn resume_background_creates(&self) {}
     fn teardown_scope(
         &self,
         action: ScopeLifecycleAction,
@@ -5751,7 +5759,7 @@ impl Server {
                     // transition began, and `marsh stop --force` (and plain
                     // stop or reset) waits for, or is refused by, the one
                     // running: a teardown never overlaps its Kit/VM work.
-                    let pass = match store.begin_background_request("the background Kit pass") {
+                    let pass = match store.begin_background_request(BACKGROUND_PASS) {
                         Ok(_admission) => {
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 backend.auto_update_kits(&store);
@@ -6512,6 +6520,31 @@ impl ConnectionHandler {
 
     /// The busy refusal of a lifecycle request; once the pinned stock SBX is
     /// gone, what the refusal now waits for and why.
+    /// Before a plain stop, reset or restart: when the only work in flight
+    /// is the background Kit pass, cancel its VM creates (a Kit update's
+    /// create can take an hour; it may still land, and its intent stays) and
+    /// wait, within the forced stop's bound, for the pass to end
+    /// (`docs/model/KitInstall.tla` `TdCancelBg`). A user's install or job is
+    /// never cancelled here: that refuses, as before. Returns whether it
+    /// cancelled.
+    fn drain_background_pass(&self) -> bool {
+        let only_background = |requests: &[String]| {
+            !requests.is_empty()
+                && requests
+                    .iter()
+                    .all(|request| request.starts_with(BACKGROUND_PASS))
+        };
+        if !only_background(&self.store.requests_in_flight()) {
+            return false;
+        }
+        self.backend.cancel_background_creates();
+        let deadline = Instant::now() + self.forced_stop_drain;
+        while Instant::now() < deadline && only_background(&self.store.requests_in_flight()) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        true
+    }
+
     fn busy_lifecycle_message(&self) -> String {
         match self.stock_sbx.as_deref() {
             Some(path) if stock_sbx_removed(Some(path)) => stock_sbx_removed_message(path),
@@ -6524,7 +6557,10 @@ impl ConnectionHandler {
                     if requests.is_empty() {
                         format!("{BUSY_BLOCKED}{REQUEST_IN_FLIGHT}")
                     } else {
-                        format!("{BUSY_BLOCKED}{REQUEST_IN_FLIGHT}: {}", requests.join(", "))
+                        format!(
+                            "{BUSY_BLOCKED}{REQUEST_IN_FLIGHT}: {} (`marsh stop --force` cancels the VM creates in flight and stops)",
+                            requests.join(", ")
+                        )
                     }
                 } else {
                     busy_blockers_message(&blockers)
@@ -7675,7 +7711,14 @@ impl ConnectionHandler {
         let admission = if request.body == PublicRequest::ForceStopScope {
             self.store.begin_forced_stop()
         } else if lifecycle_request {
-            self.store.begin_lifecycle_request()
+            let cancelled = self.drain_background_pass();
+            let admission = self.store.begin_lifecycle_request();
+            if cancelled {
+                // Admitted or not, no new background pass starts under a
+                // lifecycle transition; one after it may create again.
+                self.backend.resume_background_creates();
+            }
+            admission
         } else {
             self.store
                 .begin_ordinary_request(request_label(&request.body))

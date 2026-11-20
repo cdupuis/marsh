@@ -1530,3 +1530,52 @@ fn a_forced_stop_cancels_the_kit_create_in_flight_and_submits_no_other() {
     ));
     assert_eq!(model.count("create"), 1);
 }
+
+/// Claude's round 2 (`KitInstall.tla` `TdCancelBg`): a plain stop or reset
+/// cancels the background pass's Kit VM create in flight, and no other
+/// create; the cancelled one may still land (its name quarantined as
+/// may-still-land). Fails when background creates run under the shared
+/// cancellation (the user's create is cancelled too) or under none.
+#[test]
+fn a_plain_stop_cancels_only_the_background_passs_create() {
+    let model = StockModel::new();
+    model.hold_creates_until_cancelled();
+    let adapter = Arc::new(model.adapter());
+    let background = KitFixture::published(KIT);
+    let (creating, spec) = (Arc::clone(&adapter), background.spec.clone());
+    let pass = std::thread::spawn(move || creating.in_background(|| creating.ensure_kit_vm(&spec)));
+    model.wait_for_held_create();
+    let user = KitFixture::local("marsh-kit-user");
+    let (creating, spec) = (Arc::clone(&adapter), user.spec.clone());
+    let install = std::thread::spawn(move || creating.ensure_kit_vm(&spec));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while model.count("create") < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the user's create never ran"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    adapter.cancel_background_creates();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !pass.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background create was not cancelled"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let error = pass.join().unwrap().unwrap_err();
+    assert!(matches!(error, SbxError::Io(_)), "{error}");
+    assert!(adapter.quarantined_vms()[KIT].create_pending);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !install.is_finished(),
+        "the user's create was cancelled too"
+    );
+
+    // A forced stop ends that one as well.
+    adapter.cancel_creates();
+    assert!(matches!(install.join().unwrap(), Err(SbxError::Io(_))));
+}

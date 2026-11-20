@@ -202,6 +202,20 @@ fn stock_call_error(error: io::Error, operation: &'static str, timeout: Duration
     }
 }
 
+thread_local! {
+    /// Whether this thread runs the daemon's background Kit pass
+    /// ([`StockSbx::in_background`]).
+    static BACKGROUND_CREATES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The cancellations Kit VM creates run under: `marsh stop --force` cancels
+/// both; a plain stop or reset cancels only the background pass's.
+#[derive(Default)]
+struct CreateCancellations {
+    all: marsh_runtime::Cancellation,
+    background: marsh_runtime::Cancellation,
+}
+
 /// A registry Kit reference as stock must read it. Stock's `ResolveReference`
 /// stats an unprefixed argument (relative to its cwd) before its OCI
 /// heuristic, so a directory named like `registry/repo@sha256:...` or
@@ -1233,7 +1247,7 @@ pub struct StockSbx {
     /// Cancelled by `marsh stop --force` ([`Self::cancel_creates`]): every
     /// Kit VM create in flight ends, and no new one is submitted until
     /// [`Self::resume_creates`].
-    create_cancel: Mutex<marsh_runtime::Cancellation>,
+    create_cancel: Mutex<CreateCancellations>,
     shell_recovery_specs: Mutex<BTreeMap<String, ShellVmSpec>>,
     active_shell_sessions: Mutex<BTreeMap<String, Arc<AtomicUsize>>>,
     // Quarantine retains admitted directory handles and mount references until
@@ -1398,7 +1412,7 @@ impl StockSbx {
             installed_shell_artifacts: Mutex::new(BTreeMap::new()),
             shell_mount_references: Mutex::new(BTreeMap::new()),
             ownership: VmOwnership::in_memory(),
-            create_cancel: Mutex::new(marsh_runtime::Cancellation::default()),
+            create_cancel: Mutex::new(CreateCancellations::default()),
             shell_recovery_specs: Mutex::new(BTreeMap::new()),
             active_shell_sessions: Mutex::new(BTreeMap::new()),
             uncertain_shell_grants: Mutex::new(BTreeMap::new()),
@@ -7703,12 +7717,56 @@ impl StockSbx {
             .map_err(|error| stock_call_error(error, operation, timeout))
     }
 
-    /// The cancellation every Kit VM create in flight runs under.
+    /// The cancellation a Kit VM create on this thread runs under: the
+    /// background pass's own ([`Self::in_background`]), or every other's.
     fn create_cancellation(&self) -> marsh_runtime::Cancellation {
+        let tokens = self
+            .create_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if BACKGROUND_CREATES.with(std::cell::Cell::get) {
+            tokens.background.clone()
+        } else {
+            tokens.all.clone()
+        }
+    }
+
+    /// Run `work` (the daemon's background Kit pass) with its Kit VM creates
+    /// under the background cancellation: a plain `marsh stop` or `marsh
+    /// reset` cancels those ([`Self::cancel_background_creates`]), never a
+    /// user's `kit install` or job.
+    pub fn in_background<T>(&self, work: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                BACKGROUND_CREATES.with(|flag| flag.set(self.0));
+            }
+        }
+        let _restore = Restore(BACKGROUND_CREATES.with(|flag| flag.replace(true)));
+        work()
+    }
+
+    /// A plain stop or reset found the background pass in flight: end its
+    /// Kit VM create in flight (the VM may still land, and its intent stays)
+    /// and submit no new background create until
+    /// [`Self::resume_background_creates`].
+    pub fn cancel_background_creates(&self) {
         self.create_cancel
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .background
+            .cancel();
+    }
+
+    /// The background pass may create again (unless a forced stop runs).
+    pub fn resume_background_creates(&self) {
+        let mut tokens = self
+            .create_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !tokens.all.is_cancelled() {
+            tokens.background = marsh_runtime::Cancellation::default();
+        }
     }
 
     /// Refuse to submit a Kit VM create once `marsh stop --force` began.
@@ -7723,7 +7781,12 @@ impl StockSbx {
     /// process group is killed; the VM may still land, and its intent stays)
     /// and submit no new one until [`Self::resume_creates`].
     pub fn cancel_creates(&self) {
-        self.create_cancellation().cancel();
+        let tokens = self
+            .create_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokens.all.cancel();
+        tokens.background.cancel();
     }
 
     /// A forced stop that did not go ahead: creates are submitted again.
@@ -7731,8 +7794,7 @@ impl StockSbx {
         *self
             .create_cancel
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            marsh_runtime::Cancellation::default();
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = CreateCancellations::default();
     }
 
     fn run_bounded_os<I, S>(

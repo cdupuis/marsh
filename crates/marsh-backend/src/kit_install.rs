@@ -1265,6 +1265,82 @@ mod tests {
     }
 
     #[test]
+    fn review_ephemeral_recovery_remembers_the_actual_name_for_session_cleanup() {
+        let mut lab = Lab::new();
+        let lease = lab.backend.sbx.allocate_ephemeral_home().unwrap();
+        let token = lease.token();
+        lab.store = None;
+        let server = marsh_daemon::Server::bind(lab.home.path())
+            .unwrap()
+            .with_backend(lab.backend.clone());
+        lab.store = Some(server.store());
+        let task = std::thread::spawn(move || server.serve_one().unwrap());
+        let authority = marsh_daemon::SessionAuthority {
+            username: "review".into(),
+            uid: nix::unistd::Uid::current().as_raw(),
+            gid: nix::unistd::Gid::current().as_raw(),
+            launch_directory: lab.home.path().to_owned(),
+            guest_home: lease.path().to_owned(),
+            home_backing: lease.path().to_owned(),
+            ephemeral_home: true,
+        };
+        let reply = marsh_daemon::Client::connect(lab.home.path())
+            .unwrap()
+            .request(marsh_daemon::PublicRequest::AttachEphemeralShell {
+                pid: std::process::id(),
+                session: authority.clone(),
+                expected_project_identity: None,
+                token: token.clone(),
+            })
+            .unwrap();
+        task.join().unwrap();
+        let marsh_daemon::PublicReply::ShellAttached { session_id } = reply else {
+            panic!("{reply:?}");
+        };
+        let session = marsh_daemon::SessionSpec {
+            session_id: session_id.clone(),
+            username: authority.username,
+            uid: authority.uid,
+            gid: authority.gid,
+            launch_directory: authority.launch_directory,
+            guest_home: authority.guest_home,
+            home_backing: authority.home_backing,
+            ephemeral_home: true,
+            terminal: false,
+            terminal_size: None,
+        };
+        lab.register("c", &reference('c'));
+        let spec = lab
+            .backend
+            .kit_spec_for_session("c", &session, lab.store())
+            .unwrap();
+        lab.stock
+            .script(&[Create::FailedListed, Create::FailedListed]);
+        lab.backend
+            .prepare_one_authorized(&spec, lab.store(), Some(&token), |_| Ok(()))
+            .unwrap_err();
+        lab.backend
+            .prepare_one_authorized(&spec, lab.store(), Some(&token), |_| Ok(()))
+            .unwrap_err();
+        let created = lab.stock.created();
+        assert_eq!(created.len(), 2);
+        assert_ne!(created[0], created[1]);
+        let remembered = lab
+            .backend
+            .remembered_ephemeral_kits()
+            .into_iter()
+            .map(|s| s.name)
+            .collect::<Vec<_>>();
+        lease.close_admission().unwrap();
+        let closed = lab.backend.close_ephemeral_kits(&session_id, lab.store());
+        assert!(
+            closed.is_ok() && lab.stock.listed().is_empty(),
+            "close={closed:?}, session cleanup knew {remembered:?}, actual VM left={:?}",
+            lab.stock.listed()
+        );
+    }
+
+    #[test]
     fn review_late_adoption_during_an_absent_reset_must_not_forget_the_vm() {
         let mut lab = Lab::new();
         lab.stock.script(&[Create::TimedOutLandsLater]);

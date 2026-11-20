@@ -63,30 +63,17 @@ impl StockDaemonBackend {
             .get(session)
             .cloned()
             .unwrap_or_default();
-        // The Kit lock key of each VM's ownership key, as its preparation
-        // takes it (`kit_lock_key`).
-        let keys = specs
+        // One Kit lock per ownership key of the session (as its preparations
+        // take them: `kit_lock_key`), in key order.
+        let owners = specs
             .values()
-            .map(|spec| {
-                self.kit_lock_key(&ephemeral_ownership_key(
-                    spec.workload_kit.identity(),
-                    session,
-                ))
-            })
+            .map(|spec| ephemeral_ownership_key(spec.workload_kit.identity(), session))
+            .collect::<BTreeSet<_>>();
+        let keys = owners
+            .iter()
+            .map(|owner| self.kit_lock_key(owner))
             .collect::<Result<Vec<_>, DaemonError>>()?;
-        let locks = {
-            let mut all = self
-                .kit_locks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            keys.iter()
-                .map(|key| {
-                    all.entry(key.clone())
-                        .or_insert_with(|| Arc::new(Mutex::new(())))
-                        .clone()
-                })
-                .collect::<Vec<_>>()
-        };
+        let locks = self.kit_locks_in_order(&owners)?;
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut guards = Vec::new();
         for lock in &locks {
@@ -110,6 +97,23 @@ impl StockDaemonBackend {
                         ));
                     }
                 }
+            }
+        }
+        // Under those locks: every VM the session's keys own, not only the
+        // names noted before a preparation chose (`KitInstall.tla`
+        // `ephStaleName`): a preparation may recover the noted VM and create
+        // under a new name.
+        let mut specs = specs;
+        for (name, owner) in self.sbx.live_kit_entries() {
+            if !owners.contains(&owner) || specs.contains_key(&name) {
+                continue;
+            }
+            if let Some(template) = specs.values().find(|spec| {
+                ephemeral_ownership_key(spec.workload_kit.identity(), session) == owner
+            }) {
+                let mut spec = template.clone();
+                spec.name.clone_from(&name);
+                specs.insert(name, spec);
             }
         }
         let names = specs.keys().cloned().collect::<Vec<_>>();

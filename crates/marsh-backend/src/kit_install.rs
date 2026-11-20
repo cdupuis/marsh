@@ -1,5 +1,80 @@
-//! `marsh kit install`, its Kit VM and `marsh workers reset`: the design
+//! `marsh kit install` records and `marsh workers reset NAME|all`: the design
 //! `docs/model/KitInstall.tla` proves (issue #194).
+//!
+//! An install attempt persists a record (attempt id, command) in the
+//! ownership entry of the Kit VM name it chose, under the Kit lock and before
+//! its create; the record ends when the command is published, or with the
+//! name when its VM is retired. A failed create, however it failed, keeps its
+//! intent and its record: the VM may still land, and the record is how
+//! `workers reset NAME` reaches it, also after a restart.
+
+use marsh_daemon::DaemonError;
+use marsh_sbx::InstallRecord;
+
+use super::{StockDaemonBackend, backend_error};
+
+/// One install attempt that has not published its command: running while
+/// this guard lives. Dropping it settles the attempt (its persisted record
+/// stays); [`InstallAttempt::published`] ends the record.
+pub(super) struct InstallAttempt<'a> {
+    backend: &'a StockDaemonBackend,
+    record: InstallRecord,
+}
+
+impl InstallAttempt<'_> {
+    pub(super) const fn record(&self) -> &InstallRecord {
+        &self.record
+    }
+
+    /// The command is registered: the attempt's record ends.
+    pub(super) fn published(self) -> Result<(), DaemonError> {
+        self.backend
+            .sbx
+            .end_install_record(&self.record.attempt)
+            .map(drop)
+            .map_err(backend_error)
+    }
+}
+
+impl Drop for InstallAttempt<'_> {
+    fn drop(&mut self) {
+        self.backend
+            .running_installs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.record.attempt);
+    }
+}
+
+impl StockDaemonBackend {
+    /// A new install attempt of `command`, running until the guard drops
+    /// ([`InstallRecord::new_attempt`]: its id is never reused).
+    pub(super) fn begin_install_attempt(&self, command: &str) -> InstallAttempt<'_> {
+        let record = InstallRecord::new_attempt(command);
+        self.running_installs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(record.attempt.clone());
+        InstallAttempt {
+            backend: self,
+            record,
+        }
+    }
+
+    /// The commands whose install records name `vm`, for `marsh status`.
+    pub(super) fn install_names_for_vm(&self, vm: &str) -> Vec<String> {
+        let mut names = self
+            .sbx
+            .install_records()
+            .into_iter()
+            .filter(|(name, _, _)| name == vm)
+            .map(|(_, _, record)| record.command)
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+    }
+}
 
 /// Each test reproduces one race of a `KitInstall.tla` negative control with
 /// a scripted stock SBX, and names the rule whose removal makes it fail.
@@ -268,6 +343,7 @@ mod tests {
         assert_ne!(created[0], created[1]);
         assert_eq!(lab.stock.removed(), [created[0].clone()], "recovered first");
         lab.assert_every_vm_owned();
+        assert_eq!(lab.records(), [format!("{} hf", created[1])]);
     }
 
     /// `jobPathStaleName`: a job's preparation is handed the name chosen

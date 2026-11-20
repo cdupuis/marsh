@@ -156,6 +156,9 @@ pub struct StockDaemonBackend {
     configured_mcp_vms: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
     /// Why automatic recovery last left a quarantined Kit VM in place.
     quarantine_recovery: Mutex<BTreeMap<String, String>>,
+    /// The ids of `kit install` attempts that have not published their
+    /// command (`kit_install.rs`); their records are persisted in the map.
+    running_installs: Mutex<BTreeSet<String>>,
     /// Session-origin cloud placement (`docs/design/cloud-placement.md`).
     cloud: cloud::CloudPlacement,
     /// Automatic Kit updates; off unless [`Self::with_auto_update`].
@@ -495,6 +498,7 @@ impl StockDaemonBackend {
             sbxenv_sweep: Mutex::new(sbxenv::Sweep::default()),
             configured_mcp_vms: Mutex::new(BTreeMap::new()),
             quarantine_recovery: Mutex::new(BTreeMap::new()),
+            running_installs: Mutex::new(BTreeSet::new()),
             cloud: cloud::CloudPlacement::default(),
             auto_update: None,
             kit_updates: Mutex::new(()),
@@ -5673,9 +5677,42 @@ impl StockDaemonBackend {
                 return Err(DaemonError::InvalidState("aliases of the same Kit must have identical environments; add the matching sbxenvs file".into()));
             }
         }
+        // With a store, the Kit VM is prepared under the Kit lock, which is
+        // held until the command is registered (`docs/model/KitInstall.tla`,
+        // rule 2): no recovery, GC or reset of the Kit sees the VM between
+        // its preparation and the registry write. The attempt's persisted
+        // record names the VM until then, and stays if the install fails.
+        let owner = workload.identity().to_owned();
+        let kit_lock = store.map(|_| self.kit_lock_for_key(&owner)).transpose()?;
+        let observed_validation = self.observed_validation(&owner)?;
+        let _kit = kit_lock.as_ref().map(|lock| {
+            lock.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        let mut attempt = None;
         if let Some(store) = store {
-            let spec = self.kit_spec_for_workload(workload.clone())?;
-            let vm = self.prepare_one_with_progress(&spec, store, |_| Ok(()))?;
+            let started = attempt.insert(self.begin_install_attempt(&command));
+            let hint = self
+                .sbx
+                .recorded_vm_name(VmPurpose::Kit, &owner)
+                .unwrap_or_default();
+            let spec = self.kit_spec_for_workload_named(workload.clone(), hint)?;
+            let vm = self
+                .prepare_held(
+                    &spec,
+                    store,
+                    &owner,
+                    observed_validation,
+                    Some(started.record()),
+                )
+                .map_err(|error| {
+                    let vm = self.sbx.recorded_vm_name(VmPurpose::Kit, &owner);
+                    quarantine_hint(
+                        error,
+                        &command,
+                        vm.and_then(|vm| self.recovery_note(&vm)).as_deref(),
+                    )
+                })?;
             self.register_worker(store, &vm)?;
         }
         self.persist_installed_command(&previous, &updated)?;
@@ -5691,6 +5728,9 @@ impl StockDaemonBackend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(command, RegisteredKit { workload });
+        if let Some(attempt) = attempt {
+            attempt.published()?;
+        }
         Ok(reference)
     }
 

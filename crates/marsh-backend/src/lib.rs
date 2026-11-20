@@ -159,6 +159,10 @@ pub struct StockDaemonBackend {
     /// The ids of `kit install` attempts that have not published their
     /// command (`kit_install.rs`); their records are persisted in the map.
     running_installs: Mutex<BTreeSet<String>>,
+    /// Runs once between a reset's first plan and its Kit locks (tests that
+    /// interleave another operation there).
+    #[cfg(test)]
+    reset_before_locks: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Session-origin cloud placement (`docs/design/cloud-placement.md`).
     cloud: cloud::CloudPlacement,
     /// Automatic Kit updates; off unless [`Self::with_auto_update`].
@@ -499,6 +503,8 @@ impl StockDaemonBackend {
             configured_mcp_vms: Mutex::new(BTreeMap::new()),
             quarantine_recovery: Mutex::new(BTreeMap::new()),
             running_installs: Mutex::new(BTreeSet::new()),
+            #[cfg(test)]
+            reset_before_locks: Mutex::new(None),
             cloud: cloud::CloudPlacement::default(),
             auto_update: None,
             kit_updates: Mutex::new(()),
@@ -2017,51 +2023,7 @@ impl DaemonBackend for StockDaemonBackend {
         if let Some(done) = self.reset_cloud_selection(selection, &store)? {
             return Ok(done);
         }
-        let mut selected = match selection {
-            LoadSelection::All => self.command_names(),
-            LoadSelection::Kits(commands) => commands.clone(),
-        };
-        selected.sort();
-        selected.dedup();
-        if selected.is_empty() {
-            return Err(DaemonError::InvalidState(
-                "worker reset selection cannot be empty".into(),
-            ));
-        }
-
-        // Resolve every command before making any lifecycle change. Aliases
-        // that name the same exact Kit identity collapse to one owned VM.
-        let mut specs = BTreeMap::new();
-        for command in &selected {
-            let spec = self.kit_spec(command)?;
-            specs.entry(spec.name.clone()).or_insert(spec);
-        }
-        let locks = specs
-            .values()
-            .map(|spec| {
-                let key = self.kit_flight_key(spec, false)?;
-                Ok(self
-                    .kit_locks
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .entry(key)
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone())
-            })
-            .collect::<Result<Vec<_>, DaemonError>>()?;
-        let _guards = locks
-            .iter()
-            .map(|lock| {
-                lock.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-            })
-            .collect::<Vec<_>>();
-        let claim = Self::claim_retirement(&store, specs.keys().cloned().collect())?;
-        self.retire_claimed(&store, &specs, &claim)?;
-        if matches!(selection, LoadSelection::All) {
-            self.retire_unnamed_quarantined(&store)?;
-        }
-        Ok(selected)
+        self.reset_kit_vms(selection, &store)
     }
 
     #[allow(clippy::too_many_lines)] // Reports each local cleanup independently.
@@ -6649,31 +6611,62 @@ impl StockDaemonBackend {
         specs: &BTreeMap<String, KitVmSpec>,
         claim: &RetirementClaim,
     ) -> Result<(), DaemonError> {
+        self.retire_claimed_named(
+            store,
+            &specs
+                .iter()
+                .map(|(name, spec)| (name.clone(), spec.workload_kit.identity().to_owned()))
+                .collect(),
+            claim,
+        )
+        .map(drop)
+    }
+
+    /// [`Self::retire_claimed`] by VM name and ownership key, under the Kit
+    /// lock of each key. A VM is removed by its recorded UUID and its name
+    /// forgotten, which ends the install records naming it. A name nothing
+    /// is listed under keeps its intent and records (a create that may still
+    /// land) and loses its quarantine. Returns those names.
+    fn retire_claimed_named(
+        &self,
+        store: &DaemonStore,
+        targets: &BTreeMap<String, String>,
+        claim: &RetirementClaim,
+    ) -> Result<Vec<String>, DaemonError> {
         let RetirementClaim {
             worker_ids,
             live,
             quarantined,
         } = claim;
-        for (index, (worker_id, spec)) in specs.iter().enumerate() {
-            let retired = self.sbx.retire_kit_vm_before(
-                spec,
+        let mut may_land = Vec::new();
+        for (index, (worker_id, owner)) in targets.iter().enumerate() {
+            let retired = self.sbx.retire_kit_vm_named_before(
+                worker_id,
+                owner,
                 Instant::now() + Duration::from_hours(24),
                 Some((live, quarantined.contains(worker_id))),
             );
-            if let Err(error) = retired {
-                // Only claimed workers are settled; a target this daemon never
-                // registered (an automatic claim of an unserved VM) has none.
-                if worker_ids.contains(worker_id) {
-                    store.finish_worker_reset(worker_id, false)?;
+            match retired {
+                Ok(false) if self.sbx.is_live_vm_name(worker_id) => {
+                    may_land.push(worker_id.clone());
                 }
-                let rest = specs
-                    .keys()
-                    .skip(index + 1)
-                    .filter(|id| worker_ids.contains(id))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                store.cancel_workers_reset(&rest);
-                return Err(backend_error(error));
+                Ok(_) => {}
+                Err(error) => {
+                    // Only claimed workers are settled; a target this daemon
+                    // never registered (an automatic claim of an unserved VM)
+                    // has none.
+                    if worker_ids.contains(worker_id) {
+                        store.finish_worker_reset(worker_id, false)?;
+                    }
+                    let rest = targets
+                        .keys()
+                        .skip(index + 1)
+                        .filter(|id| worker_ids.contains(id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    store.cancel_workers_reset(&rest);
+                    return Err(backend_error(error));
+                }
             }
             self.ready_kits
                 .lock()
@@ -6682,7 +6675,7 @@ impl StockDaemonBackend {
             self.kit_validation_flights
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(self.kit_flight_key(spec, false)?)
+                .entry(self.kit_lock_key(owner)?)
                 .and_modify(|completion| {
                     completion.epoch = completion.epoch.saturating_add(1);
                     completion.error = None;
@@ -6701,7 +6694,7 @@ impl StockDaemonBackend {
                 .remove(worker_id);
             store.finish_worker_reset(worker_id, true)?;
         }
-        Ok(())
+        Ok(may_land)
     }
 }
 
@@ -9272,14 +9265,17 @@ mod tests {
                 .unwrap(),
             vec!["second".to_string()]
         );
-        assert_eq!(runner.runs.lock().unwrap().len(), 1);
+        // Neither Kit has a VM name in the ownership map: a reset looks the
+        // name up and never assigns one, so it has nothing to list or remove.
+        assert_eq!(runner.runs.lock().unwrap().len(), 0);
+        assert_eq!(backend.sbx.live_kit_entries(), Vec::new());
         assert_eq!(
             backend
                 .reset_workers(&LoadSelection::All, store.clone())
                 .unwrap(),
             vec!["first".to_string(), "second".to_string()]
         );
-        assert_eq!(runner.runs.lock().unwrap().len(), 3);
+        assert_eq!(runner.runs.lock().unwrap().len(), 0);
         let before = runner.runs.lock().unwrap().len();
         assert!(matches!(
             backend.reset_workers(&LoadSelection::Kits(vec!["unknown".into()]), store,),

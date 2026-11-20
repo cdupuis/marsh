@@ -243,22 +243,6 @@ impl StockDaemonBackend {
         Some(self.recover_quarantined_vm(store, &spec.name))
     }
 
-    /// `marsh workers reset all`: Kit VMs quarantined by the adapter that no
-    /// command names any more (a failed `kit install`) are retired too.
-    pub(super) fn retire_unnamed_quarantined(
-        &self,
-        store: &DaemonStore,
-    ) -> Result<(), DaemonError> {
-        for vm in self.sbx.quarantined_vms().into_keys() {
-            if self.spec_for_vm(&vm).1.is_some() || store.worker_has_unfinished_jobs(&vm) {
-                continue;
-            }
-            self.retire_recovered(store, &vm, None)?;
-            self.note_recovery(store, &vm, None);
-        }
-        Ok(())
-    }
-
     /// `marsh status`: quarantines the adapter holds (with their reasons)
     /// on the store's workers, and VMs that are not registered workers.
     pub(super) fn annotate_quarantines(&self, workers: &mut Vec<WorkerStatus>, scope_id: &str) {

@@ -16,11 +16,12 @@
 //! and records: its create may still land.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use marsh_daemon::{DaemonError, DaemonStore, LoadSelection};
 use marsh_sbx::{InstallRecord, VmPurpose};
 
-use super::{StockDaemonBackend, backend_error, lock_in_order};
+use super::{StockDaemonBackend, backend_error};
 
 /// How many times a reset plans again because its Kits changed while it
 /// waited for their locks.
@@ -75,6 +76,20 @@ impl Drop for InstallAttempt<'_> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.record.attempt);
     }
+}
+
+/// Every Kit lock of `locks` (in their key order) without waiting, or
+/// `None` (and none held) when one is held elsewhere.
+fn try_lock_in_order(locks: &[Arc<Mutex<()>>]) -> Option<Vec<MutexGuard<'_, ()>>> {
+    let mut guards = Vec::with_capacity(locks.len());
+    for lock in locks {
+        match lock.try_lock() {
+            Ok(guard) => guards.push(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => guards.push(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    }
+    Some(guards)
 }
 
 /// What a reset removes, planned under the Kit locks of `keys`.
@@ -151,7 +166,22 @@ impl StockDaemonBackend {
                 hook();
             }
             let locks = self.kit_locks_in_order(&keys)?;
-            let _guards = lock_in_order(&locks);
+            // Never wait blocked on a Kit lock: an install that started on
+            // one of these Kits since the plan holds it for its whole create.
+            // While a lock is held, plan again: that refuses (NAME) or skips
+            // (all) such an install, and any other change starts over.
+            let guards = loop {
+                if let Some(guards) = try_lock_in_order(&locks) {
+                    break Some(guards);
+                }
+                if self.plan_reset(selection)?.keys != keys {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let Some(_guards) = guards else {
+                continue;
+            };
             // Nothing planned before the locks is used after them.
             let plan = self.plan_reset(selection)?;
             if !plan.keys.is_subset(&keys) {
@@ -177,19 +207,17 @@ impl StockDaemonBackend {
                 // never retired, and the others still go.
                 let mut may_land = Vec::new();
                 for (name, owner) in &plan.targets {
-                    let retired = if store.worker_has_unfinished_jobs(name) {
-                        Err(DaemonError::InvalidState(
-                            "a job on it has not finished (its cleanup is not verified)".into(),
-                        ))
-                    } else {
-                        Self::claim_retirement(store, vec![name.clone()]).and_then(|claim| {
+                    // The claim itself refuses a VM with an unfinished job
+                    // or one whose cleanup is not verified (in one step under
+                    // the store lock), quarantined or not.
+                    let retired = Self::claim_settled_retirement(store, vec![name.clone()])
+                        .and_then(|claim| {
                             self.retire_claimed_named(
                                 store,
                                 &BTreeMap::from([(name.clone(), owner.clone())]),
                                 &claim,
                             )
-                        })
-                    };
+                        });
                     match retired {
                         Ok(names) => may_land.extend(names),
                         Err(error) => reply.push(format!("{name}: skipped: {error}")),
@@ -251,6 +279,19 @@ impl StockDaemonBackend {
                         add_registered(&mut plan, &command)?;
                         found = true;
                     }
+                    for (name, owner, record) in &records {
+                        if record.command != command {
+                            continue;
+                        }
+                        plan.targets.insert(name.clone(), owner.clone());
+                        plan.keys.insert(owner.clone());
+                        found = true;
+                    }
+                    if !found {
+                        return Err(DaemonError::NotFound(command));
+                    }
+                    // With every Kit NAME's targets need (its registered Kit's
+                    // and its records'): an install on any of them refuses.
                     if let Some((other, _)) = running
                         .iter()
                         .find(|(other, owner)| *other == command || plan.keys.contains(owner))
@@ -263,17 +304,6 @@ impl StockDaemonBackend {
                                 format!(" on {command}'s Kit")
                             }
                         )));
-                    }
-                    for (name, owner, record) in &records {
-                        if record.command != command {
-                            continue;
-                        }
-                        plan.targets.insert(name.clone(), owner.clone());
-                        plan.keys.insert(owner.clone());
-                        found = true;
-                    }
-                    if !found {
-                        return Err(DaemonError::NotFound(command));
                     }
                     plan.selected.push(command);
                 }
@@ -701,6 +731,151 @@ mod tests {
                 .map(|(name, _, record)| format!("{name} {}", record.command))
                 .collect()
         }
+    }
+
+    #[test]
+    fn review_v2b_reset_all_skips_unverified_job_cleanup_and_makes_progress() {
+        reset_all_with_a_quarantined_job(true);
+    }
+
+    #[test]
+    fn review_v2b_reset_all_skips_running_job_and_makes_progress() {
+        reset_all_with_a_quarantined_job(false);
+    }
+
+    fn reset_all_with_a_quarantined_job(complete: bool) {
+        use marsh_daemon::{
+            CleanupState, ExitStatus, NewJob, SessionAuthority, TimingReport, WorkerHealth,
+            WorkerStatus,
+        };
+        let lab = Lab::new();
+        let vm = lab
+            .backend
+            .sbx
+            .vm_name(marsh_sbx::VmPurpose::Kit, &reference('c'))
+            .unwrap();
+        let idle = lab
+            .backend
+            .sbx
+            .vm_name(marsh_sbx::VmPurpose::Kit, &reference('d'))
+            .unwrap();
+        lab.stock.seed(&vm);
+        lab.stock.seed(&idle);
+        lab.backend.sbx.stock_inventory(true).unwrap();
+        let store = lab.store();
+        store
+            .register_worker(WorkerStatus {
+                worker_id: vm.clone(),
+                vm_id: vm.clone(),
+                scope_id: store.status(None).scope_id,
+                kit_ref: reference('c'),
+                kits: vec!["hf".into()],
+                warm: true,
+                health: WorkerHealth::Ready,
+                container_capacity: 8,
+                active_container_ids: vec![],
+                quarantine: None,
+            })
+            .unwrap();
+        let session = store.attach_shell(
+            1,
+            SessionAuthority {
+                username: "alice".into(),
+                uid: 501,
+                gid: 20,
+                launch_directory: lab.home.path().into(),
+                guest_home: "/Users/alice".into(),
+                home_backing: lab.home.path().into(),
+                ephemeral_home: false,
+            },
+        );
+        let (job, _) = store
+            .begin_job(NewJob {
+                label: None,
+                session_id: session,
+                command: "hf".into(),
+                kit_ref: reference('c'),
+                workload_image: reference('c'),
+                mounts: vec![],
+            })
+            .unwrap();
+        store.reserve_worker(&job, &vm, &vm).unwrap();
+        store.mark_running(&job, &vm, &vm, &"a".repeat(64)).unwrap();
+        if complete {
+            store
+                .finish_job(
+                    &job,
+                    ExitStatus {
+                        code: Some(125),
+                        cause: "worker_start_ambiguous".into(),
+                    },
+                    false,
+                    CleanupState::Uncertain,
+                    TimingReport::default(),
+                )
+                .unwrap();
+        }
+        store
+            .quarantine_worker(&vm, "container may still run")
+            .unwrap();
+        assert!(store.vm_jobs_unsettled(&vm));
+        let reply = lab.reset(&[]).unwrap();
+        assert!(
+            lab.stock.removed().contains(&idle),
+            "idle target was not removed: {reply:?}"
+        );
+        assert!(
+            lab.stock.listed().contains(&vm),
+            "reset all removed a VM with unsettled jobs (complete={complete}): reply={reply:?}, removed={:?}",
+            lab.stock.removed()
+        );
+        assert!(
+            reply
+                .iter()
+                .any(|line| line.contains(&vm) && line.contains("skipped")),
+            "{reply:?}"
+        );
+    }
+
+    #[test]
+    fn review_v2b_reset_failed_name_does_not_wait_for_an_alias_install() {
+        let mut lab = Lab::new();
+        lab.stock.script(&[Create::FailedNone]);
+        lab.install("hf", &reference('c')).unwrap_err();
+        lab.restart();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        lab.stock.script(&[Create::FailedListed]);
+        lab.stock.before_create(move || {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let install = std::thread::spawn(move || {
+            backend.install_command("alias".into(), reference('c'), Some(&store))
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reset = std::thread::spawn(move || {
+            let result = backend.reset_workers(&LoadSelection::Kits(vec!["hf".into()]), store);
+            done_tx.send(()).unwrap();
+            result
+        });
+        let prompt = done.recv_timeout(Duration::from_millis(500));
+        release.send(()).unwrap();
+        let reset_result = reset.join().unwrap();
+        install.join().unwrap().unwrap_err();
+        assert!(
+            prompt.is_ok(),
+            "reset of a failed install waited for an alias's whole create: {reset_result:?}"
+        );
+        assert!(
+            reset_result
+                .unwrap_err()
+                .to_string()
+                .contains("still running")
+        );
     }
 
     /// `resetIgnoresRecords` (#194 itself): `workers reset NAME` of a
@@ -1398,6 +1573,103 @@ mod tests {
     }
 
     #[test]
+    fn review_v2b_ephemeral_close_deduplicates_and_takes_kit_keys_in_order() {
+        let mut lab = Lab::new();
+        let lease = lab.backend.sbx.allocate_ephemeral_home().unwrap();
+        let token = lease.token();
+        lab.store = None;
+        let server = marsh_daemon::Server::bind(lab.home.path())
+            .unwrap()
+            .with_backend(lab.backend.clone());
+        lab.store = Some(server.store());
+        let task = std::thread::spawn(move || server.serve_one().unwrap());
+        let authority = marsh_daemon::SessionAuthority {
+            username: "review".into(),
+            uid: nix::unistd::Uid::current().as_raw(),
+            gid: nix::unistd::Gid::current().as_raw(),
+            launch_directory: lab.home.path().into(),
+            guest_home: lease.path().into(),
+            home_backing: lease.path().into(),
+            ephemeral_home: true,
+        };
+        let reply = marsh_daemon::Client::connect(lab.home.path())
+            .unwrap()
+            .request(marsh_daemon::PublicRequest::AttachEphemeralShell {
+                pid: std::process::id(),
+                session: authority.clone(),
+                expected_project_identity: None,
+                token,
+            })
+            .unwrap();
+        task.join().unwrap();
+        let marsh_daemon::PublicReply::ShellAttached { session_id } = reply else {
+            panic!("{reply:?}")
+        };
+        let session = marsh_daemon::SessionSpec {
+            session_id: session_id.clone(),
+            username: authority.username,
+            uid: authority.uid,
+            gid: authority.gid,
+            launch_directory: authority.launch_directory,
+            guest_home: authority.guest_home,
+            home_backing: authority.home_backing,
+            ephemeral_home: true,
+            terminal: false,
+            terminal_size: None,
+        };
+        for digit in ['c', 'd'] {
+            lab.register(&digit.to_string(), &reference(digit));
+            let spec = lab
+                .backend
+                .kit_spec_for_session(&digit.to_string(), &session, lab.store())
+                .unwrap();
+            lab.stock.seed(&spec.name);
+            if digit == 'c' {
+                let mut duplicate = spec;
+                duplicate.name = "marsh-k-oldname1".into();
+                lab.backend
+                    .ephemeral_kits
+                    .lock()
+                    .unwrap()
+                    .get_mut(&session_id)
+                    .unwrap()
+                    .insert(duplicate.name.clone(), duplicate);
+            }
+        }
+        lease.close_admission().unwrap();
+        let first = lab
+            .backend
+            .kit_lock_for_key(&format!("{}:ephemeral:{session_id}", reference('c')))
+            .unwrap();
+        let last = lab
+            .backend
+            .kit_lock_for_key(&format!("{}:ephemeral:{session_id}", reference('d')))
+            .unwrap();
+        let held = last.lock().unwrap();
+        let (backend, store, session) =
+            (lab.backend.clone(), lab.store().clone(), session_id.clone());
+        let close = std::thread::spawn(move || backend.close_ephemeral_kits(&session, &store));
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let mut took_first = false;
+        while std::time::Instant::now() < deadline {
+            if first.try_lock().is_err() {
+                took_first = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(held);
+        let result = close.join().unwrap();
+        assert!(
+            took_first,
+            "close waited for a later Kit key before taking the earlier one"
+        );
+        result.unwrap();
+        assert_eq!(lab.stock.listed(), NONE);
+        assert!(lab.store().ephemeral_home_token(&session_id).is_none());
+    }
+
+    #[test]
     fn review_late_adoption_during_an_absent_reset_must_not_forget_the_vm() {
         let mut lab = Lab::new();
         lab.stock.script(&[Create::TimedOutLandsLater]);
@@ -1738,5 +2010,55 @@ mod tests {
         assert_eq!(lab.backend.sbx.live_kit_entries(), Vec::new());
         drop(held);
         stop.join().unwrap().unwrap();
+    }
+
+    /// GPT's round 2 (the lock acquisition): an install that starts on the
+    /// Kit after a reset's plan and before its locks holds that Kit lock for
+    /// its whole create. The reset does not wait for it blocked: it plans
+    /// again while the lock is held, and refuses. Fails with a blocking lock
+    /// acquisition.
+    #[test]
+    fn a_reset_does_not_wait_on_an_install_that_started_after_its_plan() {
+        let lab = Lab::new();
+        lab.register("g", &reference('c'));
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        lab.stock.script(&[Create::FailedListed]);
+        lab.stock.before_create(move || {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        let install = Arc::new(Mutex::new(None));
+        let (slot, backend, store) = (install.clone(), lab.backend.clone(), lab.store().clone());
+        *lab.backend.reset_before_locks.lock().unwrap() = Some(Box::new(move || {
+            *slot.lock().unwrap() = Some(std::thread::spawn(move || {
+                backend.install_command("hf".into(), reference('c'), Some(&store))
+            }));
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        }));
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reset = std::thread::spawn(move || {
+            let reset = backend.reset_workers(&LoadSelection::Kits(vec!["g".into()]), store);
+            done_tx.send(()).unwrap();
+            reset
+        });
+        let finished = done.recv_timeout(Duration::from_secs(5));
+        release.send(()).unwrap();
+        let reset = reset.join().unwrap();
+        install
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            finished.is_ok(),
+            "the reset waited blocked on the install's Kit lock"
+        );
+        let refused = reset.unwrap_err().to_string();
+        assert!(refused.contains("still running on g's Kit"), "{refused}");
     }
 }

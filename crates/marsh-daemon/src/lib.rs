@@ -3843,7 +3843,29 @@ impl DaemonStore {
     /// Atomically block admission to every selected worker before destructive
     /// lifecycle work. No worker is claimed if any selected worker is active.
     pub fn begin_workers_reset(&self, worker_ids: &[String]) -> Result<(), DaemonError> {
+        self.claim_workers_reset(worker_ids, false)
+    }
+
+    /// [`Self::begin_workers_reset`] for a bulk reset (`marsh workers reset
+    /// all`), which is no operator's release of a particular VM: in the same
+    /// step it also refuses a VM any job of which is unfinished, or whose
+    /// cleanup is pending or uncertain, registered worker or not.
+    pub fn begin_settled_workers_reset(&self, worker_ids: &[String]) -> Result<(), DaemonError> {
+        self.claim_workers_reset(worker_ids, true)
+    }
+
+    fn claim_workers_reset(&self, worker_ids: &[String], settled: bool) -> Result<(), DaemonError> {
         let mut state = self.lock();
+        if settled
+            && let Some(vm) = worker_ids.iter().find(|vm| {
+                state.reservations.values().any(|worker| worker == *vm)
+                    || Self::recorded_busy(&state, vm)
+            })
+        {
+            return Err(DaemonError::InvalidState(format!(
+                "{vm}: a job on it has not finished, or its cleanup is not verified"
+            )));
+        }
         for worker_id in worker_ids {
             let Some(worker) = state.workers.get(worker_id) else {
                 continue;

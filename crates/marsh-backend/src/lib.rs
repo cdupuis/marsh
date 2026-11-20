@@ -5429,6 +5429,22 @@ impl StockDaemonBackend {
         })
     }
 
+    /// [`Self::claim_retirement`] for `marsh workers reset all`: refused for
+    /// a VM with an unfinished job or one whose cleanup is not verified
+    /// (`DaemonStore::begin_settled_workers_reset`).
+    fn claim_settled_retirement(
+        store: &DaemonStore,
+        worker_ids: Vec<String>,
+    ) -> Result<RetirementClaim, DaemonError> {
+        let live = store.attached_session_ids();
+        store.begin_settled_workers_reset(&worker_ids)?;
+        Ok(RetirementClaim {
+            worker_ids,
+            live,
+            quarantined: BTreeSet::new(),
+        })
+    }
+
     /// Drops `command`'s entry from `commands.json` (`overlay`, as read under
     /// `registry_install`, which the caller holds): it runs `replacement` (the
     /// packaged Kit) or is removed. New jobs see the change at once. The old

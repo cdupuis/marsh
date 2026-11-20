@@ -242,7 +242,7 @@ Invariants: `NoForeignEffect`, `OwnedAreOurs`, `NoLeak` (Ownership); `CapacityBo
 `NoEntryRecursion`, `SpawnSetAttenuates`, `KitVMBound`, `NoHomeKitHome`, `AdmittedUnderLimits` (Process);
 `NoForeignRemoval`, `EveryDaemonVMOwned`, `EveryDaemonVMReachable`, `EveryDaemonVMResettable`,
 `NoOrphanRecord`, `NoDeadlock`, `NoStaleRefusal`, `ResetRemovesTargets`, `SessionLeavesNoVm`,
-`TeardownAlone` (KitInstall). Liveness:
+`TeardownAlone`, `NoRunningRemoval` (KitInstall). Liveness:
 `AttemptsTerminate` and `QuarantineHeals` (Worker; weak fairness, no operator action), `DrainEnds` (KitSwitch; weak fairness on job ends and the drain pass), and `EventuallySettled` (Workspace; weak fairness on
 daemon steps and process progress, checked in the smaller `Workspace_live_pass.cfg`).
 
@@ -621,6 +621,7 @@ waits for a lock it holds itself.
 | `EveryDaemonVMOwned` | `staleAbsence` | Code review round 1 (GPT): a reset's listing finds a timed-out create's name empty; the VM lands and another listing (GC) adopts it before the reset acts; the reset forgets the name as gone, and the VM is nobody's |
 | `SessionLeavesNoVm` | `ephStaleName` | Code review round 1 (both): an ephemeral session notes its Kit VM's name before the lock; a preparation recovers that VM and creates under a new name; closing the session removes only the noted name |
 | `EveryDaemonVMOwned` | `bgCancelForgets` | Code review round 2: a background Kit update's create that a plain stop cancelled forgets its intent; the VM lands foreign |
+| `NoRunningRemoval` | `releaseRunning` | Code review round 3 (GPT): a sibling job's uncertain cleanup quarantines a VM while another job runs on it; `reset NAME`'s release of a quarantined VM removes it under the running job |
 | `TeardownAlone` | `bgUnadmitted` | Code review round 1 (GPT): the background Kit pass is not admitted, so `marsh stop --force`'s drain does not wait for it and the teardown overlaps its Kit work |
 
 **What each invariant says.**
@@ -638,7 +639,8 @@ waits for a lock it holds itself.
 - `ResetRemovesTargets`: a reset that is not refused leaves none of the targets its listing
   found listed under a live name (a VM landing after that listing is kept, with its intent).
 - `SessionLeavesNoVm`: closing an ephemeral-home session leaves no VM of its key listed.
-- `TeardownAlone`: a teardown runs while no process holds a Kit lock. Together with `EveryDaemonVMReachable`, a quiescent `reset NAME` removes every VM
+- `TeardownAlone`: a teardown runs while no process holds a Kit lock.
+- `NoRunningRemoval`: no VM is removed while a job runs on it, quarantined or not. Together with `EveryDaemonVMReachable`, a quiescent `reset NAME` removes every VM
   its install created.
 - **No liveness is claimed.** Not for a hung create, not for a cancellation, and not for a
   drain.
@@ -662,6 +664,8 @@ Positive configs:
   switch. About 3.55 M states.
 - `KitInstall_eph_pass.cfg`: an ephemeral-home session (key "e") with two preparations,
   recovery, GC and a teardown. About 0.82 M states.
+- `KitInstall_run_pass.cfg`: running jobs on Kit VMs, a sibling's quarantine of a VM a job
+  runs on, a job preparation, recovery, GC and a teardown; no switch. About 0.39 M states.
 - `KitInstall_bg_pass.cfg`: the two-step background pass, recovering or creating (a Kit
   update), with a forced stop, a plain teardown that cancels its create, and a restart; one
   install attempt, no job or switch. About 0.34 M states.
@@ -691,6 +695,7 @@ Not modeled:
 | RecoverBg | `marsh-backend/src/worker_recovery.rs` `recover_quarantined_vm`: the Kit lock of the VM's ownership key (`vm_ownership_key`, also of a name forgotten in this process), whether or not a command names the VM, then `recover_quarantined_vm_locked` -> `retire_recovered`; marsh-sbx `lib.rs` `retire_quarantined_vm` |
 | Gc | `marsh-backend/src/vm_gc.rs` `remove_recorded`: the Kit lock of the VM's ownership key, always; stopped VMs only |
 | Teardown | `marsh-backend/src/lib.rs` `teardown_scope` and `reset_stale_scope_components` -> marsh-sbx `lib.rs` `reset_stale_scope_kit_vms_before` (intents and their records stay; it reads the UUIDs before its listing, `owned_kit_uuids`, for `forget_absent`); it is admitted by marsh-daemon `lib.rs` `begin_lifecycle_request`, which refuses while any request, an install or the background pass included, is in flight |
+| RunStart / RunEnd / SiblingQuarantine | marsh-daemon `lib.rs`: a job runs on a Kit VM from `mark_running` to `finish_job`; `quarantine_worker` quarantines its VM. Every claim that may retire a VM refuses one a queued or running job is recorded on, under the store lock: `begin_workers_reset` (reset NAME, recovery, teardown, a switched Kit's VM; `job_running_on`, whatever the quarantine), `begin_settled_workers_reset` (reset all), `begin_automatic_retire` (GC, drained Kits) |
 | EphOpen / EphRun / EphClose | `marsh-backend/src/ephemeral.rs` `kit_spec_for_session` notes a name before the lock; preparation is `prepare_one_unnoted` (key `IDENTITY:ephemeral:SESSION`); `close_ephemeral_kits` takes the session's Kit locks (deduplicated, key order) and removes every live entry of its keys (`live_kit_entries`), not only the noted names |
 | BgStart / BgStartUpd / BgEnd / TdCancelBg | marsh-daemon `lib.rs` `spawn_kit_updater`: each background pass (`DaemonBackend::auto_update_kits`: retired-VM removal, draining retirement, recovery, Kit updates, VM GC) holds a `begin_background_request` admission for its whole run; its creates run under the background cancellation (marsh-sbx `lib.rs` `in_background`). A plain stop, reset or restart runs `drain_background_pass` first: when only the pass is in flight, `DaemonBackend::cancel_background_creates` (`cancel_background_creates`), a wait within `FORCED_STOP_DRAIN`, then `begin_lifecycle_request` |
 | StopBegin / StopEnd / StopGiveUp (`marsh stop --force`) | marsh-daemon `lib.rs` `begin_forced_stop` closes admission (refused while shells are attached or jobs run, as `marsh stop`), then `handle_forced_stop`: `DaemonBackend::cancel_creates` (marsh-sbx `lib.rs` `cancel_creates`: `run_create` runs every Kit VM create through `run_bounded_cancellable`, which kills the process group; a cancelled create fails as may-still-land, and no new one is submitted), `wait_for_requests` up to `FORCED_STOP_DRAIN`, then `handle_scope_lifecycle` (teardown and stop); a request still running gives up: `resume_creates`, nothing torn down |

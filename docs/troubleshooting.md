@@ -200,7 +200,10 @@ with `still running` (so does a reset of another command on the same Kit), and
 `marsh workers reset all` skips it. `marsh workers reset all` also skips, and
 names, a VM it must not remove (a job runs on it, a job's cleanup is not
 verified, another VM holds its name, or a live private-home session uses it),
-and removes the others.
+and removes the others. No reset removes a VM a job is still running on, even
+a quarantined one; a reset that waits more than 30 seconds for a Kit that is
+busy (a job starting, a recovery, a Kit change) stops, removes nothing, and
+names that Kit.
 
 A `marsh kit install` whose VM create hangs keeps its request open for up to
 an hour. `marsh stop` and `marsh reset` do not clear it: they wait briefly for

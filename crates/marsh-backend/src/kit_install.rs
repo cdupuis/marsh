@@ -2061,4 +2061,30 @@ mod tests {
         let refused = reset.unwrap_err().to_string();
         assert!(refused.contains("still running on g's Kit"), "{refused}");
     }
+
+    /// Claude's round 2 (N2), `staleAbsence` for the scope reset (`marsh
+    /// reset`/`stop`): it reads the recorded UUIDs before its listing, so a VM
+    /// that lands and is adopted by another listing after that listing was
+    /// taken is not forgotten as gone. Fails when the UUIDs are read after
+    /// the listing.
+    #[test]
+    fn the_scope_reset_never_forgets_a_vm_adopted_after_its_listing() {
+        let lab = Lab::new();
+        lab.stock.script(&[Create::TimedOutLandsLater]);
+        lab.install("hf", &reference('c')).unwrap_err();
+        let vm = lab.stock.created()[0].clone();
+        let (stock, sbx) = (lab.stock.clone(), lab.backend.sbx.clone());
+        *lab.stock.after_list_snapshot.lock().unwrap() = Some(Box::new(move || {
+            // The scope reset's listing found nothing; the VM lands and a
+            // newer listing adopts it before that reply is acted on.
+            stock.land_pending();
+            sbx.stock_inventory(true).unwrap();
+        }));
+        lab.backend.sbx.reset_stale_scope_kit_vms().unwrap();
+        assert_eq!(lab.stock.listed(), std::slice::from_ref(&vm));
+        lab.assert_every_vm_owned();
+        assert_eq!(lab.records(), [format!("{vm} hf")]);
+        lab.reset(&["hf"]).unwrap();
+        assert_eq!(lab.stock.listed(), NONE);
+    }
 }

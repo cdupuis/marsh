@@ -19,14 +19,45 @@ case "$selected" in
 esac
 export HOME=$selected
 
+# Docker Sandboxes reports SBX_CRED_ANTHROPIC_MODE as apikey or none, never
+# oauth: a Mac whose only Anthropic credential is a claude.ai login shows as
+# none. The sentinel credentials file the engine writes for that login goes to
+# the Kit VM's image-declared home, which a job does not mount. So ask the
+# proxy: it answers the profile endpoint for the access-token sentinel
+# (claude.yaml, oauth.sentinels.accessToken) only when it holds that login.
+# A caller's own token or key and a selected home's own login are left alone,
+# and without the stock proxy there is nothing to ask.
+claude_oauth_sentinel=sk-ant-oat01-proxy-managed
+anthropic_mode=${SBX_CRED_ANTHROPIC_MODE:-none}
+if [ "$anthropic_mode" = none ] && [ -n "${HTTPS_PROXY:-}" ] &&
+   [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ] &&
+   [ ! -e "$HOME/.claude/.credentials.json" ]; then
+  # MARSH_* is reserved: a user shell can never forward this test override.
+  if node -e '
+      const [url, token] = process.argv.slice(1);
+      fetch(url, {headers: {authorization: `Bearer ${token}`},
+                  signal: AbortSignal.timeout(3000)})
+        .then(response => process.exit(response.status === 200 ? 0 : 1),
+              () => process.exit(1));
+    ' "${MARSH_TEST_CLAUDE_OAUTH_PROBE:-https://api.anthropic.com/api/oauth/profile}" \
+      "$claude_oauth_sentinel" 2>/dev/null; then
+    anthropic_mode=oauth
+  fi
+fi
+# The proxy replaces this placeholder with the Mac's login; nothing is written
+# to the selected home, so a later change of the binding leaves no stale state.
+if [ "$anthropic_mode" = oauth ]; then
+  export CLAUDE_CODE_OAUTH_TOKEN=$claude_oauth_sentinel
+fi
+
 # ACP mode (`--acp`): the Kit's acp@1 adapter, `marsh run --acp claude`.
 # The official adapter speaks ACP v1 on stdio and drives the Agent SDK's
 # Claude Code through claude-cli.sh, which disables Claude's Bash sandbox.
 if [ "${1:-}" = --acp ]; then
   shift
-  printf 'marsh-auth-mode=%s\n' "${SBX_CRED_ANTHROPIC_MODE:-none}" >&2
-  case "${SBX_CRED_ANTHROPIC_MODE:-none}" in
-    apikey|oauth) export ANTHROPIC_API_KEY=proxy-managed ;;
+  printf 'marsh-auth-mode=%s\n' "$anthropic_mode" >&2
+  case "$anthropic_mode" in
+    apikey) export ANTHROPIC_API_KEY=proxy-managed ;;
   esac
   CLAUDE_CODE_EXECUTABLE=/opt/marsh/claude-acp/claude-cli.sh
   export CLAUDE_CODE_EXECUTABLE
@@ -94,7 +125,7 @@ date +%s >"$claude_lock/created"
 
 claude_settings="$HOME/.claude/settings.json"
 node - "$claude_config" "$PWD" "$claude_lock" "$claude_settings" \
-  "${SBX_CRED_ANTHROPIC_MODE:-none}" \
+  "$anthropic_mode" \
   "${MCP_GATEWAY_URL:-}" "${MCP_SENTINEL_TOKEN_NAME:-}" <<'NODE'
 const fs = require("fs");
 const nodePath = require("path");
@@ -276,7 +307,9 @@ if (settings.skipDangerousModePermissionPrompt === undefined) {
   settingsChanged = true;
 }
 // Use one proxy-managed auth path. Keep a different user-owned helper intact.
-if (credentialMode !== "none" && settings.apiKeyHelper === undefined) {
+// A claude.ai login travels as CLAUDE_CODE_OAUTH_TOKEN instead: a helper would
+// make Claude Code present the subscription as an API key.
+if (credentialMode === "apikey" && settings.apiKeyHelper === undefined) {
   settings.apiKeyHelper = "echo proxy-managed";
   settingsChanged = true;
 }
@@ -300,7 +333,7 @@ trap - EXIT HUP INT TERM
 
 # Claude otherwise treats the stock proxy sentinel as a custom key, prompting
 # on first launch and warning that both authentication paths are configured.
-if [ "${SBX_CRED_ANTHROPIC_MODE:-none}" != none ]; then
+if [ "$anthropic_mode" != none ]; then
   unset ANTHROPIC_API_KEY
 fi
 # The job container is the sandbox boundary. Claude Code's own Bash sandbox

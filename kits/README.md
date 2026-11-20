@@ -108,6 +108,14 @@ trust boundary. Selected-home jobs use the stock-SBX proxy and non-secret mode
 sentinels admitted by the adapter. Codex and Pi likewise receive proxy-managed
 state, never raw keys.
 
+Docker Sandboxes reports `SBX_CRED_ANTHROPIC_MODE` as `apikey` or `none`. A
+Mac whose only Anthropic credential is a claude.ai login shows as `none`, so
+the Claude entrypoint asks the proxy: with no key, token or saved login of its
+own, it requests `api.anthropic.com/api/oauth/profile` with the access-token
+sentinel, and a 200 means the proxy holds a login. The job then runs with that
+sentinel in `CLAUDE_CODE_OAUTH_TOKEN`. Nothing is written to the selected home.
+The request adds about 0.3 seconds to a launch in that case only.
+
 Claude's old outer-only block volumes were removed. Selected-home persistence
 is the single state mechanism for nested jobs, avoiding hidden state that the
 user cannot see or carry between worker VMs.

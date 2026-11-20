@@ -196,7 +196,11 @@ marsh records the install with the VM's name before the create and keeps the
 record until the VM is removed. If nothing is listed under the name yet, the
 reset removes nothing and says the create may still land; run it again later.
 While the install itself is still running, `marsh workers reset NAME` refuses
-with `still running` and `marsh workers reset all` skips it.
+with `still running` (so does a reset of another command on the same Kit), and
+`marsh workers reset all` skips it. `marsh workers reset all` also skips, and
+names, a VM it must not remove (a job runs on it, a job's cleanup is not
+verified, another VM holds its name, or a live private-home session uses it),
+and removes the others.
 
 A `marsh kit install` whose VM create hangs keeps its request open for up to
 an hour. `marsh stop` and `marsh reset` do not clear it: they wait briefly for
@@ -236,7 +240,8 @@ and `marsh workers reset` or `marsh stop` removes it.
 | `marsh stop --force` | As `marsh stop`, after cancelling the VM creates in flight (a hung `marsh kit install`) and waiting up to 30 seconds for requests to end |
 
 `reset` and `stop` refuse while shells or jobs are open, and, after waiting
-briefly, while another request (a `marsh kit install`) is running;
+briefly, while another request (a `marsh kit install`) or marsh's background
+Kit pass (updates, recovery, garbage collection) is running;
 `stop --force` cancels such a request's VM create instead. Each prints the VMs
 it removed.
 

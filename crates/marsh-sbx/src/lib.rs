@@ -179,7 +179,26 @@ pub struct VmQuarantine {
 /// Whether a failed `sbx create` may still finish later: it timed out or its
 /// reply was lost. A create stock SBX reported as failed is over.
 fn create_may_land(error: &SbxError) -> bool {
-    matches!(error, SbxError::PreparationTimeout { .. } | SbxError::Io(_))
+    matches!(
+        error,
+        SbxError::PreparationTimeout { .. } | SbxError::OutputDrain { .. } | SbxError::Io(_)
+    )
+}
+
+/// A stock call's failed `run_bounded`. A drain failure (the command exited,
+/// a helper holds its pipes) keeps its own text and captured output: it is not
+/// the call running out of time.
+fn stock_call_error(error: io::Error, operation: &'static str, timeout: Duration) -> SbxError {
+    if let Some(drain) = marsh_runtime::OutputDrainTimeout::of(&error) {
+        SbxError::OutputDrain {
+            operation,
+            detail: drain.to_string(),
+        }
+    } else if error.kind() == io::ErrorKind::TimedOut {
+        SbxError::PreparationTimeout { operation, timeout }
+    } else {
+        SbxError::Io(error)
+    }
 }
 
 /// A registry Kit reference as stock must read it. Stock's `ResolveReference`
@@ -3572,14 +3591,7 @@ impl StockSbx {
             .runner
             .run_bounded(&invocation, self.preparation_timeouts.create)
             .map_err(|error| {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    SbxError::PreparationTimeout {
-                        operation: "create shell VM",
-                        timeout: self.preparation_timeouts.create,
-                    }
-                } else {
-                    SbxError::Io(error)
-                }
+                stock_call_error(error, "create shell VM", self.preparation_timeouts.create)
             })
             .and_then(|output| Self::require_success("create shell VM", output));
         if let Err(error) = outcome {
@@ -5870,14 +5882,11 @@ impl StockSbx {
                 self.runner
                     .run_bounded(&invocation, self.preparation_timeouts.create)
                     .map_err(|error| {
-                        if error.kind() == io::ErrorKind::TimedOut {
-                            SbxError::PreparationTimeout {
-                                operation: "create local kit VM",
-                                timeout: self.preparation_timeouts.create,
-                            }
-                        } else {
-                            SbxError::Io(error)
-                        }
+                        stock_call_error(
+                            error,
+                            "create local kit VM",
+                            self.preparation_timeouts.create,
+                        )
                     })
             };
             let output = self.create_withholding_clashing_skills(spec, create)?;
@@ -7599,13 +7608,7 @@ impl StockSbx {
     {
         self.runner
             .run_bounded(&self.invocation(arguments), timeout)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    SbxError::PreparationTimeout { operation, timeout }
-                } else {
-                    SbxError::Io(error)
-                }
-            })
+            .map_err(|error| stock_call_error(error, operation, timeout))
     }
 
     /// When a recovery operation gives up waiting for a VM's fence: its own
@@ -7650,13 +7653,7 @@ impl StockSbx {
                 },
                 timeout,
             )
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    SbxError::PreparationTimeout { operation, timeout }
-                } else {
-                    SbxError::Io(error)
-                }
-            })
+            .map_err(|error| stock_call_error(error, operation, timeout))
     }
 
     fn run_bounded_in_os<I, S>(
@@ -7672,13 +7669,7 @@ impl StockSbx {
     {
         self.runner
             .run_bounded(&self.invocation_in(directory, arguments), timeout)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    SbxError::PreparationTimeout { operation, timeout }
-                } else {
-                    SbxError::Io(error)
-                }
-            })
+            .map_err(|error| stock_call_error(error, operation, timeout))
     }
 
     fn require_success(operation: &'static str, output: CommandOutput) -> Result<(), SbxError> {
@@ -9271,6 +9262,14 @@ pub enum SbxError {
     PreparationTimeout {
         operation: &'static str,
         timeout: Duration,
+    },
+    /// A stock command exited but a helper kept its output open: its output
+    /// may be incomplete, so it is a failure, and a create that did this may
+    /// still land.
+    #[error("stock SBX {operation}: {detail}")]
+    OutputDrain {
+        operation: &'static str,
+        detail: String,
     },
     #[error("scope lifecycle deadline expired before {operation}")]
     LifecycleDeadline { operation: &'static str },

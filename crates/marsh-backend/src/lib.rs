@@ -1373,6 +1373,7 @@ const fn replace_after(error: &marsh_sbx::SbxError) -> Replace {
         marsh_sbx::SbxError::WorkerNotReady(_) => Replace::Always,
         marsh_sbx::SbxError::CommandFailed { .. }
         | marsh_sbx::SbxError::PreparationTimeout { .. }
+        | marsh_sbx::SbxError::OutputDrain { .. }
         | marsh_sbx::SbxError::IncompatibleVm { .. }
         | marsh_sbx::SbxError::UnreadableVm { .. }
         | marsh_sbx::SbxError::WorkerLeaseLost(_) => Replace::IfResumed,

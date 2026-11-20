@@ -6615,7 +6615,13 @@ impl ConnectionHandler {
                 },
             );
         }
-        self.handle_scope_lifecycle(stream, ScopeLifecycleAction::Stop, None)
+        let stopped = self.handle_scope_lifecycle(stream, ScopeLifecycleAction::Stop, None);
+        // A stop whose cleanup could not be verified keeps the daemon: it
+        // creates VMs again.
+        if !self.shutdown_requested.load(Ordering::Acquire) {
+            self.backend.resume_creates();
+        }
+        stopped
     }
 
     #[allow(clippy::too_many_lines)] // One linear dispatch over the public request variants.

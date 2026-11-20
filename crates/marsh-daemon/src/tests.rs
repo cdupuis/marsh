@@ -6505,6 +6505,7 @@ fn receipt_journal_is_owner_only_and_keeps_no_job_or_prompt_content() {
 #[derive(Default)]
 struct InstallInFlight {
     ignores_cancel: bool,
+    cleanup_uncertain: bool,
     entered: AtomicBool,
     cancelled: AtomicBool,
     released: AtomicBool,
@@ -6558,7 +6559,7 @@ impl DaemonBackend for InstallInFlightBackend {
         self.0.calls.lock().unwrap().push(action);
         ScopeLifecycleReport {
             action,
-            cleanup_complete: true,
+            cleanup_complete: !self.0.cleanup_uncertain,
             components: Vec::new(),
         }
     }
@@ -6678,4 +6679,32 @@ fn a_forced_stop_whose_requests_do_not_end_tears_nothing_down() {
     install.join().unwrap().unwrap_err();
     client.stop_scope().unwrap();
     task.join().unwrap();
+}
+
+/// A forced stop whose teardown could not be verified keeps the daemon, as
+/// `marsh stop` does, and lets it create VMs again. Fails when the creates
+/// stay cancelled.
+#[test]
+fn a_forced_stop_that_keeps_the_daemon_resumes_creates() {
+    let home = home();
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        cleanup_uncertain: true,
+        ..InstallInFlight::default()
+    }));
+    let server = Arc::new(
+        Server::bind(home.path())
+            .unwrap()
+            .with_backend(Arc::new(backend.clone())),
+    );
+    let serving = Arc::clone(&server);
+    let task = thread::spawn(move || serving.serve_one().unwrap());
+    let report = Client::connect(home.path())
+        .unwrap()
+        .force_stop_scope()
+        .unwrap();
+    task.join().unwrap();
+    assert!(!report.cleanup_complete);
+    assert!(backend.0.cancelled.load(Ordering::Acquire));
+    assert!(backend.0.resumed.load(Ordering::Acquire));
+    assert!(!server.shutdown_requested.load(Ordering::Acquire));
 }

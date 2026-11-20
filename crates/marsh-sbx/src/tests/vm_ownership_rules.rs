@@ -912,14 +912,18 @@ fn install(attempt: &str, command: &str) -> crate::InstallRecord {
     }
 }
 
-/// `KitInstall.tla` rule 6 (`recordsInMemory`): install records are persisted with
-/// the entry they name, so a restarted daemon still reaches a failed
-/// install's VM by the install's name; the schema is 3 only while a record
-/// exists, and a version 2 map still loads.
+/// `KitInstall.tla` rule 6 (`recordsInMemory`): install records are persisted
+/// next to the map, so a restarted daemon still reaches a failed install's VM
+/// by the install's name. The map itself stays schema 2, which an older marsh
+/// reads (Claude's review: a schema 3 map stopped an older marshd); a record
+/// whose name the map no longer has is dropped when they are read (an older
+/// marsh retiring the VM takes the record along); a schema 3 map an earlier
+/// build wrote, with records inline, still loads, and is rewritten as 2.
 #[test]
-fn install_records_are_persisted_with_their_entry_and_survive_a_restart() {
+fn install_records_are_persisted_next_to_a_schema_2_map_and_survive_a_restart() {
     let control = scratch();
     let map = control.path().join("vm-ownership.json");
+    let side = control.path().join("vm-ownership-installs.json");
     let ownership = VmOwnership::persisted(map.clone()).unwrap();
     let name = ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
     let version = || {
@@ -927,10 +931,11 @@ fn install_records_are_persisted_with_their_entry_and_survive_a_restart() {
             .as_u64()
             .unwrap()
     };
-    assert_eq!(version(), 2);
     ownership.begin_install(&name, install("a1", "hf")).unwrap();
     ownership.begin_install(&name, install("a2", "hf")).unwrap();
-    assert_eq!(version(), 3);
+    assert_eq!(version(), 2);
+    assert!(!fs::read_to_string(&map).unwrap().contains("installs"));
+    assert!(fs::read_to_string(&side).unwrap().contains("a2"));
 
     let restarted = VmOwnership::persisted(map.clone()).unwrap();
     assert_eq!(
@@ -949,12 +954,42 @@ fn install_records_are_persisted_with_their_entry_and_survive_a_restart() {
             .install_records(),
         [(name.clone(), "kit-a".into(), install("a2", "hf"))]
     );
-    restarted.end_install("a2").unwrap();
+
+    // An older marsh forgets the name (it rewrites only the map): the record
+    // goes with it.
+    let mut file: serde_json::Value = serde_json::from_slice(&fs::read(&map).unwrap()).unwrap();
+    file["vms"].as_object_mut().unwrap().remove(&name);
+    fs::write(&map, serde_json::to_vec(&file).unwrap()).unwrap();
     assert_eq!(
-        version(),
-        2,
-        "a map with no record is readable by an older marsh"
+        VmOwnership::persisted(map.clone())
+            .unwrap()
+            .install_records(),
+        []
     );
+
+    // A schema 3 map with inline records (an earlier build) loads and is
+    // rewritten as schema 2, its records moved next to it.
+    let legacy = scratch();
+    let old = legacy.path().join("vm-ownership.json");
+    write_map(
+        &old,
+        &serde_json::json!({
+            "version": 3,
+            "vms": {"marsh-k-legacy01": {"purpose": "kit", "key": "kit-a",
+                     "installs": [{"attempt": "a9", "command": "hf"}]}}
+        }),
+    );
+    let loaded = VmOwnership::persisted(old.clone()).unwrap();
+    assert_eq!(
+        loaded.install_records(),
+        [(
+            "marsh-k-legacy01".into(),
+            "kit-a".into(),
+            install("a9", "hf")
+        )]
+    );
+    let rewritten: serde_json::Value = serde_json::from_slice(&fs::read(&old).unwrap()).unwrap();
+    assert_eq!(rewritten["version"], 2);
 }
 
 /// `KitInstall.tla` rules 5 and 6: forgetting a removed VM's name ends the records

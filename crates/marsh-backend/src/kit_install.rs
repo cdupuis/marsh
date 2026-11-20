@@ -1,9 +1,10 @@
 //! `marsh kit install` records and `marsh workers reset NAME|all`: the design
 //! `docs/model/KitInstall.tla` proves (issue #194).
 //!
-//! An install attempt persists a record (attempt id, command) in the
-//! ownership entry of the Kit VM name it chose, under the Kit lock and before
-//! its create; the record ends when the command is published, or with the
+//! An install attempt persists a record (attempt id, command) for the Kit
+//! VM name it chose (next to the ownership map, which stays schema 2), under
+//! the Kit lock and before its create; the record ends when the command is
+//! published, when the attempt is stopped before its create, or with the
 //! name when its VM is retired. A failed create, however it failed, keeps its
 //! intent and its record: the VM may still land, and the record is how
 //! `workers reset NAME` reaches it, also after a restart.
@@ -38,8 +39,26 @@ impl InstallAttempt<'_> {
         &self.record
     }
 
-    /// The command is registered: the attempt's record ends.
-    pub(super) fn published(self) -> Result<(), DaemonError> {
+    /// The command is registered on the VM `vm`: the attempt's record ends,
+    /// and so does every earlier record of the command under that name (the
+    /// registry reaches that VM now: `KitInstall.tla` `InstPublish`).
+    pub(super) fn published(self, vm: &str) -> Result<(), DaemonError> {
+        self.backend
+            .sbx
+            .end_install_record(&self.record.attempt)
+            .map_err(backend_error)?;
+        self.backend
+            .sbx
+            .end_install_records_of(vm, &self.record.command)
+            .map(drop)
+            .map_err(backend_error)
+    }
+
+    /// The attempt was stopped before it submitted any create (`marsh stop
+    /// --force`): it made nothing to reach, so its record ends
+    /// (`KitInstall.tla` `InstAbort`). A create of an earlier attempt under
+    /// the same name keeps that attempt's record.
+    pub(super) fn abandoned(self) -> Result<(), DaemonError> {
         self.backend
             .sbx
             .end_install_record(&self.record.attempt)
@@ -1491,5 +1510,81 @@ mod tests {
         lab.reset(&[]).unwrap_err();
         assert_eq!(lab.stock.removed(), NONE);
         assert_eq!(lab.stock.listed(), [vm]);
+    }
+
+    /// The retry of a failed install succeeds, through a validation flight
+    /// that completed while it waited: its Ready VM is `name`.
+    fn complete_next_install(lab: &Lab, owner: &str, name: &str) {
+        let key = lab.backend.kit_lock_key(owner).unwrap();
+        let spec = lab
+            .backend
+            .kit_spec_for_workload_named(
+                marsh_sbx::NativeKitRef::immutable_oci(owner.to_owned()).unwrap(),
+                name.to_owned(),
+            )
+            .unwrap();
+        let backend = Arc::downgrade(&lab.backend);
+        let owner = owner.to_owned();
+        *lab.backend.install_hook.lock().unwrap() = Some(Box::new(move |point| {
+            let Some(backend) = backend.upgrade() else {
+                return;
+            };
+            if point != "observed" {
+                return;
+            }
+            backend.ready_kits.lock().unwrap().insert(
+                key.clone(),
+                marsh_sbx::ReadyKitVm {
+                    name: spec.name.clone(),
+                    kit_ref: owner.clone(),
+                    lifecycle_workspace: spec.lifecycle_workspace.clone(),
+                    cold_started: false,
+                    job_image: spec.workload_kit.workload_image().unwrap().clone(),
+                    worker_binary: spec.worker_binary.clone(),
+                },
+            );
+            let mut flights = backend.kit_validation_flights.lock().unwrap();
+            let epoch = flights.get(&key).map_or(0, |flight| flight.epoch) + 1;
+            flights.insert(
+                key.clone(),
+                crate::KitFlightCompletion { epoch, error: None },
+            );
+        }));
+    }
+
+    /// Claude's review (the downgrade trap) and `KitInstall.tla`
+    /// `InstPublish`: publishing a command ends every earlier record of it
+    /// on the VM it was published on (the registry reaches that VM now), not
+    /// only the publishing attempt's. Fails when publication ends its own
+    /// record only.
+    #[test]
+    fn publishing_ends_the_commands_earlier_records_on_that_vm() {
+        let mut lab = Lab::new();
+        lab.stock.script(&[Create::FailedNone]);
+        lab.install("hf", &reference('c')).unwrap_err();
+        let vm = lab.stock.created()[0].clone();
+        // A restart: the record stays, the quarantine goes.
+        lab.restart();
+        assert_eq!(lab.records(), [format!("{vm} hf")]);
+        complete_next_install(&lab, &reference('c'), &vm);
+        lab.install("hf", &reference('c')).unwrap();
+        assert_eq!(lab.records(), NONE);
+        assert!(lab.backend.command_names().contains(&"hf".to_owned()));
+    }
+
+    /// Claude's review (`may still land` for a create never submitted) and
+    /// `KitInstall.tla` `InstAbort`: an install refused by `marsh stop
+    /// --force` before its create made nothing: its record ends and its name
+    /// is not quarantined, so no reset says a create may still land. Fails
+    /// when the record is kept (the record outlives every reset).
+    #[test]
+    fn an_install_stopped_before_its_create_leaves_no_record() {
+        let lab = Lab::new();
+        lab.backend.cancel_creates();
+        let error = lab.install("hf", &reference('c')).unwrap_err().to_string();
+        assert!(error.contains("marsh stop --force"), "{error}");
+        assert_eq!(lab.stock.created(), NONE);
+        assert_eq!(lab.records(), NONE);
+        assert_eq!(lab.backend.sbx.quarantined_vms().len(), 0);
     }
 }

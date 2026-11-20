@@ -2387,6 +2387,15 @@ impl StockSbx {
         self.ownership.is_live(name)
     }
 
+    /// End every install record of `command` under `name`: the command was
+    /// published on that VM.
+    ///
+    /// # Errors
+    /// Fails when the records cannot be written.
+    pub fn end_install_records_of(&self, name: &str, command: &str) -> Result<usize, SbxError> {
+        self.ownership.end_installs_of(name, command)
+    }
+
     /// Every persisted install record as `(name, ownership key, record)`.
     #[must_use]
     pub fn install_records(&self) -> Vec<(String, String, InstallRecord)> {
@@ -3063,7 +3072,9 @@ impl StockSbx {
             if let Err(error) = self.create_published_vm_with_grant(spec, &lifecycle_grant) {
                 // Submitted Create may complete late; never delete by a
                 // name alone or discharge its durable pending operation.
+                // (One refused by `marsh stop --force` was never submitted.)
                 if !matches!(&error, SbxError::Io(source) if marsh_runtime::command_not_started(source))
+                    && !matches!(error, SbxError::Stopping)
                 {
                     self.quarantine_vm_as(
                         &spec.name,
@@ -7692,7 +7703,7 @@ impl StockSbx {
             .map_err(|error| stock_call_error(error, operation, timeout))
     }
 
-    /// Refuse to submit a Kit VM create once `marsh stop --force` began.
+    /// The cancellation every Kit VM create in flight runs under.
     fn create_cancellation(&self) -> marsh_runtime::Cancellation {
         self.create_cancel
             .lock()
@@ -7700,6 +7711,7 @@ impl StockSbx {
             .clone()
     }
 
+    /// Refuse to submit a Kit VM create once `marsh stop --force` began.
     fn refuse_create_when_stopping(&self) -> Result<(), SbxError> {
         if self.create_cancellation().is_cancelled() {
             return Err(SbxError::Stopping);

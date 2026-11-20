@@ -5601,6 +5601,7 @@ impl StockDaemonBackend {
     /// `marsh kit install`: resolve a tag once, record only its digest (and
     /// the tag in `kit-sources.json`), and register the name. With a store,
     /// the Kit VM is prepared first; without one, the first call starts it.
+    #[allow(clippy::too_many_lines)] // One install: checks, the locked preparation, publication.
     fn install_command(
         &self,
         command: String,
@@ -5668,6 +5669,7 @@ impl StockDaemonBackend {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
         let mut attempt = None;
+        let mut published_vm = None;
         if let Some(store) = store {
             let started = attempt.insert(self.begin_install_attempt(&command));
             let hint = self
@@ -5675,23 +5677,32 @@ impl StockDaemonBackend {
                 .recorded_vm_name(VmPurpose::Kit, &owner)
                 .unwrap_or_default();
             let spec = self.kit_spec_for_workload_named(workload.clone(), hint)?;
-            let vm = self
-                .prepare_held(
-                    &spec,
-                    store,
-                    &owner,
-                    observed_validation,
-                    Some(started.record()),
+            let prepared = self.prepare_held(
+                &spec,
+                store,
+                &owner,
+                observed_validation,
+                Some(started.record()),
+            );
+            if let Err(error) = &prepared
+                && error
+                    .to_string()
+                    .contains(&marsh_sbx::SbxError::Stopping.to_string())
+                && let Some(stopped) = attempt.take()
+            {
+                // Refused before its submit: nothing of it may land.
+                stopped.abandoned()?;
+            }
+            let vm = prepared.map_err(|error| {
+                let vm = self.sbx.recorded_vm_name(VmPurpose::Kit, &owner);
+                quarantine_hint(
+                    error,
+                    &command,
+                    vm.and_then(|vm| self.recovery_note(&vm)).as_deref(),
                 )
-                .map_err(|error| {
-                    let vm = self.sbx.recorded_vm_name(VmPurpose::Kit, &owner);
-                    quarantine_hint(
-                        error,
-                        &command,
-                        vm.and_then(|vm| self.recovery_note(&vm)).as_deref(),
-                    )
-                })?;
+            })?;
             self.register_worker(store, &vm)?;
+            published_vm = Some(vm.name);
         }
         self.persist_installed_command(&previous, &updated)?;
         if let Some(tag) = source {
@@ -5708,8 +5719,8 @@ impl StockDaemonBackend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(command, RegisteredKit { workload });
-        if let Some(attempt) = attempt {
-            attempt.published()?;
+        if let (Some(attempt), Some(vm)) = (attempt, published_vm) {
+            attempt.published(&vm)?;
         }
         Ok(reference)
     }

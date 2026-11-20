@@ -287,11 +287,37 @@ fn refuse_connection(mut stream: UnixStream, cap: usize) {
             &mut stream,
             &PublicReply::Error {
                 code: ErrorCode::InvalidRequest,
-                message: format!(
-                    "marsh: the daemon is serving {cap} connections, its most; try again"
-                ),
+                message: daemon_busy_message(cap),
             },
         );
+    }
+}
+
+fn daemon_busy_message(cap: usize) -> String {
+    format!(
+        "marsh: the daemon is serving {cap}{}",
+        marsh_contracts::process::CONNECTIONS_FULL_SUFFIX
+    )
+}
+
+/// Whether `error` is a refusal that read nothing and started nothing and
+/// says to try again: the job's capability socket full, the daemon or a shell
+/// relay at its connection cap, a relay that could not reach the daemon, or
+/// such a refusal that reached the caller as a broken pipe (its request was
+/// still being written when the peer refused and closed).
+#[must_use]
+pub fn is_retryable_refusal(error: &DaemonError) -> bool {
+    use marsh_contracts::process::{
+        CONNECTION_REFUSAL, CONNECTIONS_FULL_SUFFIX, RELAY_UNREACHABLE,
+    };
+    match error {
+        DaemonError::Remote(message) | DaemonError::Refused(message) => {
+            message.contains(CONNECTION_REFUSAL.trim_start_matches("marsh: "))
+                || message.ends_with(CONNECTIONS_FULL_SUFFIX)
+                || message == RELAY_UNREACHABLE
+        }
+        DaemonError::Io(io) => io.kind() == io::ErrorKind::BrokenPipe,
+        _ => false,
     }
 }
 
@@ -10136,10 +10162,17 @@ pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(
 /// read without waiting: it is already queued, and a peer that is merely
 /// silent must not hold the caller.
 fn write_request<T: Serialize>(stream: &mut UnixStream, request: &T) -> Result<(), DaemonError> {
-    let error = match write_frame(stream, request) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
+    match write_frame(stream, request) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(after_failed_write(stream, error)),
+    }
+}
+
+/// What a request write that failed with `error` reports: the refusal queued
+/// on `stream`, if the failure was the peer closing and it left one, else
+/// `error`. For every writer of a request to the daemon, including one that
+/// frames its own bytes. The caller must give the stream up afterwards.
+fn after_failed_write(stream: &mut UnixStream, error: DaemonError) -> DaemonError {
     if matches!(
         &error,
         DaemonError::Io(io) if matches!(
@@ -10149,9 +10182,9 @@ fn write_request<T: Serialize>(stream: &mut UnixStream, request: &T) -> Result<(
     ) && stream.set_nonblocking(true).is_ok()
         && let Ok(PublicReply::Error { message, .. }) = read_frame::<PublicReply>(stream)
     {
-        return Err(DaemonError::Remote(message));
+        return DaemonError::Remote(message);
     }
-    Err(error)
+    error
 }
 
 pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T, DaemonError> {
@@ -10238,3 +10271,5 @@ mod tests;
 
 #[cfg(test)]
 mod mcp_load_tests;
+#[cfg(test)]
+mod write_request_tests;

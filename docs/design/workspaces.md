@@ -535,25 +535,41 @@ is 130. `split` exits with the first nonzero code in declaration order.
     even when its own write failed first (a caller that wrote late, or a
     request larger than the socket buffers): a write that ends in a broken
     pipe or a reset takes the refusal queued on that socket instead
-    (`write_request`). Unit tests in `relay.rs`:
+    (`write_request`; the ACP prompt, which frames its own bytes, calls the
+    same `after_failed_write`). A source-level test
+    (`every_client_request_write_goes_through_the_refusal_recovery`) fails if a
+    `Client` method writes its request any other way. A refusal that says
+    to try again (this one, the daemon's own cap, the job socket's cap) is what
+    a link retries (`is_retryable_refusal`, `job.rs` `retry_refusals`: 30
+    attempts, 100 ms apart). Unit tests in `relay.rs`:
     `guest_relay_past_its_capacity_refuses_with_a_frame_not_a_reset`,
     `a_client_that_writes_after_the_refusal_reads_the_reason_not_a_broken_pipe`,
     `a_real_client_with_a_large_request_reads_the_capacity_refusal`,
     `a_real_client_reads_the_refusal_when_the_host_cannot_reach_the_daemon`,
     `host_relay_rejects_the_connection_after_its_bounded_capacity` and
-    `a_services_connection_does_not_take_a_daemon_slot_on_the_host`. The
-    Docker endpoint answers past its cap with its own 429 (unchanged).
+    `a_services_connection_does_not_take_a_daemon_slot_on_the_host`,
+    `a_large_acp_prompt_at_capacity_reads_the_refusal` and
+    `every_relay_refusal_a_real_client_reads_is_retryable`. The Docker endpoint answers past its cap with its own 429 (unchanged).
   - A relay half says so when it refuses a daemon connection: one line, then
     at most one more every 10 s that counts the refusals left unsaid. The
     guest's line (on its stderr) gives the open daemon connections against
     the cap and the services connections against theirs; the host half's, in
     the daemon's log, gives the daemon connections or that the daemon socket
     did not accept. The host passes the guest's refusal lines (and only
-    those) on to the daemon's log, so a refusal in the VM is visible there.
-    The pure parts are tested (`the_guest_says_once_how_full_it_was_when_it_refuses`,
+    those) on to the daemon's log, so a refusal in the VM is visible there:
+    as plain one-line text (`sanitize_vm_text`) of at most 300 characters,
+    and at most 3 per 10 s, the lines left out counted on the next one. A
+    prefix does not authenticate a line: whatever can write the relay's
+    stderr in the VM can write a false one. The lines are for diagnosis.
+    Tested: `the_guest_says_once_how_full_it_was_when_it_refuses`,
     `refusal_lines_are_rate_limited_and_count_what_they_skip`,
-    `only_the_guests_refusal_lines_reach_the_daemon_log`); the daemon's
-    `eprintln!` of them has no test.
+    `only_the_guests_refusal_lines_reach_the_daemon_log`,
+    `forwarded_guest_text_is_one_line_of_plain_text`,
+    `a_long_guest_line_is_cut_and_an_endless_one_is_not_kept`,
+    `a_flood_of_guest_refusal_lines_is_limited_per_window_and_counted` and, in
+    the backend, `drain_tests::the_guest_relays_refusal_lines_reach_the_daemons_log_and_its_head_is_kept`.
+    Diagnostics are written with a write that ignores failure, so a closed
+    stderr never panics a relay thread (not tested).
   - Split input that spooling and running splits hold is bounded: 64 MiB
     for one job's splits, 192 MiB for all jobs' splits, and, apart, 256 MiB
     for the host's and sessions' splits (a session shell is the user's), so

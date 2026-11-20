@@ -402,7 +402,7 @@ where
                         "marshd: shell relay",
                         &format!("{open}/{MAX_RELAY_CONNECTIONS} daemon connections open"),
                     ) {
-                        eprintln!("{line}");
+                        log_line(&line);
                     }
                     if let Err(error) = refuse_open(&tunnel, connection, &busy_message()) {
                         break Err(error);
@@ -415,7 +415,7 @@ where
                         "marshd: shell relay",
                         "the daemon socket did not accept a connection",
                     ) {
-                        eprintln!("{line}");
+                        log_line(&line);
                     }
                     if let Err(error) = refuse_open(&tunnel, connection, UNREACHABLE_MESSAGE) {
                         break Err(error);
@@ -527,12 +527,18 @@ fn send_guest_ready<W: Write>(tunnel: &SharedWriter<W>) -> Result<(), DaemonErro
 
 fn busy_message() -> String {
     format!(
-        "marsh: this shell holds {MAX_RELAY_CONNECTIONS} daemon connections, its most; try again"
+        "marsh: this shell holds {MAX_RELAY_CONNECTIONS} daemon{}",
+        marsh_contracts::process::CONNECTIONS_FULL_SUFFIX
     )
 }
 
-const UNREACHABLE_MESSAGE: &str =
-    "marsh: this shell's relay could not open a connection to the daemon; try again";
+const UNREACHABLE_MESSAGE: &str = marsh_contracts::process::RELAY_UNREACHABLE;
+
+/// One diagnostic line on this process's stderr. Never panics: a closed
+/// stderr (the host dropped the pipe) must not take a relay thread with it.
+pub fn log_line(line: &str) {
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
 
 fn refusal(message: &str) -> PublicReply {
     PublicReply::Error {
@@ -567,38 +573,65 @@ fn refuse_open<W: Write>(
 }
 
 /// What the guest relay writes to its stderr that the host passes on to the
-/// daemon's log: only its refusal lines (`RefusalLog`), whole, control
-/// characters removed and cut short. Anything else the guest says stays in
-/// the bounded head kept for a relay that fails to start.
+/// daemon's log: only its refusal lines (`RefusalLog`), whole, as plain
+/// one-line text (`sanitize_vm_text`) cut to [`Self::MAX_LINE`] characters,
+/// and at most [`Self::LINES_PER_WINDOW`] per [`REFUSAL_LOG_INTERVAL`]: the
+/// guest rate-limits its own, but what a guest process writes is not trusted.
+/// Anything else the guest says stays in the bounded head kept for a relay
+/// that fails to start. A prefix is not authentication: a process that can
+/// write that stream can write a false line.
 #[derive(Default)]
 pub struct GuestDiagnostics {
     partial: Vec<u8>,
+    window: Option<Instant>,
+    in_window: usize,
+    left_out: u64,
 }
 
 impl GuestDiagnostics {
     const LINE_PREFIX: &'static [u8] = b"marsh-relay: refused a connection (";
     const MAX_LINE: usize = 300;
+    const LINES_PER_WINDOW: usize = 3;
 
-    /// The lines completed by `bytes`, for the daemon's log.
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+    /// The lines completed by `bytes` (read at `now`) that go to the daemon's
+    /// log.
+    pub fn feed(&mut self, now: Instant, bytes: &[u8]) -> Vec<String> {
         let mut lines = Vec::new();
         for &byte in bytes {
             if byte == b'\n' {
                 let line = std::mem::take(&mut self.partial);
                 if line.starts_with(Self::LINE_PREFIX) {
-                    lines.push(
-                        String::from_utf8_lossy(&line)
-                            .chars()
-                            .filter(|character| !character.is_control())
-                            .take(Self::MAX_LINE)
-                            .collect(),
-                    );
+                    lines.extend(self.admit(now, &line));
                 }
             } else if self.partial.len() < Self::MAX_LINE * 2 {
                 self.partial.push(byte);
             }
         }
         lines
+    }
+
+    fn admit(&mut self, now: Instant, line: &[u8]) -> Option<String> {
+        if self
+            .window
+            .is_none_or(|start| now.saturating_duration_since(start) >= REFUSAL_LOG_INTERVAL)
+        {
+            self.window = Some(now);
+            self.in_window = 0;
+        }
+        if self.in_window >= Self::LINES_PER_WINDOW {
+            self.left_out += 1;
+            return None;
+        }
+        self.in_window += 1;
+        let mut text: String =
+            marsh_contracts::terminal::sanitize_vm_text(&String::from_utf8_lossy(line))
+                .take(Self::MAX_LINE)
+                .collect();
+        let left_out = std::mem::take(&mut self.left_out);
+        if left_out > 0 {
+            text = format!("{text} [{left_out} earlier refusal lines left out]");
+        }
+        Some(text)
     }
 }
 
@@ -670,7 +703,7 @@ where
         socket_path,
         token_path,
         endpoint,
-        Arc::new(|line| eprintln!("{line}")),
+        Arc::new(log_line),
     )
 }
 
@@ -2397,30 +2430,162 @@ mod tests {
         );
     }
 
+    const GUEST_LINE: &str = "marsh-relay: refused a connection (128/128 daemon connections open)";
+
     #[test]
     fn only_the_guests_refusal_lines_reach_the_daemon_log() {
+        let now = Instant::now();
         let mut diagnostics = GuestDiagnostics::default();
-        let line = "marsh-relay: refused a connection (128/128 daemon connections open)";
         // Split across reads, between other output, with a control character.
         assert_eq!(
-            diagnostics.feed(
-                b"some other noise
-marsh-relay: refu"
-            ),
+            diagnostics.feed(now, b"some other noise\nmarsh-relay: refu"),
             Vec::<String>::new()
         );
         let lines = diagnostics.feed(
+            now,
             format!(
-                "sed a connection (128/128 daemon connections open)\u{1b}[2J\nmore noise\n{line}\n"
+                "sed a connection (128/128 daemon connections open)\u{1b}[2J\nmore noise\n{GUEST_LINE}\n"
             )
             .as_bytes(),
         );
         // The escape byte goes; the rest is plain text.
-        assert_eq!(lines, [format!("{line}[2J"), line.to_owned()]);
+        assert_eq!(lines, [format!("{GUEST_LINE}[2J"), GUEST_LINE.to_owned()]);
         assert!(lines.iter().all(|line| !line.contains('\u{1b}')));
-        // A line with no end is bounded, not kept without limit.
-        assert_eq!(diagnostics.feed(&vec![b'x'; 10_000]), Vec::<String>::new());
-        assert_eq!(diagnostics.feed(format!("\n{line}\n").as_bytes()), [line]);
+    }
+
+    #[test]
+    fn forwarded_guest_text_is_one_line_of_plain_text() {
+        let mut diagnostics = GuestDiagnostics::default();
+        // Bidi overrides and isolates, line and paragraph separators, a
+        // zero-width space and a tag character: none passes.
+        let hostile =
+            format!("{GUEST_LINE}\u{202e}\u{2066}\u{2028}\u{2029}\u{200b}\u{e0041}\u{85}\r!\n");
+        let lines = diagnostics.feed(Instant::now(), hostile.as_bytes());
+        assert_eq!(lines, [format!("{GUEST_LINE}!")]);
+    }
+
+    #[test]
+    fn a_long_guest_line_is_cut_and_an_endless_one_is_not_kept() {
+        let mut diagnostics = GuestDiagnostics::default();
+        let long = format!("{GUEST_LINE}{}\n", "y".repeat(5_000));
+        let lines = diagnostics.feed(Instant::now(), long.as_bytes());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].chars().count(), GuestDiagnostics::MAX_LINE);
+        // A refusal line that never ends keeps only a bounded part.
+        let mut diagnostics = GuestDiagnostics::default();
+        diagnostics.feed(Instant::now(), GUEST_LINE.as_bytes());
+        diagnostics.feed(Instant::now(), &vec![b'z'; 100_000]);
+        assert!(diagnostics.partial.len() <= GuestDiagnostics::MAX_LINE * 2);
+        let lines = diagnostics.feed(Instant::now(), b"\n");
+        assert!(lines.len() == 1 && lines[0].chars().count() <= GuestDiagnostics::MAX_LINE);
+    }
+
+    #[test]
+    fn a_flood_of_guest_refusal_lines_is_limited_per_window_and_counted() {
+        let start = Instant::now();
+        let mut diagnostics = GuestDiagnostics::default();
+        let flood = format!("{GUEST_LINE}\n").repeat(1_000);
+        let lines = diagnostics.feed(start, flood.as_bytes());
+        assert_eq!(lines.len(), GuestDiagnostics::LINES_PER_WINDOW);
+        // Still the same window.
+        assert_eq!(
+            diagnostics.feed(start + Duration::from_secs(9), flood.as_bytes()),
+            Vec::<String>::new()
+        );
+        // The next window: a few more, the first saying what was left out.
+        let lines = diagnostics.feed(start + REFUSAL_LOG_INTERVAL, flood.as_bytes());
+        assert_eq!(lines.len(), GuestDiagnostics::LINES_PER_WINDOW);
+        assert!(
+            lines[0].ends_with(&format!(
+                "[{} earlier refusal lines left out]",
+                2 * 1_000 - GuestDiagnostics::LINES_PER_WINDOW
+            )),
+            "{}",
+            lines[0]
+        );
+        assert!(!lines[1].contains("left out"));
+    }
+
+    #[test]
+    fn a_large_acp_prompt_at_capacity_reads_the_refusal() {
+        let relays = PairedRelays::new();
+        let held = fill_to_capacity(&relays);
+        let reply = client(&relays).acp_prompt_classified(
+            "agent".into(),
+            session("shell-1", Path::new("/home/u")),
+            "op".into(),
+            "x".repeat(512 * 1024),
+        );
+        drop(held);
+        relays.stop();
+        let message = match reply {
+            Err(crate::acp_session::PromptAdmissionError::Rejected(DaemonError::Remote(
+                message,
+            ))) => message,
+            other => panic!("the prompt was answered {other:?}, not a refusal"),
+        };
+        assert!(message.contains("try again"), "{message}");
+    }
+
+    #[test]
+    fn what_a_link_retries_covers_every_refusal_that_says_try_again() {
+        use marsh_contracts::process::{CONNECTION_REFUSAL, RELAY_UNREACHABLE};
+        let remote = |message: String| DaemonError::Remote(message);
+        for refusal in [
+            remote(busy_message()),
+            remote(crate::daemon_busy_message(1024)),
+            remote(RELAY_UNREACHABLE.into()),
+            remote(CONNECTION_REFUSAL.into()),
+            remote(format!(
+                "{CONNECTION_REFUSAL} (at most 4 at once: twice job-children, plus 4)"
+            )),
+            DaemonError::Io(std::io::ErrorKind::BrokenPipe.into()),
+        ] {
+            assert!(crate::is_retryable_refusal(&refusal), "{refusal:?}");
+        }
+        for other in [
+            remote("marsh: unauthorized".into()),
+            remote("spawn refused: shell is not allowed".into()),
+            DaemonError::InvalidState("busy".into()),
+            DaemonError::JobUncertain("lost".into()),
+            DaemonError::Io(std::io::ErrorKind::NotFound.into()),
+        ] {
+            assert!(!crate::is_retryable_refusal(&other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn every_relay_refusal_a_real_client_reads_is_retryable() {
+        let relays = PairedRelays::new();
+        let held = fill_to_capacity(&relays);
+        let client = client(&relays);
+        let capped = [
+            client.request(PublicRequest::Ping),
+            client.request(PublicRequest::OpenUrl {
+                url: "x".repeat(512 * 1024),
+            }),
+        ];
+        drop(held);
+        fs::remove_file(
+            relays
+                .socket
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("daemon.sock"),
+        )
+        .unwrap();
+        let unreachable = client.request(PublicRequest::Ping);
+        relays.stop();
+        for reply in capped.into_iter().chain([unreachable]) {
+            // A refusal read as the reply, or carried by the failed write.
+            let error = match reply {
+                Ok(reply) => crate::unexpected_reply(reply),
+                Err(error) => error,
+            };
+            assert!(crate::is_retryable_refusal(&error), "{error:?}");
+        }
     }
 
     #[test]

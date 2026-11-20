@@ -287,11 +287,8 @@ fn child_at(
         acp: false,
     };
     let client = marsh_daemon::Client::capability(Path::new(SOCKET));
-    // The connection cap is transient: a refused connection read nothing
-    // and started nothing, so it is retried briefly.
-    let mut result = Err(DaemonError::Refused(String::new()));
-    for attempt in 0..30 {
-        result = client.run_process_with_io_started(
+    let result = retry_refusals(30, std::time::Duration::from_millis(100), || {
+        client.run_process_with_io_started(
             spec.clone(),
             std::io::stdin(),
             std::io::stdout(),
@@ -302,23 +299,8 @@ fn child_at(
                     let _ = std::fs::write(path, job);
                 }
             },
-        );
-        match &result {
-            // A refused connection may also surface as a broken pipe: the
-            // refusal closed the socket before the request was fully
-            // written, so the daemon never read it and nothing started.
-            // (Loss after acceptance is `JobUncertain`, never retried.)
-            Err(error)
-                if attempt < 29
-                    && (remote_message(error).contains("too many concurrent daemon requests")
-                        || matches!(error, DaemonError::Io(io)
-                            if io.kind() == std::io::ErrorKind::BrokenPipe)) =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            _ => break,
-        }
-    }
+        )
+    });
     match result {
         Ok(code) => code,
         Err(error) => {
@@ -331,6 +313,28 @@ fn child_at(
             }
         }
     }
+}
+
+/// Runs `attempt` up to `attempts` times, `pause` apart, while it fails with a
+/// refusal that is worth retrying (`is_retryable_refusal`). The connection
+/// cap is transient: a refused connection read nothing and started nothing.
+/// (Loss after acceptance is `JobUncertain`, never retried.)
+fn retry_refusals<T>(
+    attempts: usize,
+    pause: std::time::Duration,
+    mut attempt: impl FnMut() -> Result<T, DaemonError>,
+) -> Result<T, DaemonError> {
+    let mut result = Err(DaemonError::Refused(String::new()));
+    for number in 0..attempts {
+        result = attempt();
+        match &result {
+            Err(error) if number + 1 < attempts && marsh_daemon::is_retryable_refusal(error) => {
+                std::thread::sleep(pause);
+            }
+            _ => break,
+        }
+    }
+    result
 }
 
 fn remote_message(error: &DaemonError) -> String {
@@ -1178,7 +1182,65 @@ fn quote(argument: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobScope, render_jobs};
+    use super::{JobScope, render_jobs, retry_refusals};
+    use marsh_daemon::DaemonError;
+    use std::time::Duration;
+
+    fn refused(message: &str) -> DaemonError {
+        DaemonError::Remote(message.to_owned())
+    }
+
+    #[test]
+    fn a_link_retries_a_refusal_that_says_try_again_and_then_succeeds() {
+        // What a shell relay at its cap, the daemon at its cap and a relay
+        // that cannot reach the daemon send, and the job socket's own cap.
+        for refusal in [
+            "marsh: this shell holds 128 daemon connections, its most; try again",
+            "marsh: the daemon is serving 1024 connections, its most; try again",
+            "marsh: this shell's relay could not open a connection to the daemon; try again",
+            "marsh: too many concurrent daemon requests in this job",
+        ] {
+            let mut calls = 0;
+            let result = retry_refusals(30, Duration::ZERO, || {
+                calls += 1;
+                if calls < 3 {
+                    Err(refused(refusal))
+                } else {
+                    Ok(7)
+                }
+            });
+            assert_eq!((result.ok(), calls), (Some(7), 3), "{refusal}");
+        }
+        // The same refusal that reached the caller as a broken pipe.
+        let mut calls = 0;
+        let result = retry_refusals(30, Duration::ZERO, || {
+            calls += 1;
+            if calls == 1 {
+                Err(DaemonError::Io(std::io::ErrorKind::BrokenPipe.into()))
+            } else {
+                Ok(0)
+            }
+        });
+        assert_eq!((result.ok(), calls), (Some(0), 2));
+    }
+
+    #[test]
+    fn a_link_does_not_retry_what_is_not_a_refusal_and_gives_up_at_the_last_attempt() {
+        let mut calls = 0;
+        let result: Result<i32, _> = retry_refusals(30, Duration::ZERO, || {
+            calls += 1;
+            Err(refused("spawn refused: not in this job's spawn set"))
+        });
+        assert!(result.is_err() && calls == 1, "{calls}");
+        let mut calls = 0;
+        let result: Result<i32, _> = retry_refusals(5, Duration::ZERO, || {
+            calls += 1;
+            Err(refused(
+                "marsh: this shell holds 128 daemon connections, its most; try again",
+            ))
+        });
+        assert!(result.is_err() && calls == 5, "{calls}");
+    }
 
     #[test]
     fn run_records_only_its_own_model_option() {

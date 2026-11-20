@@ -159,6 +159,9 @@ pub struct StockDaemonBackend {
     /// The ids of `kit install` attempts that have not published their
     /// command (`kit_install.rs`); their records are persisted in the map.
     running_installs: Mutex<BTreeMap<String, (String, String)>>,
+    /// How long a reset waits for Kit locks held elsewhere (milliseconds;
+    /// `kit_install::RESET_LOCK_WAIT_MS`, shortened by tests).
+    reset_lock_wait: std::sync::atomic::AtomicU64,
     /// Runs once between a reset's first plan and its Kit locks (tests that
     /// interleave another operation there).
     #[cfg(test)]
@@ -506,6 +509,7 @@ impl StockDaemonBackend {
             configured_mcp_vms: Mutex::new(BTreeMap::new()),
             quarantine_recovery: Mutex::new(BTreeMap::new()),
             running_installs: Mutex::new(BTreeMap::new()),
+            reset_lock_wait: std::sync::atomic::AtomicU64::new(kit_install::RESET_LOCK_WAIT_MS),
             #[cfg(test)]
             reset_before_locks: Mutex::new(None),
             #[cfg(test)]

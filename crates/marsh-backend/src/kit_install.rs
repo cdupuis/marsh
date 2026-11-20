@@ -78,19 +78,23 @@ impl Drop for InstallAttempt<'_> {
     }
 }
 
-/// Every Kit lock of `locks` (in their key order) without waiting, or
-/// `None` (and none held) when one is held elsewhere.
-fn try_lock_in_order(locks: &[Arc<Mutex<()>>]) -> Option<Vec<MutexGuard<'_, ()>>> {
+/// Every Kit lock of `locks` (in their key order) without waiting, or the
+/// index of one held elsewhere (and none held).
+fn try_lock_in_order(locks: &[Arc<Mutex<()>>]) -> Result<Vec<MutexGuard<'_, ()>>, usize> {
     let mut guards = Vec::with_capacity(locks.len());
-    for lock in locks {
+    for (index, lock) in locks.iter().enumerate() {
         match lock.try_lock() {
             Ok(guard) => guards.push(guard),
             Err(std::sync::TryLockError::Poisoned(error)) => guards.push(error.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(index),
         }
     }
-    Some(guards)
+    Ok(guards)
 }
+
+/// How long a reset waits for Kit locks held elsewhere, in milliseconds (the
+/// client's own wait for a busy daemon is as long).
+pub(super) const RESET_LOCK_WAIT_MS: u64 = 30_000;
 
 /// What a reset removes, planned under the Kit locks of `keys`.
 #[derive(Debug, Default)]
@@ -153,6 +157,11 @@ impl StockDaemonBackend {
         selection: &LoadSelection,
         store: &DaemonStore,
     ) -> Result<Vec<String>, DaemonError> {
+        let wait = std::time::Duration::from_millis(
+            self.reset_lock_wait
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let deadline = std::time::Instant::now() + wait;
         for _ in 0..RESET_PLAN_ROUNDS {
             // The candidate Kits, found without assigning a name.
             let keys = self.plan_reset(selection)?.keys;
@@ -170,12 +179,22 @@ impl StockDaemonBackend {
             // one of these Kits since the plan holds it for its whole create.
             // While a lock is held, plan again: that refuses (NAME) or skips
             // (all) such an install, and any other change starts over.
+            // The wait is bounded: a lock held all along (a long job
+            // preparation, a Kit change) refuses, naming its Kit.
             let guards = loop {
-                if let Some(guards) = try_lock_in_order(&locks) {
-                    break Some(guards);
-                }
+                let busy = match try_lock_in_order(&locks) {
+                    Ok(guards) => break Some(guards),
+                    Err(busy) => busy,
+                };
                 if self.plan_reset(selection)?.keys != keys {
                     break None;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let kit = keys.iter().nth(busy).cloned().unwrap_or_default();
+                    return Err(DaemonError::InvalidState(format!(
+                        "the reset waited {} s for Kit {kit}, which a job's preparation, a recovery, a Kit change or garbage collection kept busy; nothing was removed, try again",
+                        wait.as_secs()
+                    )));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             };
@@ -2316,5 +2335,43 @@ mod tests {
         assert_eq!(lab.records(), [format!("{vm} hf")]);
         lab.reset(&["hf"]).unwrap();
         assert_eq!(lab.stock.listed(), NONE);
+    }
+
+    /// GPT's round 3 (the bound): a reset waiting on a Kit lock that stays
+    /// held (stable contention) gives up at its deadline and names the Kit,
+    /// removing nothing. Fails with the deadline removed (it waits as long as
+    /// the lock is held).
+    #[test]
+    fn a_reset_under_stable_contention_gives_up_at_its_deadline() {
+        let lab = Lab::new();
+        lab.register("g", &reference('c'));
+        let vm = lab
+            .backend
+            .sbx
+            .vm_name(marsh_sbx::VmPurpose::Kit, &reference('c'))
+            .unwrap();
+        lab.stock.seed(&vm);
+        lab.backend
+            .reset_lock_wait
+            .store(300, std::sync::atomic::Ordering::Relaxed);
+        let lock = lab.backend.kit_lock_for_key(&reference('c')).unwrap();
+        let held = lock.lock().unwrap();
+        let (backend, store) = (lab.backend.clone(), lab.store().clone());
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reset = std::thread::spawn(move || {
+            let reset = backend.reset_workers(&LoadSelection::Kits(vec!["g".into()]), store);
+            done_tx.send(()).unwrap();
+            reset
+        });
+        let finished = done.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        let refused = reset.join().unwrap();
+        assert!(finished.is_ok(), "the reset outwaited its deadline");
+        let refused = refused.unwrap_err().to_string();
+        assert!(
+            refused.contains(&reference('c')) && refused.contains("nothing was removed"),
+            "{refused}"
+        );
+        assert_eq!(lab.stock.listed(), std::slice::from_ref(&vm));
     }
 }

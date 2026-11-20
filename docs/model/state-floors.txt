@@ -14,6 +14,8 @@
 CloudOwnership.cfg 6900
 CloudOwnership_concurrent_pass.cfg 5300000
 Grants.cfg 9300
+KitInstall.cfg 200000
+KitInstall_wide_pass.cfg 6800000
 KitSwitch.cfg 10000
 Ownership.cfg 51
 Pins.cfg 560

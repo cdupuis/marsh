@@ -4,7 +4,10 @@ Eleven TLA+ modules specify current cross-component state (ten local modules and
 the cloud ownership extension). A twelfth, `Placement`,
 specifies the cloud placement extension; only its single-crossing,
 session-origin part is implemented (see
-[coverage and gaps](#proposed-placement-model)). TLC checks their bounded state
+[coverage and gaps](#proposed-placement-model)). A thirteenth, `KitInstall`, is
+a design model of reaching the VM of a failed `marsh kit install` (issue #194):
+it fixes the lock and record protocol before the code follows it (see
+[Kit install design model](#kit-install-design-model)). TLC checks their bounded state
 spaces; a pass does not prove that the Rust code refines these specifications.
 The code-location table below records the implementation mapping and known gaps.
 `scripts/check-model-locations.py` (run by `make test-tools`, through
@@ -187,6 +190,10 @@ review obligation when the code they cite changes.
   the idle claim), `admitStopping` (admit a job to a VM claimed for a stop), `cancelOnError`
   (reopen admission when the stop command errs) and `loseRetired` (the retired mark does not
   survive a restart, so the VM serves again), all StopSparesRunning.
+- `KitInstall.tla` (design model): the VM of a `marsh kit install` that failed, fails fast,
+  times out or lands late, the per-Kit lifecycle locks, the per-attempt install records and the
+  ownership map that keep it reachable by `marsh workers reset NAME|all` while nothing is removed
+  that the map does not prove the daemon's. See [Kit install design model](#kit-install-design-model).
 - `Grants.tla`: an ACP session published as an MCP tool and an MCP pipeline loaded into a
   named sandbox. Both use the same model: publish binds one target incarnation, revoke is
   terminal, and requests and one-time permissions are checked when delivered. The same
@@ -231,7 +238,9 @@ Invariants: `NoForeignEffect`, `OwnedAreOurs`, `NoLeak` (Ownership); `CapacityBo
 `CancelScoped`, `NoRemoveWhileLive`, `NoReplay`, `WorkspaceRecorded` (Workspace); `LineageWF`,
 `Attenuation`, `BudgetBound`, `FanOutBound`, `RateBound`, `LiveUnderLive`, `NoOrphanRunning`,
 `CancelPropagates`, `RevokedAtRestart`, `RestartUncertain`, `NoReplay`, `EntryOnce`,
-`NoEntryRecursion`, `SpawnSetAttenuates`, `KitVMBound`, `NoHomeKitHome`, `AdmittedUnderLimits` (Process). Liveness:
+`NoEntryRecursion`, `SpawnSetAttenuates`, `KitVMBound`, `NoHomeKitHome`, `AdmittedUnderLimits` (Process);
+`NoForeignRemoval`, `EveryDaemonVMOwned`, `EveryDaemonVMReachable`, `NoOrphanRecord`, `NoDeadlock`,
+`ResetNeverStuck` (KitInstall, design). Liveness:
 `AttemptsTerminate` and `QuarantineHeals` (Worker; weak fairness, no operator action), `DrainEnds` (KitSwitch; weak fairness on job ends and the drain pass), and `EventuallySettled` (Workspace; weak fairness on
 daemon steps and process progress, checked in the smaller `Workspace_live_pass.cfg`).
 
@@ -335,10 +344,11 @@ Run: `docs/model/check.sh [--quick | --huge | --no-huge] [--cores N] [--workers 
 concurrently inside a core budget (default: the runner's CPUs, at most 8), one TLC process each with its own
 log; the verdict of a config does not depend on scheduling. `--quick` (run by `make test`, about 90 s on 8
 cores) checks every negative control and, for each module, a positive config with every invariant
-(`Ownership.cfg`, `Worker.cfg`, `Grants.cfg`, `Pins.cfg`, `Process.cfg`, `Workspace_restart_pass.cfg`) plus the liveness
+(`Ownership.cfg`, `Worker.cfg`, `Grants.cfg`, `Pins.cfg`, `Process.cfg`, `KitInstall.cfg`, `Workspace_restart_pass.cfg`) plus the liveness
 configs (`Process_live_pass.cfg`, `Workspace_live_pass.cfg`). It skips only the configs marked
 `\* marsh-check: slow`, the larger positive bounds: `Workspace.cfg` (about 7 min), `Process_caps_pass`,
-`Process_kits_pass`, `Process_kitvms_pass` (about 2 min each), and `Workspace_depth3_pass` (about 30 min).
+`Process_kits_pass`, `Process_kitvms_pass` (about 2 min each), `KitInstall_wide_pass` (about 11 min on two
+workers), and `Workspace_depth3_pass` (about 30 min).
 The default and `make regress` run every config. `--huge` / `--no-huge` split the one config that does
 not fit a CI job from the rest: CI's model job runs `--no-huge`, and the weekly
 [model.yml](../../.github/workflows/model.yml) runs `--huge`. `TLC_CACHE=DIR` skips a config whose spec, config,
@@ -359,7 +369,7 @@ positive config fails or a negative control passes or fails for the wrong reason
 - *Deadlock checking is off* (`tlc2.TLC -deadlock`) because the models bound their environment
   with counters (restarts, jobs, labels, UUIDs), so a run ends in states where no action is
   enabled, and TLC cannot tell such a bounded end from a stuck state. With the check on,
-  `KitSwitch`, `Sbxenv`, `ServicesReap`, `ServicesLanes`, `CloudOwnership`,
+  `KitSwitch`, `KitInstall`, `Sbxenv`, `ServicesReap`, `ServicesLanes`, `CloudOwnership`,
   `Placement_nested_pass` and `Workspace_restart_pass` stop with "Deadlock reached" at a bound
   (the same configs of `Ownership`, `Pins`, `Grants`, `ServicesVm` and `Process_limits_pass`
   do not). Progress is checked by the liveness configs (`*_live_pass`), not by deadlock
@@ -437,6 +447,136 @@ positive config fails or a negative control passes or fails for the wrong reason
 | Process: Spawn Kit VM cap (KitVMBound) | `process::kit_vm_cap` (from `child_lineage`, split branches included): distinct `kit_ref` among the tree's live receipts, at most `tree_kit_vms` (8 by default; `tree-kit-vms`), checked in the pre-check and in `begin_job_process` |
 | Process: SetLimits / Lim (AdmittedUnderLimits; control `staleLimits`) | every admission check reads `State::limits` (`marsh-daemon/src/lib.rs`): the daemon's launch-environment snapshot (`JobDefaults::from_environment`) with the scope's `config.json` `limits` applied (`limits.rs` `ConfigCache`, re-read when the file changes; written by `marsh config limit`, `marsh/src/limits_cli.rs`). A change neither ends nor reassigns a running job; it only refuses the next launch over it |
 | Process: Spawn spawn-set narrowing | `process::admit` (`child_lineage`): `MARSH_SPAWN` / `marsh run --spawn` / `--no-spawn` narrow admission. The capability socket remains available for subtree inspection; disallowed spawn requests are refused. |
+
+## Kit install design model
+
+`KitInstall.tla` settles the design for issue #194 (PR #502): `marsh workers reset NAME|all`
+must reach the VM of a failed `marsh kit install` (a create that fails, times out, or lands
+after its call returned) and must never remove a VM the daemon cannot prove is its own. Three
+review rounds of that PR each found a new interleaving in the Kit lock, install record and
+ownership map logic. Each one is a negative control here. **It is a design model.** Main does not
+implement the protocol, and the round-3 work in progress implements most of it. The table
+after the controls maps each action to the code on main and marks what exists only in the
+design. A pass is evidence about the protocol, not about the Rust code.
+
+State: stock SBX as a name -> VM table (A1, A2 above); the ownership map, with a name
+`free`, `live` (an intent or a recorded VM: the daemon's) or `retired` (forgotten after its VM
+was removed: a VM listed under it is foreign); the quarantine; one install record per attempt
+(attempt id, name, running/settled/ended); the registered commands; one lock per Kit identity.
+Processes: successive install attempts of one command (installs serialize on
+`registry_install`), a job preparing a registered command's Kit VM, `workers reset NAME|all`,
+a Kit switch of a registered command to another Kit, and single-step automatic recovery, VM
+GC and scope teardown. A create returns ok, fails with a VM listed, fails with none, or times
+out; a timed-out create lands later (`Land`) or never. A process that holds one lock and waits
+for no other takes, uses and releases it in one step. Only reset and the switch have a wait
+state, and `NoDeadlock` checks for a wait-for cycle, including a process that waits for a
+lock it holds itself.
+
+The design (positive configs, `Bug = "none"`):
+
+1. **One lock per Kit identity.** The lock order is lifecycle admission, then
+   `registry_install`, then the Kit locks, then store claims, then the sbx per-VM fence, then
+   the ownership-map mutex. A process that needs several Kit locks takes all of them, in key
+   order, before it acts, and never waits for one while it holds a later key. A Kit switch
+   takes the old Kit's and the new Kit's locks together.
+2. **Hold the lock from the decision to the act.** An install, a job preparation, a reset, a
+   switch, automatic recovery and GC each hold the Kit lock from the moment they choose a VM
+   name until they create or retire under it. Recovery and GC key the lock by the name's
+   ownership key, whether or not a command names the Kit. Scope teardown takes no Kit lock:
+   lifecycle admission runs it only when no request or background pass is in flight.
+3. **Order under the lock.** First recover the Kit's current VM if it is quarantined and that
+   is verified safe. Then choose the name, without creating one, from the map. An install then
+   writes its record (attempt id, name), and only then creates. Nothing chosen before the lock
+   (a name, a spec, a reset's targets) is used after it.
+4. **Check the name again at the create.** The name must still be a live entry of this Kit.
+   If it is not, choose it again and re-point the record. Nothing is ever submitted under a
+   retired name. Rule 2 alone is enough (probe: no check, every rule-2 lock), and so is this
+   rule alone (probe: background recovery without the lock, with the check). Keep both.
+5. **Create outcomes.**
+   - Ok: adopt the VM. An install registers its command and then ends its record.
+   - Failed, with a VM in a fresh listing: quarantine it and keep the intent and the record.
+   - Failed, with nothing listed, and no earlier create under the name without a verdict: the
+     create is over, so forget the intent and end the record.
+   - Timed out, or the reply was lost: quarantine the VM as pending, mark the name uncertain,
+     and keep the intent and the record. They are the handle for a late landing.
+6. **When a record ends.** A record is removed by attempt id, never by command name. It ends
+   when its attempt succeeds, or when the name it names is retired. A retirement is a removal
+   by recorded UUID, then the name is forgotten, then the records naming it end, all in one
+   step under the Kit lock. That holds for reset, recovery, GC, teardown, a switch retiring the
+   old VM, and a failed create that is over. A record never ends while its name is a live
+   intent with no VM listed.
+7. **Reset.**
+   - Find the candidate Kits from the state, without assigning names, and lock them in key
+     order.
+   - Under the locks, plan again. If the plan needs a Kit lock not held, release every lock
+     and take them again in order.
+   - `NAME` targets the VM its registered Kit has (looked up, never assigned) and the names of
+     its settled records. `all` targets every live Kit name and every recorded name.
+   - Take one lock per Kit key, never one per VM.
+   - For each target:
+     - A listed VM under a live name is removed, its name is forgotten, and its records end.
+     - An absent intent keeps its intent and its records, and its quarantine is lifted. The
+       reset says the create may still land; it does not say the VM was removed.
+     - A listed VM under a retired name is foreign. The reset refuses it and never removes it.
+       Under the design this never happens to a VM the daemon created.
+
+| Invariant | Negative control | What must be caught |
+|---|---|---|
+| `EveryDaemonVMReachable` | `lateLandingLost` | Review kh: a reset that saw the create absent ends the record; the VM lands, is adopted, and no reset by the install's name reaches it |
+| `EveryDaemonVMReachable` | `oldAttemptErasesNew` | Review kh: reset plans before its locks and forgets records by command name; a retry (another reference, another Kit) records and fails meanwhile, and its record is erased |
+| `ResetNeverStuck` | `recoveryKeepsRecord` | Review kh2: recovery removes the VM and keeps the record; reset refuses "recorded VM changed" forever |
+| `EveryDaemonVMOwned` | `resetAllSnapshotRace` | Review kh3: reset plans before its locks; a retry that recovered, chose the old name and recorded it waits on the Kit lock; reset removes and forgets the VM; the retry creates under the forgotten name; the VM is foreign forever |
+| `EveryDaemonVMOwned` | `nameBeforeRecovery` | Round 2: install chooses its name, then its own recovery retires it, then it creates under it |
+| `NoDeadlock` | `lockPerVm` | Round 2: one lock per target VM; two VMs of one Kit (a record naming a retired VM and the current one) make reset wait on its own lock |
+| `EveryDaemonVMOwned` | `jobPathStaleName` | Round 2: the job path chooses its name before the lock and recovery |
+| `NoDeadlock` | `switchAbba` | A switch holds the old Kit lock and then takes the new one, while a key-ordered reset holds the new one and waits for the old |
+| `EveryDaemonVMOwned` | `recoveryNoLock` | Main: background recovery of a VM no command names takes no Kit lock, between an install's choice of name and its create (no re-check) |
+| `NoForeignRemoval` | `removeUnowned` | The tempting fix for the foreign VM: reset removes a recorded VM by name although the map does not own it |
+| `NoOrphanRecord` | `failedCreateKeepsRecord` | Main and the work in progress keep the intent and record of a create that stock reported failed, with nothing listed |
+
+`EveryDaemonVMOwned` holds in every state: every listed VM is under a live name. The others
+are checked at quiescence (no process mid-way). `EveryDaemonVMReachable` requires a VM an
+install attempt created to be named by a settled record, or to be the VM of the command once
+registered. `NoOrphanRecord` requires a settled record's VM to be listed, or its create to be
+without a verdict. `ResetNeverStuck` requires that neither `reset NAME` nor `reset all` is
+refused, and a reset that is not refused removes every target listed under a live name.
+
+Controls that need two deviations of the reviewed code turn on both:
+- `oldAttemptErasesNew`: plan before the locks, and forget by name. Under a plan made beneath
+  the locks, forgetting by name alone is harmless.
+- `resetAllSnapshotRace`: the install chooses its name before the lock, the reset plans before
+  its locks, and there is no create-time check. TLC's shortest trace goes through background
+  recovery; a probe with only install, reset and landing gives exactly kh3's trace.
+- `lockPerVm`: one lock per VM, and recovery keeps the record. Under rule 6 every target name
+  of one Kit is the same name, so one lock per VM cannot self-deadlock in this bound. Rule 7
+  still takes one lock per Kit.
+
+Positive configs:
+- `KitInstall.cfg`: one Kit to install from, 2 attempts, 1 job, 2 resets, 1 switch, 1
+  teardown, 1 late create, 4 names. About 390 k states.
+- `KitInstall_wide_pass.cfg` (slow): 2 Kits, 2 jobs, 2 late creates, 5 names. 13.6 M states,
+  11 min on two workers.
+
+Not modeled:
+- A daemon restart. Records and quarantines are in memory. After a restart a failed install's
+  VM is still owned (the intent is persisted): `marsh reset`/`stop` and GC reach it, and
+  `workers reset NAME` does not.
+- A user's own `sbx rm`.
+- Running jobs and drain (KitSwitch's).
+- Lock waits that time out (try-locks).
+- The settle-time wait before a reset.
+- The sbx-internal listing races inside one teardown pass.
+
+| KitInstall action | Code location on main (design-only parts marked) |
+|---|---|
+| InstPrep / InstCreate | `marsh-backend/src/lib.rs` `install_command`: on main `kit_spec_for_workload` chooses the name before any lock, and `prepare_one_with_progress` recovers before taking the Kit lock (`nameBeforeRecovery`). There is no install record. **Design-only**: the record, recovery and then the name under the lock, the create-time check, and ending the record on success. The create is marsh-sbx `lib.rs` `ensure_kit_vm_authorized` -> `create_published_vm_with_grant` (`quarantine_vm_as` with `create_may_land`) -> `adopt_created` (`VmOwnership::record` takes a retired name back); `vm_ownership.rs` `assign` persists the intent |
+| JobRun | `marsh-backend/src/lib.rs` `prepare_one_unnoted`: on main `recover_quarantined_vm` runs before the Kit lock, on the name the caller chose (`jobPathStaleName`); `worker_recovery.rs` `recover_before_prepare` |
+| RstStart / RstLock / RstReplan / RstAct | `marsh-backend/src/lib.rs` `reset_workers`: on main `kit_spec` is called per command before the locks (it assigns a name), there is one lock per spec in VM-name order, then `retire_claimed`; for `all`, `worker_recovery.rs` `retire_unnamed_quarantined`. marsh-sbx `lib.rs` `retire_kit_vm_before` classifies afresh -> `remove_owned_vm`; for an absent name `VmOwnership::forget` keeps an intent. **Design-only**: install records as targets, the plan under the locks, the re-plan, and one lock per Kit key |
+| SwStart / SwLock / SwAct | `marsh-backend/src/lib.rs` `apply_upgrade`: on main it holds the old Kit's `kit_lock` while `prepare_one_with_progress` takes the new Kit's (`switchAbba`); `unregister` and `claim_old_vm` retire the old VM; `move_to_shipped` prepares before it takes the old lock |
+| RecoverBg | `marsh-backend/src/worker_recovery.rs` `recover_quarantined_vm`: on main the Kit lock is taken only when a command names the VM (`recoveryNoLock`); `retire_recovered`; marsh-sbx `lib.rs` `retire_quarantined_vm` |
+| Gc | `marsh-backend/src/vm_gc.rs` `remove_recorded`: on main the Kit lock is taken only for a current Kit's VM |
+| Teardown | `marsh-backend/src/lib.rs` `teardown_scope` and `reset_stale_scope_components` -> marsh-sbx `lib.rs` `reset_stale_scope_kit_vms_before`; it is admitted by marsh-daemon `lib.rs` `begin_lifecycle_request`, which refuses while any request, an install included, is in flight |
+| Land, listing | stock SBX; marsh-sbx `vm_ownership.rs` `store_view` adopts a listed intent, and `classify` reports a VM listed under a forgotten name as foreign |
 
 ## Proposed placement model
 

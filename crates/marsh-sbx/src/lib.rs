@@ -5729,8 +5729,11 @@ impl StockSbx {
     /// `docker create`, before `docker start`), running, restarting or
     /// paused. An exited or dead container is not started again: the worker
     /// starts its container once, never re-creates it, and creates it with
-    /// no restart policy. `Err` says why that could not be shown; then the VM
-    /// stays. Only this daemon's recorded VM is inspected.
+    /// no restart policy. A container still being created when this looks
+    /// is never started either: the worker starts a container only once the
+    /// daemon acknowledges its journaled `Started` (`WorkerRequest::StartedAck`)
+    /// and deletes one never acknowledged. `Err` says why that could not be
+    /// shown; then the VM stays. Only this daemon's recorded VM is inspected.
     ///
     /// # Errors
     /// Returns the reason verification was impossible or failed.

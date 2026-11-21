@@ -207,6 +207,13 @@ one it cannot verify, and reports it as cleanup uncertain. So no quarantine is
 permanent: it ends on its own once nothing runs, or with `marsh stop --force`.
 `marsh workers reset all` skips such a VM.
 
+The check can trust what it sees because marsh records a job's VM before it
+sends the job there, and a worker starts a job's container only after the
+daemon has recorded it as running there. A container whose start marsh never
+recorded (the daemon stopped in between) is deleted by its worker, within 30
+seconds, and never started. This relies on the worker in each Kit VM being the
+one the running daemon installed, which marsh does before it first uses the VM.
+
 For a `marsh kit install NAME` that failed, use the name it was given:
 `marsh workers reset NAME` removes the VM its create left. That works after a
 daemon restart too, and for a create that lands after the install gave up:

@@ -195,13 +195,17 @@ reset KIT` removes it at once. A job marsh lost track of while it ran (the
 connection to the VM was lost, or the daemon restarted under it) may still be
 running, so `marsh workers reset KIT`, like the automatic retirement, first
 checks the VM afresh, and removes it only when it is stopped or gone or its
-Docker lists no running container. If it cannot verify that (a container still
-runs, or `sbx` cannot reach the VM), it removes nothing and names the jobs that
-may still run. Wait for them and try again, or run `marsh stop --force`: it
-removes the VM anyway, ending whatever still runs there. A plain `marsh stop` or
-`marsh reset` keeps such a VM and reports it as cleanup uncertain. So no
-quarantine is permanent: it ends on its own once nothing runs, or with
-`marsh stop --force`. `marsh workers reset all` skips such a VM.
+Docker lists no container that runs or may still start (created, running,
+restarting or paused; an exited one is never started again). If it cannot
+verify that (a container runs or waits to start, or `sbx` cannot reach the VM),
+it removes nothing and names the jobs that may still run. Wait for them and try
+again, or run `marsh stop --force`: it removes the VM anyway, ending whatever
+still runs there. A plain `marsh stop` or `marsh reset` makes the same check on
+every such VM it would remove, the VM of the Kit's current version and any VM
+an earlier version left (after a Kit update, switch or uninstall), keeps each
+one it cannot verify, and reports it as cleanup uncertain. So no quarantine is
+permanent: it ends on its own once nothing runs, or with `marsh stop --force`.
+`marsh workers reset all` skips such a VM.
 
 For a `marsh kit install NAME` that failed, use the name it was given:
 `marsh workers reset NAME` removes the VM its create left. That works after a

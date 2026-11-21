@@ -49,3 +49,4 @@ Workspace_restart_pass.cfg 10000
 KitInstall_eph_pass.cfg 410000
 KitInstall_bg_pass.cfg 170000
 KitInstall_run_pass.cfg 190000
+KitInstall_lost_pass.cfg 65000

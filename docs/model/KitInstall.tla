@@ -47,7 +47,10 @@
 (* background pass also creates (a Kit update), and a plain stop or reset *)
 (* cancels that create and waits for the pass (bgCancelForgets). Round 3: *)
 (* a job running on a VM a sibling's uncertain cleanup quarantined: no     *)
-(* claim may retire it (releaseRunning).                                   *)
+(* claim may retire it (releaseRunning). Round 4: a job whose execution   *)
+(* is unknown (a restart lost it, or its executor could not read it) may  *)
+(* still run: only a verification that nothing runs on the VM, or the     *)
+(* forced stop's explicit override, retires it (releaseUnknown).           *)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS NN,            \* number of VM names (1..NN)
@@ -78,7 +81,7 @@ Bugs == {"none", "lateLandingLost", "oldAttemptErasesNew", "recoveryKeepsRecord"
          "forgetFailedIntent", "restartLosesUncertainty", "recordsInMemory",
          "forceStopForgetsIntents", "resetNoop", "resetNoLock", "noReplan",
          "switchKeepsRecord", "narrowResetAll", "staleAbsence", "ephStaleName", "bgUnadmitted",
-         "bgCancelForgets", "releaseRunning",
+         "bgCancelForgets", "releaseRunning", "releaseUnknown",
          "lockOnly", "revalidateOnly"}    \* the last two are positive: one safeguard each
 ASSUME Bug \in Bugs /\ InstallKits \subseteq Kits
 ASSUME Actors \subseteq {"job", "sw", "rcv", "gc", "td", "stop", "restart", "eph", "bg", "run"}
@@ -116,6 +119,8 @@ EphStaleName   == Bug = "ephStaleName"                               \* session 
                                                                     \* before the Kit lock (`ephemeral_kits`)
 BgUnadmitted   == Bug = "bgUnadmitted"                               \* a background Kit pass is not admitted: it starts
                                                                     \* during a forced stop, which does not drain it
+ReleaseUnknown == Bug = "releaseUnknown"                             \* reset NAME judges by job state: a job whose
+                                                                    \* execution is unknown counts as ended
 ReleaseRunning == Bug = "releaseRunning"                             \* reset NAME's release of a quarantined VM
                                                                     \* ignores a job still running on it
 BgCancelForgets == Bug = "bgCancelForgets"                           \* a background create a plain stop cancelled
@@ -130,7 +135,9 @@ VARIABLES
   unsure,    \* [NameIds -> BOOLEAN] in memory: a create under it returned with no verdict (ForgetFailed only)
   quar,      \* quarantined names (in memory)
   running,   \* names a job is running on (the store's records; a container lives there)
-  runBad,    \* ghost: a VM was removed while a job ran on it
+  lost,      \* names a job whose execution is unknown is recorded on (store: `ExecutionOutcome::Unknown`)
+  alive,     \* ghost: names where such a job's container still runs (a subset of lost)
+  runBad,    \* ghost: a VM was removed while a job ran on it (the forced stop's override aside)
   rec,       \* [Att -> [st : "none"|"running"|"settled"|"ended", vm : 0..NN]] install records (persisted)
   reg,       \* [Cmds -> Kits \cup {None}] registered commands
   owner,     \* [Kits -> Procs \cup {None}] Kit lock holder
@@ -149,11 +156,11 @@ VARIABLES
   ephLeft,   \* ghost: a closed session left a VM of its key listed
   tdBad      \* ghost: a teardown ran while a process held a Kit lock
 
-vars == <<st, kit, stock, inflight, mk, unsure, quar, rec, running, runBad, reg, owner, pc, iAtt, iK, iN,
+vars == <<st, kit, stock, inflight, mk, unsure, quar, rec, running, lost, alive, runBad, reg, owner, pc, iAtt, iK, iN,
           jK, jN, jRuns, rMode, rL, rT, rHad, rRuns, rSeen, sFrom, sTo, sL, sRuns, tdRuns,
           stopping, stops, restarts, lates, bad, rstBad, eN, eState, eRuns, bN, bKind, bRuns,
           bgCancel, ephLeft, tdBad>>
-world == <<st, kit, stock, inflight, mk, unsure, quar, rec, bad, running, runBad>>
+world == <<st, kit, stock, inflight, mk, unsure, quar, rec, bad, running, lost, alive, runBad>>
 iVars == <<iAtt, iK, iN>>
 jVars == <<jK, jN, jRuns>>
 rVars == <<rMode, rL, rT, rHad, rRuns, rSeen>>
@@ -180,7 +187,7 @@ Init ==
   /\ st = [n \in NameIds |-> "free"] /\ kit = [n \in NameIds |-> None]
   /\ stock = [n \in NameIds |-> FALSE] /\ inflight = [n \in NameIds |-> FALSE]
   /\ mk = [n \in NameIds |-> 0] /\ unsure = [n \in NameIds |-> FALSE]
-  /\ quar = {} /\ rec = [i \in Att |-> NoRec] /\ running = {} /\ runBad = FALSE
+  /\ quar = {} /\ rec = [i \in Att |-> NoRec] /\ running = {} /\ lost = {} /\ alive = {} /\ runBad = FALSE
   /\ reg = [c \in Cmds |-> IF c = C THEN "b" ELSE None]
   /\ owner = [k \in Kits |-> None]
   /\ pc = [p \in Procs |-> "idle"]
@@ -197,10 +204,11 @@ Init ==
 (* The daemon's state as a record, so that one step can compose effects.  *)
 W0 == [st |-> st, kit |-> kit, stock |-> stock, inflight |-> inflight, mk |-> mk,
        unsure |-> unsure, quar |-> quar, rec |-> rec, bad |-> bad,
-       running |-> running, runBad |-> runBad]
+       running |-> running, lost |-> lost, alive |-> alive, runBad |-> runBad]
 SetW(W) == /\ st' = W.st /\ kit' = W.kit /\ stock' = W.stock /\ inflight' = W.inflight
            /\ mk' = W.mk /\ unsure' = W.unsure /\ quar' = W.quar /\ rec' = W.rec
-           /\ bad' = W.bad /\ running' = W.running /\ runBad' = W.runBad
+           /\ bad' = W.bad /\ running' = W.running /\ lost' = W.lost /\ alive' = W.alive
+           /\ runBad' = W.runBad
 
 Min(S) == CHOOSE x \in S : \A y \in S : x <= y
 SortKits(S) == SelectSeq(KitOrder, LAMBDA k : k \in S)
@@ -232,13 +240,15 @@ RemoveW(W, S, states) ==
                     !.st = [n \in NameIds |-> IF n \in S THEN "retired" ELSE W.st[n]],
                     !.quar = W.quar \ S,
                     !.bad = W.bad \/ (\E n \in S : W.st[n] # Live),
-                    !.runBad = W.runBad \/ (S \cap W.running # {})], S, states)
+                    !.runBad = W.runBad \/ (S \cap (W.running \cup W.alive) # {}),
+                    !.lost = W.lost \ S, !.alive = W.alive \ S], S, states)
 
 \* Recovery of a quarantined name: its VM removed if listed under a live
 \* name (one under a retired name is foreign: refused); an absent intent is
 \* kept (its create may still land) with its records; the quarantine ends.
 Recovery(W, n) ==
   IF n \in W.running THEN W              \* a job on it has not finished: it stays
+  ELSE IF n \in W.alive THEN W            \* verify_no_running_containers: a container runs
   ELSE IF W.stock[n] /\ W.st[n] = Live THEN RemoveW(W, {n}, IF KeepOnRecovery THEN {} ELSE Active)
   ELSE IF W.stock[n] THEN W
   ELSE [W EXCEPT !.quar = W.quar \ {n}]
@@ -503,7 +513,11 @@ RstAct ==
          \* Targets a job runs on: NAME refuses, all skips them. The claim's
          \* guard is unconditional (releaseRunning: a quarantined one is
          \* released anyway, as an uncertain cleanup's would be).
-         RunT == IF ReleaseRunning THEN (T \cap running) \ quar ELSE T \cap running
+         \* A job whose execution is unknown: all skips it (the settled claim);
+         \* NAME verifies that nothing runs there (releaseUnknown: it judges
+         \* by job state, and an unknown execution counts as ended).
+         Unk == IF rMode = "all" THEN lost ELSE IF ReleaseUnknown THEN {} ELSE alive
+         RunT == IF ReleaseRunning THEN (T \cap running) \ quar ELSE T \cap (running \cup Unk)
          Rm == {t \in T \ RunT : t \in rSeen /\ stock[t] /\ (st[t] = Live \/ RemoveUnowned)}
          Stale == IF StaleAbsence THEN {t \in T : t \notin rSeen /\ stock[t] /\ st[t] = Live} ELSE {}
          W1s == RemoveW(W0, Rm, {"settled"})
@@ -553,7 +567,7 @@ SwAct ==
            a == AssignW(W1, sTo)
            res == Create(a.w, a.n, 0, o)
            old == LookupW(res.w, sFrom)
-           retire == res.ok /\ reg[H] # sFrom /\ old # 0 /\ res.w.stock[old] /\ old \notin running
+           retire == res.ok /\ reg[H] # sFrom /\ old # 0 /\ res.w.stock[old] /\ old \notin running \cup lost
        IN /\ a.n # 0
           /\ SetW(IF retire THEN RemoveW(res.w, {old}, IF SwitchKeepsRec THEN {} ELSE Active) ELSE res.w)
           /\ reg' = IF res.ok THEN [reg EXCEPT ![C] = sTo] ELSE reg
@@ -580,14 +594,14 @@ RecoverBg ==
 Gc ==
   /\ Acts("gc")
   /\ \E n \in NameIds :
-       /\ st[n] = Live /\ stock[n] /\ n \notin quar /\ n \notin running /\ owner[kit[n]] = None
+       /\ st[n] = Live /\ stock[n] /\ n \notin quar /\ n \notin running /\ n \notin lost /\ owner[kit[n]] = None
        /\ SetW(RemoveW(W0, {n}, Active))
   /\ UNCHANGED <<reg, owner, pc, iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 \* Remove every VM listed under a live name; intents stay (a VM that lands
 \* later is adopted and owned).
-TeardownW(W) ==
-  LET W1 == RemoveW(W, {n \in NameIds : W.st[n] = Live /\ W.stock[n]}, Active) IN
+TeardownW(W, Keep) ==
+  LET W1 == RemoveW(W, {n \in NameIds : W.st[n] = Live /\ W.stock[n]} \ Keep, Active) IN
   IF StopForgets THEN EndRecs([W1 EXCEPT !.st = [n \in NameIds |-> IF W1.st[n] = Live THEN "retired" ELSE W1.st[n]]],
                               NameIds, Active)
   ELSE W1
@@ -597,7 +611,7 @@ TeardownW(W) ==
 \* is in flight, an install's included: only at quiescence.
 Teardown ==
   /\ Acts("td") /\ tdRuns < MaxTeardowns /\ Quiescent /\ running = {}
-  /\ SetW(TeardownW(W0))
+  /\ SetW(TeardownW(W0, alive))   \* a VM a container may run on is left (verified)
   /\ tdRuns' = tdRuns + 1
   /\ tdBad' = (tdBad \/ \E k \in Kits : owner[k] # None)
   /\ bgCancel' = FALSE
@@ -610,6 +624,9 @@ Teardown ==
 \* settled; submitted stock creates go on.
 RestartVars(W) ==
   /\ SetW([W EXCEPT !.quar = {}, !.unsure = [n \in NameIds |-> FALSE],
+                    \* A running job is lost: its execution is unknown, and its
+                    \* container may run on.
+                    !.running = {}, !.lost = W.lost \cup W.running, !.alive = W.alive \cup W.running,
                     !.rec = [i \in Att |-> IF W.rec[i].st = "running"
                                            THEN [W.rec[i] EXCEPT !.st = IF RecordsVolatile THEN "ended" ELSE "settled"]
                                            ELSE IF RecordsVolatile /\ W.rec[i].st = "settled"
@@ -639,7 +656,9 @@ StopBegin ==
 StopEnd ==
   /\ stopping
   /\ IF BgUnadmitted THEN \A p \in Procs \ {"bg"} : pc[p] = "idle" ELSE Quiescent
-  /\ RestartVars(TeardownW(W0))
+  \* The explicit override: a VM an unknown job may still run on is
+  \* removed too (its container ends with it).
+  /\ RestartVars(TeardownW([W0 EXCEPT !.alive = {}], {}))
   /\ stopping' = FALSE
   /\ tdBad' = (tdBad \/ \E k \in Kits : owner[k] # None)
   /\ bgCancel' = FALSE
@@ -749,20 +768,37 @@ TdCancelBg ==
 RunStart ==
   /\ Acts("run")
   /\ \E n \in NameIds :
-       /\ st[n] = Live /\ stock[n] /\ n \notin quar /\ n \notin running
-       /\ kit[n] \in {"a", "b"} /\ owner[kit[n]] = None
+       /\ st[n] = Live /\ stock[n] /\ n \notin quar /\ n \notin running /\ n \notin lost
+       /\ kit[n] \in {"a", "b"} /\ owner[kit[n]] = None /\ ~stopping
        /\ running' = running \cup {n}
-  /\ UNCHANGED <<st, kit, stock, inflight, mk, unsure, quar, rec, bad, runBad, reg, owner, pc,
+  /\ UNCHANGED <<st, kit, stock, inflight, mk, unsure, quar, rec, bad, lost, alive, runBad, reg, owner, pc,
                  iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 RunEnd ==
   /\ \E n \in running : running' = running \ {n}
-  /\ UNCHANGED <<st, kit, stock, inflight, mk, unsure, quar, rec, bad, runBad, reg, owner, pc,
+  /\ UNCHANGED <<st, kit, stock, inflight, mk, unsure, quar, rec, bad, lost, alive, runBad, reg, owner, pc,
+                 iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
+
+\* The executor returns without reading the job's status (execution
+\* unknown, cleanup uncertain): its container may or may not run on; the VM
+\* is quarantined.
+RunLost ==
+  /\ \E n \in running, on \in BOOLEAN :
+       /\ running' = running \ {n} /\ lost' = lost \cup {n}
+       /\ alive' = IF on THEN alive \cup {n} ELSE alive
+       /\ quar' = quar \cup {n}
+  /\ UNCHANGED <<st, kit, stock, inflight, mk, unsure, rec, bad, runBad, reg, owner, pc,
+                 iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
+
+\* Environment: a lost job's container ends, unobserved.
+LostEnds ==
+  /\ \E n \in alive : alive' = alive \ {n}
+  /\ UNCHANGED <<st, kit, stock, inflight, mk, unsure, quar, rec, bad, running, lost, runBad, reg, owner, pc,
                  iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 SiblingQuarantine ==
-  /\ \E n \in running \ quar : quar' = quar \cup {n}
-  /\ UNCHANGED <<st, kit, stock, inflight, mk, unsure, rec, bad, running, runBad, reg, owner, pc,
+  /\ \E n \in (running \cup lost) \ quar : quar' = quar \cup {n}
+  /\ UNCHANGED <<st, kit, stock, inflight, mk, unsure, rec, bad, running, lost, alive, runBad, reg, owner, pc,
                  iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 \* Environment: a create that did not report lands (stock: A2, it was absent).
@@ -771,14 +807,14 @@ Land(n) ==
   /\ stock' = [stock EXCEPT ![n] = TRUE]
   /\ inflight' = [inflight EXCEPT ![n] = FALSE]
   /\ unsure' = [unsure EXCEPT ![n] = FALSE]
-  /\ UNCHANGED <<st, kit, mk, quar, rec, bad, running, runBad, reg, owner, pc, iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
+  /\ UNCHANGED <<st, kit, mk, quar, rec, bad, running, lost, alive, runBad, reg, owner, pc, iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 Next ==
   \/ InstDecideEarly \/ InstPrep \/ InstSubmit \/ InstReply \/ InstPublish \/ InstAbort
   \/ JobDecideEarly \/ JobRun \/ JobAbort
   \/ RstStart \/ RstLock \/ RstReplan \/ RstObserve \/ RstAct
   \/ EphOpen \/ EphRun \/ EphClose \/ BgStart \/ BgStartUpd \/ BgEnd \/ TdCancelBg
-  \/ RunStart \/ RunEnd \/ SiblingQuarantine
+  \/ RunStart \/ RunEnd \/ RunLost \/ LostEnds \/ SiblingQuarantine
   \/ SwStart \/ SwLock \/ SwAct
   \/ RecoverBg \/ Gc \/ Teardown \/ Restart \/ StopBegin \/ StopEnd \/ StopGiveUp
   \/ \E n \in NameIds : Land(n)
@@ -830,6 +866,8 @@ SessionLeavesNoVm == ~ephLeft
 \* (g) A teardown runs alone: no process holds a Kit lock.
 TeardownAlone == ~tdBad
 
-\* (h) No VM is removed while a job runs on it, quarantined or not.
+\* (h) No VM is removed while a job runs on it, quarantined or not, nor
+\* while the container of a job whose execution is unknown still runs there
+\* (the forced stop is the explicit override).
 NoRunningRemoval == ~runBad
 =============================================================================

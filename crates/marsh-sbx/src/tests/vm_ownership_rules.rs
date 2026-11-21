@@ -182,7 +182,7 @@ fn create_intent_persists_before_create_and_restart_adopts_present_and_keeps_abs
     assert_ne!(created, never);
     assert_eq!(first.vm_name(VmPurpose::Kit, "kit-a").unwrap(), created);
     // The intent is durable before any stock call.
-    assert!(model.calls().is_empty());
+    assert_eq!(model.calls().len(), 0);
     assert!(fs::read_to_string(&map).unwrap().contains(&created));
     // Crash after `sbx create` succeeded but before the UUID was recorded.
     let uuid = model.seed_vm(&created);
@@ -551,10 +551,11 @@ fn no_create_is_submitted_while_a_restored_intent_is_not_durable() {
         0,
         "a create ran on an undurable intent"
     );
-    // The failed attempt quarantined the name; the sync recovered, still no create.
+    // The failed attempt quarantined the name, or left it unrestored (no
+    // entry: nothing is created under it); the sync recovered, still no create.
     assert!(matches!(
         adapter.ensure_kit_vm(&kit.spec),
-        Err(SbxError::QuarantinedVm(_))
+        Err(SbxError::QuarantinedVm(_) | SbxError::StaleVmName(_))
     ));
     assert_eq!(model.count("create"), 0);
 }
@@ -605,7 +606,7 @@ fn ownership_mirror_holds_every_intent_before_create_and_tracks_removal() {
     assert!(fs::read_to_string(&mirror).unwrap().contains(&kept));
     // A new intent reaches the mirror before any stock call.
     let name = adapter.vm_name(VmPurpose::Kit, "kit-b").unwrap();
-    assert!(model.calls().is_empty());
+    assert_eq!(model.calls().len(), 0);
     assert!(fs::read_to_string(&mirror).unwrap().contains(&name));
     let uuid = model.seed_vm(&name);
     adapter.adopt_created(&name).unwrap();
@@ -902,4 +903,274 @@ fn a_map_without_dev_grants_is_not_rewritten_at_load() {
     );
     assert_eq!(loaded.uuid("marsh-s-shell001").as_deref(), Some(FOREIGN));
     assert!(!loaded.is_retired("marsh-k-intent01"));
+}
+
+#[test]
+fn review_v2b_interrupted_inline_record_migration_preserves_the_cleanup_handle() {
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    write_map(
+        &map,
+        &serde_json::json!({
+            "version": 3,
+            "vms": {"marsh-k-legacy01": {"purpose": "kit", "key": "kit-a", "uuid": FOREIGN,
+                "installs": [{"attempt": "a9", "command": "hf"}]}}
+        }),
+    );
+    // Interrupt after the first rename, before the side file is published.
+    // This uses the real writer, not a manually constructed split state.
+    let fail = crate::vm_ownership::FailDirectorySync::in_dir(control.path());
+    assert!(VmOwnership::persisted(map.clone()).is_err());
+    drop(fail);
+    let loaded = VmOwnership::persisted(map.clone()).unwrap();
+    assert_eq!(loaded.uuid("marsh-k-legacy01").as_deref(), Some(FOREIGN));
+    assert_eq!(
+        loaded.install_records(),
+        [(
+            "marsh-k-legacy01".into(),
+            "kit-a".into(),
+            install("a9", "hf")
+        )],
+        "the first rename stripped the only durable copy of the failed install's cleanup selector: {}",
+        fs::read_to_string(map).unwrap()
+    );
+}
+
+fn install(attempt: &str, command: &str) -> crate::InstallRecord {
+    crate::InstallRecord {
+        attempt: attempt.into(),
+        command: command.into(),
+    }
+}
+
+/// `KitInstall.tla` rule 6 (`recordsInMemory`): install records are persisted
+/// next to the map, so a restarted daemon still reaches a failed install's VM
+/// by the install's name. The map itself stays schema 2, which an older marsh
+/// reads (Claude's review: a schema 3 map stopped an older marshd); a record
+/// whose name the map no longer has is dropped when they are read (an older
+/// marsh retiring the VM takes the record along); a schema 3 map an earlier
+/// build wrote, with records inline, still loads, and is rewritten as 2.
+#[test]
+fn install_records_are_persisted_next_to_a_schema_2_map_and_survive_a_restart() {
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let side = control.path().join("vm-ownership-installs.json");
+    let ownership = VmOwnership::persisted(map.clone()).unwrap();
+    let name = ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
+    let version = || {
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&map).unwrap()).unwrap()["version"]
+            .as_u64()
+            .unwrap()
+    };
+    ownership.begin_install(&name, install("a1", "hf")).unwrap();
+    ownership.begin_install(&name, install("a2", "hf")).unwrap();
+    assert_eq!(version(), 2);
+    assert!(!fs::read_to_string(&map).unwrap().contains("installs"));
+    assert!(fs::read_to_string(&side).unwrap().contains("a2"));
+
+    let restarted = VmOwnership::persisted(map.clone()).unwrap();
+    assert_eq!(
+        restarted.install_records(),
+        [
+            (name.clone(), "kit-a".into(), install("a1", "hf")),
+            (name.clone(), "kit-a".into(), install("a2", "hf")),
+        ]
+    );
+    // Ended by attempt id only: a2 stays.
+    assert!(restarted.end_install("a1").unwrap());
+    assert!(!restarted.end_install("a1").unwrap());
+    assert_eq!(
+        VmOwnership::persisted(map.clone())
+            .unwrap()
+            .install_records(),
+        [(name.clone(), "kit-a".into(), install("a2", "hf"))]
+    );
+
+    // An older marsh forgets the name (it rewrites only the map): the record
+    // goes with it.
+    let mut file: serde_json::Value = serde_json::from_slice(&fs::read(&map).unwrap()).unwrap();
+    file["vms"].as_object_mut().unwrap().remove(&name);
+    fs::write(&map, serde_json::to_vec(&file).unwrap()).unwrap();
+    assert_eq!(
+        VmOwnership::persisted(map.clone())
+            .unwrap()
+            .install_records(),
+        []
+    );
+
+    // A schema 3 map with inline records (an earlier build) loads and is
+    // rewritten as schema 2, its records moved next to it.
+    let legacy = scratch();
+    let old = legacy.path().join("vm-ownership.json");
+    write_map(
+        &old,
+        &serde_json::json!({
+            "version": 3,
+            "vms": {"marsh-k-legacy01": {"purpose": "kit", "key": "kit-a",
+                     "installs": [{"attempt": "a9", "command": "hf"}]}}
+        }),
+    );
+    let loaded = VmOwnership::persisted(old.clone()).unwrap();
+    assert_eq!(
+        loaded.install_records(),
+        [(
+            "marsh-k-legacy01".into(),
+            "kit-a".into(),
+            install("a9", "hf")
+        )]
+    );
+    let rewritten: serde_json::Value = serde_json::from_slice(&fs::read(&old).unwrap()).unwrap();
+    assert_eq!(rewritten["version"], 2);
+}
+
+/// `KitInstall.tla` rules 5 and 6: forgetting a removed VM's name ends the records
+/// naming it in the same write; an intent (a create that may still land) is
+/// never forgotten, and neither are its records. A record is only written
+/// under a live entry.
+#[test]
+fn install_records_end_with_their_retired_name_and_stay_with_an_intent() {
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let ownership = VmOwnership::persisted(map.clone()).unwrap();
+    let intent = ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
+    let recorded = ownership.assign(VmPurpose::Kit, "kit-b").unwrap();
+    ownership
+        .begin_install(&intent, install("a1", "hf"))
+        .unwrap();
+    ownership
+        .begin_install(&recorded, install("a2", "hf"))
+        .unwrap();
+    ownership.record(&recorded, FOREIGN).unwrap();
+
+    ownership.forget(&intent).unwrap();
+    ownership.forget(&recorded).unwrap();
+    let restarted = VmOwnership::persisted(map).unwrap();
+    assert_eq!(
+        restarted.install_records(),
+        [(intent.clone(), "kit-a".into(), install("a1", "hf"))]
+    );
+    assert!(restarted.is_live(&intent));
+    assert!(matches!(
+        ownership.begin_install(&recorded, install("a3", "hf")),
+        Err(SbxError::StaleVmName(_))
+    ));
+}
+
+#[test]
+fn review_install_record_failed_writes_roll_back_before_publication() {
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let ownership = VmOwnership::persisted(map.clone()).unwrap();
+    let name = ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
+    let before = fs::read(&map).unwrap();
+    fs::set_permissions(control.path(), fs::Permissions::from_mode(0o500)).unwrap();
+    let begun = ownership.begin_install(&name, install("a1", "hf"));
+    fs::set_permissions(control.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(begun.is_err());
+    assert_eq!(ownership.install_records().len(), 0);
+    assert_eq!(fs::read(&map).unwrap(), before);
+    ownership.begin_install(&name, install("a1", "hf")).unwrap();
+    let before = fs::read(&map).unwrap();
+    fs::set_permissions(control.path(), fs::Permissions::from_mode(0o500)).unwrap();
+    let ended = ownership.end_install("a1");
+    fs::set_permissions(control.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(ended.is_err());
+    assert_eq!(ownership.install_records().len(), 1);
+    assert_eq!(fs::read(&map).unwrap(), before);
+}
+
+#[test]
+fn review_install_record_directory_sync_failure_fences_create_and_keeps_disk_state() {
+    use crate::vm_ownership::FailDirectorySync;
+    let control = scratch();
+    let map = control.path().join("vm-ownership.json");
+    let ownership = VmOwnership::persisted(map.clone()).unwrap();
+    let name = ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
+    let fail = FailDirectorySync::in_dir(control.path());
+    assert!(ownership.begin_install(&name, install("a1", "hf")).is_err());
+    assert_eq!(
+        ownership.install_records(),
+        VmOwnership::persisted(map.clone())
+            .unwrap()
+            .install_records()
+    );
+    assert!(ownership.confirm_durable().is_err());
+    drop(fail);
+    ownership.confirm_durable().unwrap();
+    let fail = FailDirectorySync::in_dir(control.path());
+    assert!(ownership.end_install("a1").is_err());
+    assert_eq!(ownership.install_records().len(), 0);
+    assert_eq!(
+        VmOwnership::persisted(map).unwrap().install_records().len(),
+        0
+    );
+    assert!(ownership.confirm_durable().is_err());
+    drop(fail);
+    ownership.confirm_durable().unwrap();
+}
+
+/// `KitInstall.tla` rule 4 (create-time check): a create is never submitted under
+/// a name that is not a live entry of the map: not under one forgotten after
+/// it was chosen, and (persisted map) not under one the map never gave out.
+#[test]
+fn no_create_is_submitted_under_a_name_that_is_not_a_live_entry() {
+    let control = scratch();
+    let model = StockModel::new();
+    let adapter = StockSbx::new("sbx", Arc::clone(&model) as Arc<dyn CommandRunner>)
+        .with_vm_ownership(control.path().join("vm-ownership.json"))
+        .unwrap();
+    let mut kit = KitFixture::published("marsh-k-unknown1");
+    assert!(matches!(
+        adapter.ensure_kit_vm(&kit.spec),
+        Err(SbxError::StaleVmName(name)) if name == "marsh-k-unknown1"
+    ));
+    kit.spec.name = adapter.vm_name(VmPurpose::Kit, "kit-a").unwrap();
+    adapter.ownership.record(&kit.spec.name, FOREIGN).unwrap();
+    adapter.ownership.forget(&kit.spec.name).unwrap();
+    assert!(matches!(
+        adapter.ensure_kit_vm(&kit.spec),
+        Err(SbxError::StaleVmName(_))
+    ));
+    assert!(
+        adapter.quarantined_vms().is_empty(),
+        "nothing was submitted"
+    );
+
+    // The in-memory map refuses the name it forgot as well.
+    let memory = model.adapter();
+    let mut kit = KitFixture::published("marsh-k-memory01");
+    kit.spec.name = memory.vm_name(VmPurpose::Kit, "kit-a").unwrap();
+    memory.ownership.record(&kit.spec.name, FOREIGN).unwrap();
+    memory.ownership.forget(&kit.spec.name).unwrap();
+    assert!(matches!(
+        memory.ensure_kit_vm(&kit.spec),
+        Err(SbxError::StaleVmName(_))
+    ));
+    assert_eq!(model.count("create"), 0);
+}
+
+/// `KitInstall.tla` `staleAbsence`: a listing that found a name empty proves
+/// gone only the VM the map recorded before it was taken. An intent, or a
+/// UUID adopted since (by a newer listing of a VM landing late), is kept.
+#[test]
+fn an_absent_listing_forgets_only_the_vm_recorded_before_it() {
+    let ownership = VmOwnership::in_memory();
+    let late = ownership.assign(VmPurpose::Kit, "kit-a").unwrap();
+    // Observed as an intent; a newer listing adopted its VM meanwhile.
+    ownership.record(&late, FOREIGN).unwrap();
+    assert!(!ownership.forget_absent(&late, None).unwrap());
+    assert_eq!(ownership.uuid(&late).as_deref(), Some(FOREIGN));
+    // Another UUID than the one observed: kept as well.
+    assert!(
+        !ownership
+            .forget_absent(&late, Some("22222222-2222-4222-8222-222222222222"))
+            .unwrap()
+    );
+    // The VM recorded before the listing, absent from it: gone.
+    assert!(ownership.forget_absent(&late, Some(FOREIGN)).unwrap());
+    assert!(!ownership.is_live(&late));
+    // An intent is never forgotten by an absence.
+    let intent = ownership.assign(VmPurpose::Kit, "kit-b").unwrap();
+    assert!(!ownership.forget_absent(&intent, None).unwrap());
+    assert!(ownership.is_live(&intent));
 }

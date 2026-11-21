@@ -5,8 +5,8 @@ the cloud ownership extension). A twelfth, `Placement`,
 specifies the cloud placement extension; only its single-crossing,
 session-origin part is implemented (see
 [coverage and gaps](#proposed-placement-model)). A thirteenth, `KitInstall`, is
-a design model of reaching the VM of a failed `marsh kit install` (issue #194):
-it fixes the lock and record protocol before the code follows it (see
+the model of reaching the VM of a failed `marsh kit install` (issue #194): it
+fixed the lock and record protocol before the code followed it (see
 [Kit install design model](#kit-install-design-model)). TLC checks their bounded state
 spaces; a pass does not prove that the Rust code refines these specifications.
 The code-location table below records the implementation mapping and known gaps.
@@ -190,7 +190,7 @@ review obligation when the code they cite changes.
   the idle claim), `admitStopping` (admit a job to a VM claimed for a stop), `cancelOnError`
   (reopen admission when the stop command errs) and `loseRetired` (the retired mark does not
   survive a restart, so the VM serves again), all StopSparesRunning.
-- `KitInstall.tla` (design model): the VM of a `marsh kit install` that failed, fails fast,
+- `KitInstall.tla`: the VM of a `marsh kit install` that failed, fails fast,
   times out or lands late (also after a restart or a `marsh stop --force` that cancelled it),
   the per-Kit lifecycle locks, the per-attempt install records and the ownership map that keep
   it reachable by `marsh workers reset NAME|all` while nothing is removed that the map does not
@@ -241,7 +241,8 @@ Invariants: `NoForeignEffect`, `OwnedAreOurs`, `NoLeak` (Ownership); `CapacityBo
 `CancelPropagates`, `RevokedAtRestart`, `RestartUncertain`, `NoReplay`, `EntryOnce`,
 `NoEntryRecursion`, `SpawnSetAttenuates`, `KitVMBound`, `NoHomeKitHome`, `AdmittedUnderLimits` (Process);
 `NoForeignRemoval`, `EveryDaemonVMOwned`, `EveryDaemonVMReachable`, `EveryDaemonVMResettable`,
-`NoOrphanRecord`, `NoDeadlock`, `NoStaleRefusal`, `ResetRemovesTargets` (KitInstall, design). Liveness:
+`NoOrphanRecord`, `NoDeadlock`, `NoStaleRefusal`, `ResetRemovesTargets`, `SessionLeavesNoVm`,
+`TeardownAlone`, `NoRunningRemoval` (KitInstall). Liveness:
 `AttemptsTerminate` and `QuarantineHeals` (Worker; weak fairness, no operator action), `DrainEnds` (KitSwitch; weak fairness on job ends and the drain pass), and `EventuallySettled` (Workspace; weak fairness on
 daemon steps and process progress, checked in the smaller `Workspace_live_pass.cfg`).
 
@@ -460,9 +461,11 @@ the daemon cannot prove is its own. It also checks the owner's requirement that
 Three review rounds of that PR each found a new interleaving in the Kit lock, install record
 and ownership map logic. Each one is a negative control here.
 
-**This is a design model.** Main does not implement the protocol. The round-3 work in progress
-implements part of it. The code table below maps each action to main and marks what exists
-only in the design. A pass is evidence about the protocol, not about the Rust code.
+**It was written as a design model, and the code now follows it** (the change that fixed
+#194). The code table below maps each action to the code; `marsh-backend/src/kit_install.rs`
+has one Rust test per negative control, each reproducing the race with a scripted stock SBX
+and failing when its rule is removed. A pass is evidence about the protocol, not about the
+Rust code.
 
 ### State and actors
 
@@ -565,6 +568,18 @@ waits for a lock it holds itself.
      is released.
    - Every request drains. Then teardown removes every listed VM under a live name, keeps the
      intents and records, and the daemon ends.
+   - A stop whose requests do not drain within its bound gives up (`StopGiveUp`): admission
+     opens again, the requests go on, and nothing is torn down.
+   - The background Kit pass is admitted like a request: none starts once the stop began, and
+     the drain waits for the one running (`bgUnadmitted`).
+   - A plain stop or reset that finds only the background pass in flight cancels that pass's
+     creates (a Kit update's create), and waits for it; the cancelled create keeps its intent
+     (`bgCancelForgets`), and the teardown still runs alone.
+9. **Ephemeral-home sessions.** A session's Kit VM is keyed by the session. Closing it removes,
+   under the session's Kit locks, every VM its keys own, not only the name it noted before a
+   preparation chose (`ephStaleName`).
+10. **A reset's listing is a step of its own.** A name it found empty is kept, intent and
+    records, even if a VM landed there since and another listing adopted it (`staleAbsence`).
    - A VM that lands after the stop is adopted by the next daemon. Persisted records let
      `reset NAME` reach it, and `reset all` and `marsh reset`/`stop` reach it too. GC keeps a
      running VM.
@@ -603,6 +618,16 @@ waits for a lock it holds itself.
 | `NoDeadlock` | `switchAbba` | A switch holds the old Kit lock and then takes the new one, while a key-ordered reset holds the new one and waits for the old |
 | `NoForeignRemoval` | `removeUnowned` | The tempting fix for the foreign VM: reset removes a recorded VM by name although the map does not own it |
 | `ResetRemovesTargets` | `resetNoop` | A reset that is not refused removes nothing |
+| `EveryDaemonVMOwned` | `staleAbsence` | Code review round 1 (GPT): a reset's listing finds a timed-out create's name empty; the VM lands and another listing (GC) adopts it before the reset acts; the reset forgets the name as gone, and the VM is nobody's |
+| `SessionLeavesNoVm` | `ephStaleName` | Code review round 1 (both): an ephemeral session notes its Kit VM's name before the lock; a preparation recovers that VM and creates under a new name; closing the session removes only the noted name |
+| `EveryDaemonVMOwned` | `bgCancelForgets` | Code review round 2: a background Kit update's create that a plain stop cancelled forgets its intent; the VM lands foreign |
+| `NoRunningRemoval` | `preStartedLost` | Code review round 6 (GPT): a job's VM assignment was in memory until Started was journaled, and the worker started its container without the daemon having received Started; a daemon crash in between reopened the job with no VM, so no per-VM guard saw it |
+| `NoRunningRemoval` | `noStartedAck` | Code review round 6 (GPT, Claude): with the assignment journaled but no acknowledgement, a lost worker's create still in flight at the check may land and start unseen |
+| `NoRunningRemoval` | `sweepUnchecked` | Code review round 5 (Claude, GPT): a plain teardown checked only the registered Kits' current VMs; its stale-generation sweep removed the VM a Kit switch, update or uninstall left draining, under a lost job's container |
+| `NoRunningRemoval` | `snapshotRunning` | Code review round 5 (GPT): the check listed running containers only; a lost job's container, created before the worker reported Started, may start right after it |
+| `NoRunningRemoval` | `releaseUnknown` | Code review round 4 (GPT, Claude): a daemon restart turns a running job into an `Unknown` receipt with no exit observed (its container still runs), as does an executor that cannot read its job's status; `reset NAME` judged by job state, took it for a job that ended with uncertain cleanup, and removed its VM |
+| `NoRunningRemoval` | `releaseRunning` | Code review round 3 (GPT): a sibling job's uncertain cleanup quarantines a VM while another job runs on it; `reset NAME`'s release of a quarantined VM removes it under the running job |
+| `TeardownAlone` | `bgUnadmitted` | Code review round 1 (GPT): the background Kit pass is not admitted, so `marsh stop --force`'s drain does not wait for it and the teardown overlaps its Kit work |
 
 **What each invariant says.**
 - `EveryDaemonVMOwned` holds in every state: every listed VM is under a live name. The other
@@ -616,8 +641,13 @@ waits for a lock it holds itself.
   - A removal whose verification listing fails keeps the entry, and so the record.
 - `NoStaleRefusal` is safety, not progress: neither reset would be refused by a stale state
   (a foreign target, "recorded VM changed").
-- `ResetRemovesTargets`: a reset that is not refused leaves none of its targets listed under a
-  live name. Together with `EveryDaemonVMReachable`, a quiescent `reset NAME` removes every VM
+- `ResetRemovesTargets`: a reset that is not refused leaves none of the targets its listing
+  found listed under a live name (a VM landing after that listing is kept, with its intent).
+- `SessionLeavesNoVm`: closing an ephemeral-home session leaves no VM of its key listed.
+- `TeardownAlone`: a teardown runs while no process holds a Kit lock.
+- `NoRunningRemoval`: no VM is removed while a job runs on it, quarantined or not, nor while
+  the container of a job whose execution is unknown still runs there (`marsh stop --force`
+  is the explicit override). Together with `EveryDaemonVMReachable`, a quiescent `reset NAME` removes every VM
   its install created.
 - **No liveness is claimed.** Not for a hung create, not for a cancellation, and not for a
   drain.
@@ -635,15 +665,37 @@ waits for a lock it holds itself.
 
 Positive configs:
 - `KitInstall.cfg`: one Kit to install from, 2 attempts, 1 job, 2 resets, 1 switch, 1
-  teardown, 1 late create, no stop or restart. About 1.16 M states.
+  teardown, 1 late create, no stop or restart. About 2.36 M states (the reset's listing is a
+  step of its own).
 - `KitInstall_restart_pass.cfg`: `marsh stop --force`, 2 restarts and 2 late creates, with no
-  switch. About 1.41 M states.
+  switch. About 3.55 M states.
+- `KitInstall_eph_pass.cfg`: an ephemeral-home session (key "e") with two preparations,
+  recovery, GC and a teardown. About 0.82 M states.
+- `KitInstall_run_pass.cfg`: running jobs on Kit VMs, a sibling's quarantine of a VM a job
+  runs on, a job preparation, recovery, GC and a teardown; no switch. About 0.63 M states.
+- `KitInstall_lostsw_pass.cfg`: running jobs a restart loses, a job preparation, a Kit switch,
+  a reset and a plain teardown. About 2.34 M states.
+- `KitInstall_assignVolatileOnly_pass.cfg`: `lost_pass` with the job's VM assignment in memory
+  only (`assignVolatile`): with the acknowledgement it is still safe, so the journaled
+  assignment is defense in depth. About 0.16 M states.
+- `KitInstall_lost_pass.cfg`: running jobs that a restart or their executor loses (execution
+  unknown, the container perhaps still running), recovery, GC, a plain teardown and
+  `marsh stop --force`. About 0.15 M states.
+- `KitInstall_runsw_pass.cfg`: running and lost jobs, a job preparation and a Kit switch (the
+  switch's guard is load-bearing here). About 2.46 M states.
+- `KitInstall_bg_pass.cfg`: the two-step background pass, recovering or creating (a Kit
+  update), with a forced stop, a plain teardown that cancels its create, and a restart; one
+  install attempt, no job or switch. About 0.34 M states.
 - `KitInstall_lockOnly_pass.cfg` and `KitInstall_revalidateOnly_pass.cfg`, as above.
-- `KitInstall_wide_pass.cfg` (slow): every actor, stop and restart. 8.59 M states, about 5 min on two workers.
+- `KitInstall_wide_pass.cfg` (slow): every actor of round 0, stop and restart (not the
+  ephemeral session or the two-step background pass, which have their own configs). Not
+  re-measured since the reset's listing became a step of its own.
 
 Not modeled:
 - A user's own `sbx rm`.
 - Running jobs and drain (KitSwitch's), `unregister`, `move_to_shipped`, and `workers stop`.
+  So is `reset all` skipping a target it must not remove (a job on it, an unfinished job, a
+  foreign VM): it reports the target and goes on with the others.
 - Two different failed install commands.
 - Lock waits that time out (try-locks).
 - Settle windows.
@@ -651,17 +703,22 @@ Not modeled:
   landed", which rule 5 already does.
 - The sbx-internal listing races inside one teardown pass.
 
-| KitInstall action | Code location on main (design-only parts marked) |
+| KitInstall action | Code location |
 |---|---|
-| InstPrep / InstSubmit / InstReply / InstPublish | `marsh-backend/src/lib.rs` `install_command`: on main `kit_spec_for_workload` chooses the name before any lock, and `prepare_one_with_progress` recovers before taking the Kit lock (`nameBeforeRecovery`). There is no install record. **Design-only**: the persisted record, recovery and then the name under the lock, the create-time check, and publication under the lock. The create is marsh-sbx `lib.rs` `ensure_kit_vm_authorized` (it quarantines every submitted failure) -> `create_published_vm_with_grant` (`create_may_land`) -> `adopt_created` (`VmOwnership::record` takes a retired name back); `vm_ownership.rs` `assign` persists the intent, and `VmOwnership::forget` never drops one |
-| JobRun | `marsh-backend/src/lib.rs` `prepare_one_unnoted`: on main `recover_quarantined_vm` runs before the Kit lock, on the name the caller chose (`jobPathStaleName`); `worker_recovery.rs` `recover_before_prepare` |
-| RstStart / RstLock / RstReplan / RstAct | `marsh-backend/src/lib.rs` `reset_workers`: on main `kit_spec` is called per command before the locks (it assigns a name), there is one lock per spec in VM-name order, then `retire_claimed`; for `all`, `worker_recovery.rs` `retire_unnamed_quarantined`. marsh-sbx `lib.rs` `retire_kit_vm_before` classifies afresh -> `remove_owned_vm`. **Design-only**: install records as targets, the running-record skip, the plan under the locks, the re-plan, and one lock per Kit key |
-| SwStart / SwLock / SwAct | `marsh-backend/src/lib.rs` `apply_upgrade`: on main it holds the old Kit's `kit_lock` while `prepare_one_with_progress` takes the new Kit's (`switchAbba`); `unregister` and `claim_old_vm` retire the old VM; `move_to_shipped` prepares before it takes the old lock |
-| RecoverBg | `marsh-backend/src/worker_recovery.rs` `recover_quarantined_vm`: on main the Kit lock is taken only when a command names the VM (`recoveryNoLock`); `retire_recovered`; marsh-sbx `lib.rs` `retire_quarantined_vm` |
-| Gc | `marsh-backend/src/vm_gc.rs` `remove_recorded`: on main the Kit lock is taken only for a current Kit's VM, and stopped VMs only |
-| Teardown | `marsh-backend/src/lib.rs` `teardown_scope` and `reset_stale_scope_components` -> marsh-sbx `lib.rs` `reset_stale_scope_kit_vms_before`; it is admitted by marsh-daemon `lib.rs` `begin_lifecycle_request`, which refuses while any request, an install included, is in flight |
-| StopBegin / StopEnd (`marsh stop --force`) | **Design-only.** On main marsh-daemon `lib.rs` `handle_scope_lifecycle` runs only after `begin_lifecycle_request` admitted it, so a stop waits for, or is refused by, an install in flight; there is no cancellation of a stock create |
-| Restart | daemon start: marsh-sbx `vm_ownership.rs` `persisted` loads the map and its intents (the retired names are not persisted); the quarantine and the install records of the work in progress are in memory |
+| InstPrep / InstSubmit / InstReply / InstPublish | `marsh-backend/src/lib.rs` `install_command`: the Kit lock of `kit_lock_key` (held until the command is registered), `begin_install_attempt` (a random attempt id), then `prepare_held` -> `prepare_locked` -> `recover_then_choose` (recover the Kit's quarantined VM with `recover_quarantined_vm_locked`, then `vm_name` from the map, then `begin_install_record` persists the record for that name, in `vm-ownership-installs.json` next to the schema 2 map) -> `prepare_flight`; `InstallAttempt::published` ends the record, and every record of the command on that VM, once the command is registered; `InstallAttempt::abandoned` ends the record of an attempt `marsh stop --force` refused before its create (InstAbort); a failed attempt settles (`kit_install.rs`). The attempt is running (`running_installs`, with its Kit) from before its Kit lock. The create is marsh-sbx `lib.rs` `ensure_kit_vm_authorized` (the create-time check `is_live`: `StaleVmName` before any create; `prepare_locked` chooses again once) -> `create_published_vm_with_grant` (it quarantines every submitted failure; `create_may_land`) -> `adopt_created`; `vm_ownership.rs` `assign` persists the intent, and `VmOwnership::forget` never drops one |
+| JobRun | `marsh-backend/src/lib.rs` `prepare_one_unnoted`: the Kit lock of `spec_ownership_key` (ephemeral Kit VMs included), then `prepare_locked` as for the install: the caller's name is only a hint; `worker_recovery.rs` `recover_before_prepare` takes the same lock |
+| RstStart / RstLock / RstReplan / RstObserve / RstAct | `marsh-backend/src/kit_install.rs` `reset_kit_vms`: `plan_reset` (no name assigned; a running install of NAME, or on NAME's Kit, refuses `NAME`, and its Kit and live ephemeral sessions' Kits are skipped by `all`), the Kit locks in key order (`kit_locks_in_order`, `lock_in_order`), `plan_reset` again under them (re-plan when it needs a lock not held, `RESET_PLAN_ROUNDS`), then `retire_claimed_named` (for `all`, one target at a time, skipping what it must not remove) -> marsh-sbx `lib.rs` `retire_kit_vm_named_before` (RstObserve is its fresh listing; it removes by recorded UUID via `remove_owned_vm`, whose `forget` ends the records with the entry; an absent name loses its quarantine and is forgotten only through `forget_absent`, when the map recorded its UUID before the listing: an intent, or a UUID adopted since, is kept) |
+| SwStart / SwLock / SwAct | `marsh-backend/src/lib.rs` `apply_upgrade`: the old and new Kit locks together in key order, then `prepare_held` for the new VM; `claim_old_vm` and `retire_claimed` retire the old VM. `unregister` reads the old name under its Kit lock; `move_to_shipped` prepares before it takes the old lock |
+| RecoverBg | `marsh-backend/src/worker_recovery.rs` `recover_quarantined_vm`: the Kit lock of the VM's ownership key (`vm_ownership_key`, also of a name forgotten in this process), whether or not a command names the VM, then `recover_quarantined_vm_locked` -> `retire_recovered`; marsh-sbx `lib.rs` `retire_quarantined_vm` |
+| Gc | `marsh-backend/src/vm_gc.rs` `remove_recorded`: the Kit lock of the VM's ownership key, always; stopped VMs only |
+| Teardown | `marsh-backend/src/lib.rs` `teardown_scope` and `reset_stale_scope_components` -> marsh-sbx `lib.rs` `reset_stale_scope_kit_vms_before` (intents and their records stay; it reads the UUIDs before its listing, `owned_kit_uuids`, for `forget_absent`); it is admitted by marsh-daemon `lib.rs` `begin_lifecycle_request`, which refuses while any request, an install or the background pass included, is in flight |
+| RunSubmit / EarlyStart / RunStart / GhostStart (`subm`, `wst`, `ghost`) | marsh-daemon `lib.rs` `mark_execution_submitted` journals (synced) the job with its reserved VM before marsh-sbx `lib.rs` `launch_worker` writes `WorkerRequest::Start` (`started_ack`); marsh-worker `lib.rs` `prepare_container` publishes `Started` and waits (`setup.rs` `await_flag`, `STARTED_ACK_TIMEOUT`) for `WorkerRequest::StartedAck`, which marsh-backend `lib.rs` sends after `record_start` (`mark_running`, synced); never acknowledged, the container is deleted (`never_started`) |
+| RunStart / RunEnd / SiblingQuarantine | marsh-daemon `lib.rs`: a job runs on a Kit VM from `mark_running` to `finish_job`; `quarantine_worker` quarantines its VM. Every claim that may retire a VM refuses one a queued, running or detached job is recorded on, under the store lock: `begin_workers_reset` and `begin_verified_workers_reset` (reset NAME, recovery, teardown; `job_running_on`, whatever the quarantine), `begin_settled_workers_reset` (reset all), `begin_automatic_retire` (GC, drained Kits, a switched Kit's VM via `claim_old_vm`) |
+| RunLost / LostEnds / PendStart / Restart (`lost`, `alive`, `pend`) | marsh-worker `lib.rs` `prepare_container` publishes `WorkerEvent::Started` after the create and before `run_prepared`'s single attach and start (`pend`: created, start pending); marsh-sbx `lib.rs` `verify_no_running_containers` lists `docker ps --all` for created, running, restarting and paused containers (`Seen`). The teardown checks every owned Kit VM a lost job is recorded on: marsh-backend `lib.rs` `keep_unverified_generations` (`vms_whose_execution_may_run`, `owned_kit_vm_names`) feeds `reset_stale_scope_components`. marsh-daemon `lib.rs`: `DaemonStore::open` turns a queued or running receipt into `Unknown` with `ExecutionOutcome::Unknown`; `finish_job_with_execution` records an executor's unknown execution. `execution_may_run` judges an ended job by its `ExecutionOutcome` (`Unknown` and `SupervisionFailed` may still run; a container verified removed has not), and `begin_workers_reset` refuses such a VM. Only a verification that nothing runs releases it: `begin_verified_workers_reset` for marsh-backend `kit_install.rs` `verify_unknown_executions` (reset NAME), `worker_recovery.rs` `recover_quarantined_vm_locked` (recovery) and `lib.rs` `verify_unknown_executions_for_teardown` (a plain teardown, which also keeps the VM from `reset_stale_scope_components`), all through marsh-sbx `lib.rs` `verify_no_running_containers`; `marsh stop --force` (`forced_stop_active`) is the override. `reset all`, GC and the switch refuse it (`recorded_busy`) |
+| EphOpen / EphRun / EphClose | `marsh-backend/src/ephemeral.rs` `kit_spec_for_session` notes a name before the lock; preparation is `prepare_one_unnoted` (key `IDENTITY:ephemeral:SESSION`); `close_ephemeral_kits` takes the session's Kit locks (deduplicated, key order) and removes every live entry of its keys (`live_kit_entries`), not only the noted names |
+| BgStart / BgStartUpd / BgEnd / TdCancelBg | marsh-daemon `lib.rs` `spawn_kit_updater`: each background pass (`DaemonBackend::auto_update_kits`: retired-VM removal, draining retirement, recovery, Kit updates, VM GC) holds a `begin_background_request` admission for its whole run; its creates run under the background cancellation (marsh-sbx `lib.rs` `in_background`). A plain stop, reset or restart runs `drain_background_pass` first: when only the pass is in flight, `DaemonBackend::cancel_background_creates` (`cancel_background_creates`), a wait within `FORCED_STOP_DRAIN`, then `begin_lifecycle_request` |
+| StopBegin / StopEnd / StopGiveUp (`marsh stop --force`) | marsh-daemon `lib.rs` `begin_forced_stop` closes admission (refused while shells are attached or jobs run, as `marsh stop`), then `handle_forced_stop`: `DaemonBackend::cancel_creates` (marsh-sbx `lib.rs` `cancel_creates`: `run_create` runs every Kit VM create through `run_bounded_cancellable`, which kills the process group; a cancelled create fails as may-still-land, and no new one is submitted), `wait_for_requests` up to `FORCED_STOP_DRAIN`, then `handle_scope_lifecycle` (teardown and stop); a request still running gives up: `resume_creates`, nothing torn down |
+| Restart | daemon start: marsh-sbx `vm_ownership.rs` `persisted` loads the map (schema 2; a schema 3 map an earlier build wrote is read and rewritten), its intents and the install records (`read_installs`, dropping a record whose name has no entry); the retired names, the quarantine and the running attempts (marsh-backend `running_installs`) are in memory, so a running record becomes settled |
 | Land, listing | stock SBX; marsh-sbx `vm_ownership.rs` `store_view` adopts a listed intent, and `classify` reports a VM listed under a forgotten name as foreign |
 
 ## Proposed placement model

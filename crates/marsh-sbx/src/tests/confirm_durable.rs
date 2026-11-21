@@ -9,6 +9,17 @@ use crate::vm_ownership::FailDirectorySync;
 /// Opens a VM through one create site of an adapter over `model` and `map`.
 type Open = fn(&StockSbx) -> Result<(), SbxError>;
 
+/// The ownership key of the Kit VM the Kit create sites open: a persisted
+/// map creates only under a name it assigned.
+const FIXTURE_KEY: &str = "fixture";
+
+fn fixture_name(adapter: &StockSbx) -> String {
+    adapter
+        .ownership
+        .lookup(VmPurpose::Kit, FIXTURE_KEY)
+        .unwrap()
+}
+
 /// The create site runs once on a healthy map, and not at all once a write was
 /// published but its directory sync failed (and keeps failing).
 fn assert_no_create_on_an_undurable_map(open: Open) {
@@ -17,12 +28,20 @@ fn assert_no_create_on_an_undurable_map(open: Open) {
     let adapter = StockSbx::new("sbx", Arc::clone(&healthy) as Arc<dyn CommandRunner>)
         .with_vm_ownership(control.path().join("healthy.json"))
         .unwrap();
+    adapter
+        .ownership
+        .assign(VmPurpose::Kit, FIXTURE_KEY)
+        .unwrap();
     open(&adapter).unwrap();
     assert_eq!(healthy.count("create"), 1, "the control did not create");
 
     let model = StockModel::new();
     let adapter = StockSbx::new("sbx", Arc::clone(&model) as Arc<dyn CommandRunner>)
         .with_vm_ownership(control.path().join("undurable.json"))
+        .unwrap();
+    adapter
+        .ownership
+        .assign(VmPurpose::Kit, FIXTURE_KEY)
         .unwrap();
     let fail = FailDirectorySync::in_dir(control.path());
     assert!(adapter.ownership.assign(VmPurpose::Kit, "other").is_err());
@@ -82,7 +101,8 @@ fn the_services_create_waits_for_a_durable_map() {
 #[test]
 fn the_published_kit_create_waits_for_a_durable_map() {
     assert_no_create_on_an_undurable_map(|adapter| {
-        let kit = KitFixture::published("marsh-kit-fixture");
+        let mut kit = KitFixture::published("marsh-kit-fixture");
+        kit.spec.name = fixture_name(adapter);
         adapter.ensure_kit_vm(&kit.spec).map(drop)
     });
 }
@@ -90,7 +110,8 @@ fn the_published_kit_create_waits_for_a_durable_map() {
 #[test]
 fn the_local_kit_create_waits_for_a_durable_map() {
     assert_no_create_on_an_undurable_map(|adapter| {
-        let kit = KitFixture::local("marsh-kit-local");
+        let mut kit = KitFixture::local("marsh-kit-local");
+        kit.spec.name = fixture_name(adapter);
         adapter.ensure_kit_vm(&kit.spec).map(drop)
     });
 }

@@ -81,7 +81,7 @@ Usage:
   marsh config peer-review [on|off|ls] Show or set peer review by another vendor's model
   marsh peer-review ls [--json]        Show the peer reviewers and where they came from
   marsh peer-review classify MODEL...  Show a model's class and vendor (no daemon)
-  marsh stop [--json]                  Remove this home's VMs (stop Docker VMs) and stop its daemon
+  marsh stop [--force] [--json]        Remove this home's VMs (stop Docker VMs) and stop its daemon
   marsh restart                        Restart this home's idle daemon on the installed marsh (VMs kept)
   marsh reset [--include-services [--yes]] [--json]
                                        Remove this home's VMs; keep the daemon and Docker VMs
@@ -297,7 +297,7 @@ fn init_home(arguments: &[OsString]) -> Result<i32, RunError> {
     }
     Ok(0)
 }
-const STOP_HELP: &str = "Usage: marsh stop [--json] [--detached]\n\nRemove the shell and Kit VMs owned by the selected MARSH_HOME, then stop its daemon.\nServices VMs (`marsh docker`) are stopped, not removed: their disks and data stay.\nRefuses while shells or jobs are active. Home and results are kept.\nDetached cloud runs are kept (and collected when the daemon starts again); --detached discards them.\nPrints what was removed on stderr; --json also writes the daemon report on stdout.\nExits nonzero if any cleanup could not be verified. Run a script named `stop` as `marsh ./stop`.\n";
+const STOP_HELP: &str = "Usage: marsh stop [--force] [--json] [--detached]\n\nRemove the shell and Kit VMs owned by the selected MARSH_HOME, then stop its daemon.\nServices VMs (`marsh docker`) are stopped, not removed: their disks and data stay.\nRefuses while shells or jobs are active, or while another request runs.\n--force first cancels the VM creates in flight (a hung `marsh kit install`) and waits\nup to 30 seconds for requests to end; a cancelled VM that appears later is removed by\n`marsh workers reset NAME` or the next stop. Home and results are kept.\nDetached cloud runs are kept (and collected when the daemon starts again); --detached discards them.\nPrints what was removed on stderr; --json also writes the daemon report on stdout.\nExits nonzero if any cleanup could not be verified. Run a script named `stop` as `marsh ./stop`.\n";
 const RESET_HELP: &str = "Usage: marsh reset [--include-services [--yes]] [--json] [--detached]\n\nRemove the shell and Kit VMs owned by the selected MARSH_HOME; the daemon keeps running.\nServices VMs (`marsh docker`) and their data are kept: --include-services lists the projects\nwhose services data would be deleted and asks first (--yes skips the question).\nRefuses while shells or jobs are active. Home and results are kept.\nDetached cloud runs are kept; --detached discards them.\nPrints what was removed on stderr; --json also writes the daemon report on stdout.\nExits nonzero if any cleanup could not be verified. Run a script named `reset` as `marsh ./reset`.\n";
 const RECOVER_HOME_HELP: &str = "Usage: marsh recover-home SLOT --discard\n\nrecover-home explicitly selects one retained private slot (0..15), after all shell/Kit owners and pending work are closed. Use the SAME SDK selection; unknown/live authority remains retained. It never removes VMs or sweeps other slots.\n";
 const ACP_HOST_HELP: &str = "Usage: marsh acp install-published codex NAME\n       marsh acp remove-published codex NAME\n\nRegister or remove a published ACP control tool for new host Codex tasks. Inside the project shell, run `acp --help` for session commands.\n";
@@ -2171,7 +2171,8 @@ fn write_absent_scope_report(
     let report = absent_scope_report(command, recorded)?;
     let json = matches!(
         command,
-        cli::ProductCommand::Reset { json: true, .. } | cli::ProductCommand::Stop { json: true }
+        cli::ProductCommand::Reset { json: true, .. }
+            | cli::ProductCommand::Stop { json: true, .. }
     );
     if report.cleanup_complete {
         eprintln!(
@@ -5131,7 +5132,10 @@ exit 64
 
     #[test]
     fn absent_daemon_claims_nothing_running_only_when_no_vm_is_recorded() {
-        let stop = cli::ProductCommand::Stop { json: false };
+        let stop = cli::ProductCommand::Stop {
+            json: false,
+            force: false,
+        };
         let reset = cli::ProductCommand::Reset {
             json: true,
             include_services: false,

@@ -279,15 +279,19 @@ pub fn prepare(
             detached_kept(&mut stderr, kept, "reset")?;
             return Ok(outcome);
         }
-        ProductCommand::Stop { json } => {
+        ProductCommand::Stop { json, force } => {
             let reset = false;
             let home = session
                 .home_backing
                 .parent()
                 .unwrap_or(&session.home_backing);
             let kept = detached_before(client.as_ref(), &mut stderr)?;
-            let outcome =
-                scope_lifecycle(client.as_ref(), reset, json, home, &mut stdout, &mut stderr)?;
+            let outcome = if force {
+                let report = client.force_stop_scope()?;
+                write_lifecycle_report(&report, home, json, &mut stdout, &mut stderr)?
+            } else {
+                scope_lifecycle(client.as_ref(), reset, json, home, &mut stdout, &mut stderr)?
+            };
             detached_kept(&mut stderr, kept, if reset { "reset" } else { "stop" })?;
             return Ok(outcome);
         }

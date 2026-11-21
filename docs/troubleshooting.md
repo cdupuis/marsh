@@ -186,8 +186,59 @@ that (for example a container is still running, or `sbx` cannot reach the VM),
 the VM stays quarantined and the status line says why.
 
 To clear it yourself, run `marsh workers reset KIT`, using the Kit name in the
-message, or `marsh workers reset all` to retire all idle or quarantined Kit
-VMs, including one left by a `marsh kit install` that failed.
+message, or `marsh workers reset all` to retire every Kit VM this scope owns
+that is idle or quarantined.
+
+A job marsh knows ended (it exited, hit a limit, or failed to start) and whose
+container's removal is merely uncertain never holds the VM: `marsh workers
+reset KIT` removes it at once. A job marsh lost track of while it ran (the
+connection to the VM was lost, or the daemon restarted under it) may still be
+running, so `marsh workers reset KIT`, like the automatic retirement, first
+checks the VM afresh, and removes it only when it is stopped or gone or its
+Docker lists no container that runs or may still start (created, running,
+restarting or paused; an exited one is never started again). If it cannot
+verify that (a container runs or waits to start, or `sbx` cannot reach the VM),
+it removes nothing and names the jobs that may still run. Wait for them and try
+again, or run `marsh stop --force`: it removes the VM anyway, ending whatever
+still runs there. A plain `marsh stop` or `marsh reset` makes the same check on
+every such VM it would remove, the VM of the Kit's current version and any VM
+an earlier version left (after a Kit update, switch or uninstall), keeps each
+one it cannot verify, and reports it as cleanup uncertain. So no quarantine is
+permanent: it ends on its own once nothing runs, or with `marsh stop --force`.
+`marsh workers reset all` skips such a VM.
+
+The check can trust what it sees because marsh records a job's VM before it
+sends the job there, and a worker starts a job's container only after the
+daemon has recorded it as running there. A container whose start marsh never
+recorded (the daemon stopped in between) is deleted by its worker, within 30
+seconds, and never started. This relies on the worker in each Kit VM being the
+one the running daemon installed, which marsh does before it first uses the VM.
+
+For a `marsh kit install NAME` that failed, use the name it was given:
+`marsh workers reset NAME` removes the VM its create left. That works after a
+daemon restart too, and for a create that lands after the install gave up:
+marsh records the install with the VM's name before the create and keeps the
+record until the VM is removed. If nothing is listed under the name yet, the
+reset removes nothing and says the create may still land; run it again later.
+While the install itself is still running, `marsh workers reset NAME` refuses
+with `still running` (so does a reset of another command on the same Kit), and
+`marsh workers reset all` skips it. `marsh workers reset all` also skips, and
+names, a VM it must not remove (a job runs on it, a job's cleanup is not
+verified, another VM holds its name, or a live private-home session uses it),
+and removes the others. `marsh workers reset all` also skips a quarantined VM that
+still holds pins of shell sessions that have ended (`marsh workers reset KIT`
+clears it). No reset removes a VM a job is still running on, or may
+still be running on, even a quarantined one; a reset that waits more than 30 seconds for a Kit that is
+busy (a job starting, a recovery, a Kit change) stops, removes nothing, and
+names that Kit.
+
+A `marsh kit install` whose VM create hangs keeps its request open for up to
+an hour. `marsh stop` and `marsh reset` do not clear it: they wait briefly for
+requests in flight, then refuse. `marsh stop --force` cancels the create (and
+any other VM create in flight), waits up to 30 seconds for the requests to
+end, then stops like `marsh stop`. The cancelled VM may still appear later;
+the next daemon recognizes it as its own, and `marsh workers reset NAME`
+removes it.
 
 Either way the uncertain jobs stay uncertain, and files the job wrote to your
 project stay as they are. Review them with `git status` and `git diff`, or
@@ -201,7 +252,9 @@ that did not complete (its container never started, and marsh removes it by
 label), a worker that is slow to answer while busy, reinstalling marsh while
 jobs run (they keep the worker they started on), and a closing shell whose
 mount bookkeeping is busy. A VM create that `sbx` did not report on is held
-back for two minutes in case it still lands, then removed or retried.
+back for two minutes in case it still lands. After that the quarantine is
+lifted but marsh keeps the VM's name: a VM that lands later is still its own,
+and `marsh workers reset` or `marsh stop` removes it.
 
 ## Removing VMs
 
@@ -214,9 +267,15 @@ back for two minutes in case it still lands, then removed or retried.
 | `marsh workers reset cloud` | Delete every [Docker Cloud](cloud.md) sandbox this daemon owns |
 | `marsh reset` | Remove the scope's Kit and shell VMs; keep the daemon running. [Services VMs](design/services.md) are skipped; `marsh reset --include-services` lists the projects whose services data it would delete and asks first (`--yes` skips the question) |
 | `marsh stop` | Remove the scope's Kit and shell VMs and stop its daemon. Services VMs are stopped and kept, with their data |
+| `marsh stop --force` | As `marsh stop`, after cancelling the VM creates in flight (a hung `marsh kit install`) and waiting up to 30 seconds for requests to end |
 
-`reset` and `stop` refuse while shells or jobs are open. Each prints the VMs it
-removed.
+`reset` and `stop` refuse while shells or jobs are open, and, after waiting
+briefly, while another request (a `marsh kit install`) is running;
+`stop --force` cancels such a request's VM create instead. When the only thing
+running is marsh's background Kit pass (updates, recovery, garbage
+collection), `reset` and `stop` cancel its VM create (a Kit update's), wait up
+to 30 seconds for it to end, and go ahead. Each prints the VMs
+it removed.
 
 If a removal could not be verified, the command names what is left and exits
 nonzero.

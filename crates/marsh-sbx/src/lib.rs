@@ -52,6 +52,7 @@ mod vm_ownership;
 pub use ephemeral_home::{EphemeralHomeLease, EphemeralHomeToken};
 pub use shell_template_reference::ShellTemplateReference;
 pub use stock_inventory::{StockInventory, StockInventoryVm};
+pub use vm_ownership::InstallRecord;
 use vm_ownership::{VmClass, VmOwnership};
 pub use vm_ownership::{VmPurpose, valid_vm_prefix, vm_prefix};
 mod capped_command;
@@ -179,7 +180,40 @@ pub struct VmQuarantine {
 /// Whether a failed `sbx create` may still finish later: it timed out or its
 /// reply was lost. A create stock SBX reported as failed is over.
 fn create_may_land(error: &SbxError) -> bool {
-    matches!(error, SbxError::PreparationTimeout { .. } | SbxError::Io(_))
+    matches!(
+        error,
+        SbxError::PreparationTimeout { .. } | SbxError::OutputDrain { .. } | SbxError::Io(_)
+    )
+}
+
+/// A stock call's failed `run_bounded`. A drain failure (the command exited,
+/// a helper holds its pipes) keeps its own text and captured output: it is not
+/// the call running out of time.
+fn stock_call_error(error: io::Error, operation: &'static str, timeout: Duration) -> SbxError {
+    if let Some(drain) = marsh_runtime::OutputDrainTimeout::of(&error) {
+        SbxError::OutputDrain {
+            operation,
+            detail: drain.to_string(),
+        }
+    } else if error.kind() == io::ErrorKind::TimedOut {
+        SbxError::PreparationTimeout { operation, timeout }
+    } else {
+        SbxError::Io(error)
+    }
+}
+
+thread_local! {
+    /// Whether this thread runs the daemon's background Kit pass
+    /// ([`StockSbx::in_background`]).
+    static BACKGROUND_CREATES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The cancellations Kit VM creates run under: `marsh stop --force` cancels
+/// both; a plain stop or reset cancels only the background pass's.
+#[derive(Default)]
+struct CreateCancellations {
+    all: marsh_runtime::Cancellation,
+    background: marsh_runtime::Cancellation,
 }
 
 /// A registry Kit reference as stock must read it. Stock's `ResolveReference`
@@ -1210,6 +1244,10 @@ pub struct StockSbx {
     installed_shell_artifacts: Mutex<BTreeMap<(String, String), String>>,
     shell_mount_references: Mutex<BTreeMap<(String, PathBuf, PathBuf), Arc<ShellMountReference>>>,
     ownership: VmOwnership,
+    /// Cancelled by `marsh stop --force` ([`Self::cancel_creates`]): every
+    /// Kit VM create in flight ends, and no new one is submitted until
+    /// [`Self::resume_creates`].
+    create_cancel: Mutex<CreateCancellations>,
     shell_recovery_specs: Mutex<BTreeMap<String, ShellVmSpec>>,
     active_shell_sessions: Mutex<BTreeMap<String, Arc<AtomicUsize>>>,
     // Quarantine retains admitted directory handles and mount references until
@@ -1374,6 +1412,7 @@ impl StockSbx {
             installed_shell_artifacts: Mutex::new(BTreeMap::new()),
             shell_mount_references: Mutex::new(BTreeMap::new()),
             ownership: VmOwnership::in_memory(),
+            create_cancel: Mutex::new(CreateCancellations::default()),
             shell_recovery_specs: Mutex::new(BTreeMap::new()),
             active_shell_sessions: Mutex::new(BTreeMap::new()),
             uncertain_shell_grants: Mutex::new(BTreeMap::new()),
@@ -1736,9 +1775,11 @@ impl StockSbx {
     /// Remove one VM only by its recorded, currently present UUID. Absent is a
     /// successful no-op; a foreign or unrecorded VM is never touched.
     fn remove_owned_vm(&self, name: &str, deadline: Instant) -> Result<bool, SbxError> {
+        // Read before the listing: its absence proves only this VM gone.
+        let observed = self.ownership.uuid(name);
         let uuid = match self.classify_vm_before(name, true, deadline)? {
             VmClass::Absent => {
-                self.ownership.forget(name)?;
+                self.ownership.forget_absent(name, observed.as_deref())?;
                 return Ok(false);
             }
             VmClass::Foreign => return Err(SbxError::ForeignVm(name.to_owned())),
@@ -2194,16 +2235,41 @@ impl StockSbx {
         &self,
         deadline: Instant,
     ) -> Result<Vec<String>, SbxError> {
+        self.reset_stale_scope_kit_vms_keeping_before(deadline, &BTreeSet::new())
+    }
+
+    /// [`Self::reset_stale_scope_kit_vms_before`], leaving the VMs of `keep`
+    /// (a teardown keeps a VM a lost job may still run on).
+    ///
+    /// # Errors
+    /// As [`Self::reset_stale_scope_kit_vms_before`].
+    pub fn reset_stale_scope_kit_vms_keeping_before(
+        &self,
+        deadline: Instant,
+        keep: &BTreeSet<String>,
+    ) -> Result<Vec<String>, SbxError> {
         if Instant::now() >= deadline {
             return Err(SbxError::LifecycleDeadline {
                 operation: "list scope Kit VMs for reset",
             });
         }
+        // The UUIDs recorded before the listing: a VM adopted by another
+        // listing after this one was taken is not proven gone by it. (Every
+        // VM this listing finds is a candidate, intents it adopts included.)
+        let observed = self
+            .ownership
+            .owned_kit_uuids()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
         let view = self.stock_view(true)?;
         let mut removed = Vec::new();
         for vm in self.ownership.owned_kit_names() {
             if view.get(&vm).is_none() {
-                self.ownership.forget(&vm)?;
+                self.ownership
+                    .forget_absent(&vm, observed.get(&vm).map(String::as_str))?;
+                continue;
+            }
+            if keep.contains(&vm) {
                 continue;
             }
             self.reset_stale_scope_kit_vm_candidate(&vm, deadline)?;
@@ -2324,6 +2390,66 @@ impl StockSbx {
     #[must_use]
     pub fn shell_vm_in_use(&self, name: &str) -> bool {
         self.check_shell_reset_admission(name).is_err()
+    }
+
+    /// Persist a `marsh kit install` attempt's record under the live Kit VM
+    /// name it chose, before its create (`docs/model/KitInstall.tla`).
+    ///
+    /// # Errors
+    /// [`SbxError::StaleVmName`] when `name` is not an entry of the map; or
+    /// the map cannot be written.
+    pub fn begin_install_record(&self, name: &str, record: InstallRecord) -> Result<(), SbxError> {
+        self.ownership.begin_install(name, record)
+    }
+
+    /// End the install record `attempt` (its command was published).
+    ///
+    /// # Errors
+    /// Fails when the map cannot be written.
+    pub fn end_install_record(&self, attempt: &str) -> Result<bool, SbxError> {
+        self.ownership.end_install(attempt)
+    }
+
+    /// Whether a Kit VM create may be submitted under `name` (an entry of the
+    /// ownership map; see the create-time check).
+    #[must_use]
+    pub fn is_live_vm_name(&self, name: &str) -> bool {
+        self.ownership.is_live(name)
+    }
+
+    /// End every install record of `command` under `name`: the command was
+    /// published on that VM.
+    ///
+    /// # Errors
+    /// Fails when the records cannot be written.
+    pub fn end_install_records_of(&self, name: &str, command: &str) -> Result<usize, SbxError> {
+        self.ownership.end_installs_of(name, command)
+    }
+
+    /// Every persisted install record as `(name, ownership key, record)`.
+    #[must_use]
+    pub fn install_records(&self) -> Vec<(String, String, InstallRecord)> {
+        self.ownership.install_records()
+    }
+
+    /// The ownership key of a VM name, also of one forgotten in this process.
+    #[must_use]
+    pub fn vm_ownership_key(&self, name: &str) -> Option<String> {
+        self.ownership.key_of(name)
+    }
+
+    /// Every live Kit entry of the map as `(name, ownership key)`: intents
+    /// and recorded VMs.
+    #[must_use]
+    pub fn live_kit_entries(&self) -> Vec<(String, String)> {
+        self.ownership.live_kit_entries()
+    }
+
+    /// Every Kit VM name the map records a UUID for: what the stale
+    /// generation sweep (`reset_stale_scope_kit_vms_keeping_before`) visits.
+    #[must_use]
+    pub fn owned_kit_vm_names(&self) -> Vec<String> {
+        self.ownership.owned_kit_names()
     }
 
     /// The recorded name of `(purpose, key)`, never assigning one.
@@ -2508,10 +2634,10 @@ impl StockSbx {
                 {
                     return Err(SbxError::ForeignVm(foreign));
                 }
+                self.ownership.forget(name)?;
             }
             Err(error) => return Err(error),
         }
-        self.ownership.forget(name)?;
         self.worker_init_locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2698,30 +2824,48 @@ impl StockSbx {
         deadline: Instant,
         live: Option<(&BTreeSet<String>, bool)>,
     ) -> Result<bool, SbxError> {
-        validate_name(&spec.name)?;
+        self.retire_kit_vm_named_before(&spec.name, spec.workload_kit.identity(), deadline, live)
+    }
+
+    /// [`Self::retire_kit_vm_before`] by name and ownership key, for a VM no
+    /// registered command names (a failed install's, a live entry of the
+    /// map). A name under which nothing is listed keeps its intent (its
+    /// create may still land) and loses its quarantine: `Ok(false)`.
+    ///
+    /// # Errors
+    /// As [`Self::retire_kit_vm_before`].
+    pub fn retire_kit_vm_named_before(
+        &self,
+        name: &str,
+        identity: &str,
+        deadline: Instant,
+        live: Option<(&BTreeSet<String>, bool)>,
+    ) -> Result<bool, SbxError> {
+        validate_name(name)?;
         let (vm_transition, _vm_cleanup) =
-            weak_rw_transition_lock(&self.grant_vm_transition_locks, spec.name.clone());
+            weak_rw_transition_lock(&self.grant_vm_transition_locks, name.to_owned());
         let _vm_transition = fence_write_before(
             &vm_transition,
             self.admission_deadline(deadline),
             "retire a Kit VM",
         )?;
         let (stock_operation, _stock_cleanup) =
-            weak_mutex_transition_lock(&self.grant_stock_operation_locks, spec.name.clone());
+            weak_mutex_transition_lock(&self.grant_stock_operation_locks, name.to_owned());
         let _stock_operation = stock_operation_before(
             &stock_operation,
             self.admission_deadline(deadline),
             "retire a Kit VM",
         )?;
-        let quarantined = self.reject_quarantined(&spec.name).is_err();
-        match self.classify_vm_before(&spec.name, true, deadline)? {
+        let quarantined = self.reject_quarantined(name).is_err();
+        let observed = self.ownership.uuid(name);
+        match self.classify_vm_before(name, true, deadline)? {
             VmClass::Absent => {
-                self.drop_worker_lease(&spec.name)?;
-                self.clear_worker_generation(spec);
-                self.ownership.forget(&spec.name)?;
+                self.drop_worker_lease(name)?;
+                self.clear_worker_generation_named(name, identity);
+                self.ownership.forget_absent(name, observed.as_deref())?;
                 return Ok(false);
             }
-            VmClass::Foreign => return Err(SbxError::ForeignVm(spec.name.clone())),
+            VmClass::Foreign => return Err(SbxError::ForeignVm(name.to_owned())),
             VmClass::Owned { .. } => {}
         }
         // The recorded UUID is the ownership authority (trusted stock SBX,
@@ -2733,7 +2877,7 @@ impl StockSbx {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let in_use = references.iter().any(|((vm, _), reference)| {
-                vm == &spec.name
+                vm == name
                     && match live {
                         None => reference.active_jobs > 0 || !reference.pinned_sessions.is_empty(),
                         Some((sessions, caller_quarantined)) => {
@@ -2746,14 +2890,14 @@ impl StockSbx {
                     }
             });
             if !quarantined && in_use {
-                return Err(SbxError::ActiveWorkerState(spec.name.clone()));
+                return Err(SbxError::ActiveWorkerState(name.to_owned()));
             }
             // Idle retained mounts end with the VM.
-            references.retain(|(vm, _), _| vm != &spec.name);
+            references.retain(|(vm, _), _| vm != name);
         }
-        self.drop_worker_lease_before(&spec.name, deadline)?;
-        self.remove_observed_kit(&spec.name, deadline)?;
-        self.clear_worker_generation(spec);
+        self.drop_worker_lease_before(name, deadline)?;
+        self.remove_observed_kit(name, deadline)?;
+        self.clear_worker_generation_named(name, identity);
         Ok(true)
     }
 
@@ -2916,6 +3060,13 @@ impl StockSbx {
                 spec.name
             )));
         }
+        // A create is submitted only under a live entry of the map: a name
+        // retired since it was chosen would land as a VM nobody owns. A
+        // retirement forgets a name only under this fence's write side, so
+        // the check holds until this preparation's create is submitted.
+        if !self.ownership.is_live(&spec.name) {
+            return Err(SbxError::StaleVmName(spec.name.clone()));
+        }
         regular_executable(&spec.worker_binary)?;
         regular_executable(&byte_exec_artifact(&spec.worker_binary))?;
         regular_executable(&job_artifact(&spec.worker_binary))?;
@@ -2958,7 +3109,9 @@ impl StockSbx {
             if let Err(error) = self.create_published_vm_with_grant(spec, &lifecycle_grant) {
                 // Submitted Create may complete late; never delete by a
                 // name alone or discharge its durable pending operation.
+                // (One refused by `marsh stop --force` was never submitted.)
                 if !matches!(&error, SbxError::Io(source) if marsh_runtime::command_not_started(source))
+                    && !matches!(error, SbxError::Stopping)
                 {
                     self.quarantine_vm_as(
                         &spec.name,
@@ -3572,14 +3725,7 @@ impl StockSbx {
             .runner
             .run_bounded(&invocation, self.preparation_timeouts.create)
             .map_err(|error| {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    SbxError::PreparationTimeout {
-                        operation: "create shell VM",
-                        timeout: self.preparation_timeouts.create,
-                    }
-                } else {
-                    SbxError::Io(error)
-                }
+                stock_call_error(error, "create shell VM", self.preparation_timeouts.create)
             })
             .and_then(|output| Self::require_success("create shell VM", output));
         if let Err(error) = outcome {
@@ -5372,6 +5518,7 @@ impl StockSbx {
             attempt: attempt.to_owned(),
             generation: worker.generation,
             spec,
+            started_ack: true,
         };
         let start_write =
             write_start_bounded(&worker, request, self.preparation_timeouts.start_write);
@@ -5574,11 +5721,19 @@ impl StockSbx {
             .clone()
     }
 
-    /// Whether a quarantined Kit VM can have a job container running in it.
-    /// `Ok` names the evidence that none can: the VM is gone, stopped (the
-    /// quarantine stop took effect), or running with no container in its
-    /// Docker. `Err` says why that could not be shown; then the VM stays
-    /// quarantined. Only this daemon's recorded VM is inspected.
+    /// Whether a Kit VM can have a job container running in it, now or
+    /// later. `Ok` names the evidence that none can: the VM is gone, stopped
+    /// (the quarantine stop took effect; every process in it, a lost
+    /// worker's included, ended), or running with no container in its Docker
+    /// that runs or may still start: created (a worker reports Started after
+    /// `docker create`, before `docker start`), running, restarting or
+    /// paused. An exited or dead container is not started again: the worker
+    /// starts its container once, never re-creates it, and creates it with
+    /// no restart policy. A container still being created when this looks
+    /// is never started either: the worker starts a container only once the
+    /// daemon acknowledges its journaled `Started` (`WorkerRequest::StartedAck`)
+    /// and deletes one never acknowledged. `Err` says why that could not be
+    /// shown; then the VM stays. Only this daemon's recorded VM is inspected.
     ///
     /// # Errors
     /// Returns the reason verification was impossible or failed.
@@ -5623,8 +5778,17 @@ impl StockSbx {
                             vm,
                             "docker",
                             "ps",
+                            "--all",
                             "--quiet",
                             "--no-trunc",
+                            "--filter",
+                            "status=created",
+                            "--filter",
+                            "status=running",
+                            "--filter",
+                            "status=restarting",
+                            "--filter",
+                            "status=paused",
                         ],
                     )
                     .map_err(|error| format!("cannot list the VM's containers: {error}"))?;
@@ -5638,10 +5802,10 @@ impl StockSbx {
                     .split_whitespace()
                     .count();
                 if running == 0 {
-                    Ok("no container is running in the VM".into())
+                    Ok("no container is running or waiting to start in the VM".into())
                 } else {
                     Err(format!(
-                        "{running} container(s) still running in the VM; a job may still be writing"
+                        "{running} container(s) running or waiting to start in the VM; a job may still be writing"
                     ))
                 }
             }
@@ -5727,6 +5891,7 @@ impl StockSbx {
         // Never submit a create while the intent that authorizes cleaning up
         // after it may not be durable (a failed directory sync).
         self.ownership.confirm_durable()?;
+        self.refuse_create_when_stopping()?;
         self.ownership.invalidate();
         let outcome = (|| {
             let mut selected_home_environment = OsString::from("MARSH_SELECTED_HOME=");
@@ -5754,7 +5919,7 @@ impl StockSbx {
                     registry_kit_reference(spec.workload_kit.identity()),
                     spec.lifecycle_workspace.as_os_str().to_os_string(),
                 ]);
-                self.run_bounded_os("create kit VM", self.preparation_timeouts.create, arguments)
+                self.run_create("create kit VM", &self.invocation(arguments))
             };
             let output = self.create_withholding_clashing_skills(spec, create)?;
             Self::require_success("create kit VM", output)?;
@@ -5835,6 +6000,7 @@ impl StockSbx {
         // Never submit a create while the intent that authorizes cleaning up
         // after it may not be durable (a failed directory sync).
         self.ownership.confirm_durable()?;
+        self.refuse_create_when_stopping()?;
         self.ownership.invalidate();
         let outcome = (|| {
             let mut selected_home_environment = OsString::from("MARSH_SELECTED_HOME=");
@@ -5867,18 +6033,7 @@ impl StockSbx {
                         .environment
                         .push(("SBX_KIT_REBUILD".into(), "1".into()));
                 }
-                self.runner
-                    .run_bounded(&invocation, self.preparation_timeouts.create)
-                    .map_err(|error| {
-                        if error.kind() == io::ErrorKind::TimedOut {
-                            SbxError::PreparationTimeout {
-                                operation: "create local kit VM",
-                                timeout: self.preparation_timeouts.create,
-                            }
-                        } else {
-                            SbxError::Io(error)
-                        }
-                    })
+                self.run_create("create local kit VM", &invocation)
             };
             let output = self.create_withholding_clashing_skills(spec, create)?;
             Self::require_success("create local kit VM", output)?;
@@ -6194,9 +6349,14 @@ impl StockSbx {
             .as_deref()
             .filter(|_| lifecycle_grant.ephemeral.is_none())
             .and_then(|cache| cached_local_build(cache, fingerprint));
+        // The create runs on its own thread: it keeps the caller's
+        // cancellation (the background pass's, `in_background`).
+        let background = BACKGROUND_CREATES.with(std::cell::Cell::get);
         let (create_result, build_result) = thread::scope(|scope| {
-            let create =
-                scope.spawn(|| self.create_local_vm(spec, source, lifecycle_grant, rebuild));
+            let create = scope.spawn(|| {
+                BACKGROUND_CREATES.with(|flag| flag.set(background));
+                self.create_local_vm(spec, source, lifecycle_grant, rebuild)
+            });
             let build = scope.spawn(|| match cached {
                 Some(cached) => Ok(cached),
                 None => self.build_local_source(source, fingerprint, build_workspace),
@@ -7587,6 +7747,102 @@ impl StockSbx {
         invocation
     }
 
+    /// A Kit VM `sbx create`, bounded by the create timeout and cancelled by
+    /// [`Self::cancel_creates`]. A cancelled create may still land: it fails
+    /// as `Io`, which quarantines its name as may-still-land and keeps its
+    /// intent (`docs/model/KitInstall.tla`, `StopBegin`).
+    fn run_create(
+        &self,
+        operation: &'static str,
+        invocation: &Invocation,
+    ) -> Result<CommandOutput, SbxError> {
+        let timeout = self.preparation_timeouts.create;
+        let cancel = self.create_cancellation();
+        self.runner
+            .run_bounded_cancellable(invocation, timeout, &cancel)
+            .map_err(|error| stock_call_error(error, operation, timeout))
+    }
+
+    /// The cancellation a Kit VM create on this thread runs under: the
+    /// background pass's own ([`Self::in_background`]), or every other's.
+    fn create_cancellation(&self) -> marsh_runtime::Cancellation {
+        let tokens = self
+            .create_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if BACKGROUND_CREATES.with(std::cell::Cell::get) {
+            tokens.background.clone()
+        } else {
+            tokens.all.clone()
+        }
+    }
+
+    /// Run `work` (the daemon's background Kit pass) with its Kit VM creates
+    /// under the background cancellation: a plain `marsh stop` or `marsh
+    /// reset` cancels those ([`Self::cancel_background_creates`]), never a
+    /// user's `kit install` or job.
+    pub fn in_background<T>(&self, work: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                BACKGROUND_CREATES.with(|flag| flag.set(self.0));
+            }
+        }
+        let _restore = Restore(BACKGROUND_CREATES.with(|flag| flag.replace(true)));
+        work()
+    }
+
+    /// A plain stop or reset found the background pass in flight: end its
+    /// Kit VM create in flight (the VM may still land, and its intent stays)
+    /// and submit no new background create until
+    /// [`Self::resume_background_creates`].
+    pub fn cancel_background_creates(&self) {
+        self.create_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .background
+            .cancel();
+    }
+
+    /// The background pass may create again (unless a forced stop runs).
+    pub fn resume_background_creates(&self) {
+        let mut tokens = self
+            .create_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !tokens.all.is_cancelled() {
+            tokens.background = marsh_runtime::Cancellation::default();
+        }
+    }
+
+    /// Refuse to submit a Kit VM create once `marsh stop --force` began.
+    fn refuse_create_when_stopping(&self) -> Result<(), SbxError> {
+        if self.create_cancellation().is_cancelled() {
+            return Err(SbxError::Stopping);
+        }
+        Ok(())
+    }
+
+    /// `marsh stop --force`: end every Kit VM create in flight (its stock
+    /// process group is killed; the VM may still land, and its intent stays)
+    /// and submit no new one until [`Self::resume_creates`].
+    pub fn cancel_creates(&self) {
+        let tokens = self
+            .create_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokens.all.cancel();
+        tokens.background.cancel();
+    }
+
+    /// A forced stop that did not go ahead: creates are submitted again.
+    pub fn resume_creates(&self) {
+        *self
+            .create_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = CreateCancellations::default();
+    }
+
     fn run_bounded_os<I, S>(
         &self,
         operation: &'static str,
@@ -7599,13 +7855,7 @@ impl StockSbx {
     {
         self.runner
             .run_bounded(&self.invocation(arguments), timeout)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    SbxError::PreparationTimeout { operation, timeout }
-                } else {
-                    SbxError::Io(error)
-                }
-            })
+            .map_err(|error| stock_call_error(error, operation, timeout))
     }
 
     /// When a recovery operation gives up waiting for a VM's fence: its own
@@ -7650,13 +7900,7 @@ impl StockSbx {
                 },
                 timeout,
             )
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    SbxError::PreparationTimeout { operation, timeout }
-                } else {
-                    SbxError::Io(error)
-                }
-            })
+            .map_err(|error| stock_call_error(error, operation, timeout))
     }
 
     fn run_bounded_in_os<I, S>(
@@ -7672,13 +7916,7 @@ impl StockSbx {
     {
         self.runner
             .run_bounded(&self.invocation_in(directory, arguments), timeout)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    SbxError::PreparationTimeout { operation, timeout }
-                } else {
-                    SbxError::Io(error)
-                }
-            })
+            .map_err(|error| stock_call_error(error, operation, timeout))
     }
 
     fn require_success(operation: &'static str, output: CommandOutput) -> Result<(), SbxError> {
@@ -9272,6 +9510,14 @@ pub enum SbxError {
         operation: &'static str,
         timeout: Duration,
     },
+    /// A stock command exited but a helper kept its output open: its output
+    /// may be incomplete, so it is a failure, and a create that did this may
+    /// still land.
+    #[error("stock SBX {operation}: {detail}")]
+    OutputDrain {
+        operation: &'static str,
+        detail: String,
+    },
     #[error("scope lifecycle deadline expired before {operation}")]
     LifecycleDeadline { operation: &'static str },
     #[error("stock SBX lifecycle schema mismatch during {operation}: {detail}")]
@@ -9288,6 +9534,14 @@ pub enum SbxError {
     MissingCapability(&'static str),
     #[error("existing sandbox name is not an owned compatible kit VM: {0}")]
     ForeignVm(String),
+    /// `marsh stop --force` is stopping the daemon: no Kit VM create is
+    /// submitted.
+    #[error("marsh stop --force is stopping this daemon; no VM is created")]
+    Stopping,
+    /// A Kit VM name that is no longer an entry of the ownership map (it was
+    /// retired after it was chosen): nothing is created under it.
+    #[error("Kit VM name {0} is no longer in the VM ownership map; choose it again")]
+    StaleVmName(String),
     #[error("owned sandbox {vm} cannot be reused: {detail}")]
     IncompatibleVm { vm: String, detail: String },
     #[error(

@@ -7,6 +7,38 @@ fn ephemeral_ownership_key(identity: &str, session: &str) -> String {
     format!("{identity}:ephemeral:{session}")
 }
 
+/// Every lock of `locks`, in order, polling each until `deadline`; refused
+/// (an ephemeral Kit preparation has not drained) when one stays held.
+fn lock_all_before(
+    locks: &[Arc<Mutex<()>>],
+    deadline: Instant,
+) -> Result<Vec<std::sync::MutexGuard<'_, ()>>, DaemonError> {
+    let mut guards = Vec::new();
+    for lock in locks {
+        loop {
+            match lock.try_lock() {
+                Ok(guard) => {
+                    guards.push(guard);
+                    break;
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    guards.push(error.into_inner());
+                    break;
+                }
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => {
+                    return Err(DaemonError::ShellCleanupUncertain(
+                        "ephemeral Kit preparation has not drained; private slot retained".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(guards)
+}
+
 impl StockDaemonBackend {
     pub(super) fn kit_spec_for_session(
         &self,
@@ -47,7 +79,6 @@ impl StockDaemonBackend {
         Ok(spec)
     }
 
-    #[allow(clippy::too_many_lines)] // Locks, retires and forgets one session's Kit VMs.
     pub(super) fn close_ephemeral_kits(
         &self,
         session: &str,
@@ -75,30 +106,7 @@ impl StockDaemonBackend {
             .collect::<Result<Vec<_>, DaemonError>>()?;
         let locks = self.kit_locks_in_order(&owners)?;
         let deadline = Instant::now() + Duration::from_secs(90);
-        let mut guards = Vec::new();
-        for lock in &locks {
-            loop {
-                match lock.try_lock() {
-                    Ok(guard) => {
-                        guards.push(guard);
-                        break;
-                    }
-                    Err(std::sync::TryLockError::Poisoned(error)) => {
-                        guards.push(error.into_inner());
-                        break;
-                    }
-                    Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => {
-                        return Err(DaemonError::ShellCleanupUncertain(
-                            "ephemeral Kit preparation has not drained; private slot retained"
-                                .into(),
-                        ));
-                    }
-                }
-            }
-        }
+        let _guards = lock_all_before(&locks, deadline)?;
         // Under those locks: every VM the session's keys own, not only the
         // names noted before a preparation chose (`KitInstall.tla`
         // `ephStaleName`): a preparation may recover the noted VM and create

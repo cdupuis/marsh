@@ -1315,7 +1315,7 @@ impl StockDaemonBackend {
 
     /// One fenced validation/preparation flight of `spec`'s VM, under its
     /// Kit lock.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)] // One fenced validation/preparation flight.
     fn prepare_flight(
         &self,
         spec: &KitVmSpec,
@@ -5772,10 +5772,46 @@ impl StockDaemonBackend {
         self.kit_lock_for_key(spec.workload_kit.identity())
     }
 
+    /// The digest reference `marsh kit install` records: a tag resolved
+    /// (once) and its Kit contract checked; any other reference as given.
+    fn resolve_install_reference(
+        &self,
+        source: Option<&KitTag>,
+        reference: String,
+    ) -> Result<String, DaemonError> {
+        Ok(match source {
+            Some(tag) => {
+                let image = self.sbx.resolve_kit_tag(tag).map_err(backend_error)?;
+                let contract = self.sbx.kit_contract(&image).map_err(backend_error)?;
+                check_contract(contract, false).map_err(DaemonError::InvalidState)?;
+                image.as_str().to_owned()
+            }
+            None => reference,
+        })
+    }
+
+    /// Refuses `command` as an alias of a registered command's Kit with a
+    /// different environment.
+    fn check_alias_environments(
+        &self,
+        command: &str,
+        current_names: &[String],
+        workload: &NativeKitRef,
+    ) -> Result<(), DaemonError> {
+        let environment = self.environment(command);
+        for name in current_names {
+            if self.registered_kit(name)?.workload.identity() == workload.identity()
+                && self.environment(name).fingerprint() != environment.fingerprint()
+            {
+                return Err(DaemonError::InvalidState("aliases of the same Kit must have identical environments; add the matching sbxenvs file".into()));
+            }
+        }
+        Ok(())
+    }
+
     /// `marsh kit install`: resolve a tag once, record only its digest (and
     /// the tag in `kit-sources.json`), and register the name. With a store,
     /// the Kit VM is prepared first; without one, the first call starts it.
-    #[allow(clippy::too_many_lines)] // One install: checks, the locked preparation, publication.
     fn install_command(
         &self,
         command: String,
@@ -5798,15 +5834,7 @@ impl StockDaemonBackend {
         // A tag is resolved once, here; the registry records only the digest.
         let mut sources = kit_lifecycle::read_sources(&self.config.control_home)?;
         let source = KitTag::parse(&reference).ok();
-        let reference = match &source {
-            Some(tag) => {
-                let image = self.sbx.resolve_kit_tag(tag).map_err(backend_error)?;
-                let contract = self.sbx.kit_contract(&image).map_err(backend_error)?;
-                check_contract(contract, false).map_err(DaemonError::InvalidState)?;
-                image.as_str().to_owned()
-            }
-            None => reference,
-        };
+        let reference = self.resolve_install_reference(source.as_ref(), reference)?;
         let path = self.config.control_home.join("commands.json");
         let previous = command_registry::read_declaration(&path).map_err(backend_error)?;
         let updated = previous
@@ -5820,14 +5848,7 @@ impl StockDaemonBackend {
         validate_count(prospective_names.len()).map_err(backend_error)?;
         command_registry::validate_references(&path, &updated).map_err(backend_error)?;
         let workload = NativeKitRef::immutable_oci(reference.clone()).map_err(backend_error)?;
-        let environment = self.environment(&command);
-        for name in &current_names {
-            if self.registered_kit(name)?.workload.identity() == workload.identity()
-                && self.environment(name).fingerprint() != environment.fingerprint()
-            {
-                return Err(DaemonError::InvalidState("aliases of the same Kit must have identical environments; add the matching sbxenvs file".into()));
-            }
-        }
+        self.check_alias_environments(&command, &current_names, &workload)?;
         // With a store, the Kit VM is prepared under the Kit lock, which is
         // held until the command is registered (`docs/model/KitInstall.tla`,
         // rule 2): no recovery, GC or reset of the Kit sees the VM between

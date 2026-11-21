@@ -597,120 +597,193 @@ mod tests {
         }
     }
 
+    impl Stock {
+        /// The scripted registry's reply (`review_registry_image`), if any.
+        fn registry_reply(
+            &self,
+            invocation: &Invocation,
+            arguments: &[String],
+        ) -> Option<CommandOutput> {
+            let image = self.review_registry_image.lock().unwrap().clone()?;
+            let image = &image;
+            let reply = if invocation.program == std::ffi::OsStr::new("docker") {
+                let day = if arguments.iter().any(|arg| arg == image) {
+                    "02"
+                } else {
+                    "01"
+                };
+                Some(format!(
+                    r#"{{"config":{{"Labels":{{"org.marsh.kit.contract":"1"}}}},"created":"2026-01-{day}T00:00:00Z"}}"#
+                ))
+            } else if arguments.first().is_some_and(|arg| arg == "kit") {
+                Some(format!(r#"{{"sandbox":{{"image":"{image}"}}}}"#))
+            } else {
+                None
+            };
+            reply.map(|reply| CommandOutput {
+                exit_code: Some(0),
+                stdout: reply.into_bytes(),
+                stderr: vec![],
+            })
+        }
+
+        fn stock_ls(&self) -> io::Result<CommandOutput> {
+            if self
+                .review_list_failure
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return output(1, "stock inventory unavailable");
+            }
+            let hook = self.before_list.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            let rows = self
+                .vms
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(name, id)| {
+                    let status = if self.stopped.lock().unwrap().contains(name) {
+                        "stopped"
+                    } else {
+                        "running"
+                    };
+                    format!(r#"{{"name":"{name}","id":"{id}","status":"{status}"}}"#)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let after = self.after_list_snapshot.lock().unwrap().take();
+            if let Some(hook) = after {
+                hook();
+            }
+            Ok(CommandOutput {
+                exit_code: Some(0),
+                stdout: format!(r#"{{"sandboxes":[{rows}]}}"#).into_bytes(),
+                stderr: Vec::new(),
+            })
+        }
+
+        fn stock_create(&self, arguments: &[String]) -> io::Result<CommandOutput> {
+            let hook = self.before_create.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            let name = arguments
+                .iter()
+                .position(|argument| argument == "--name")
+                .map(|index| arguments[index + 1].clone())
+                .unwrap();
+            if self.vms.lock().unwrap().contains_key(&name)
+                || self.pending.lock().unwrap().contains(&name)
+            {
+                return output(1, "sandbox name already in use");
+            }
+            self.created.lock().unwrap().push(name.clone());
+            let outcome = self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Create::TimedOut);
+            match outcome {
+                Create::TimedOut => Err(io::Error::new(io::ErrorKind::TimedOut, "hung")),
+                Create::TimedOutLandsLater => {
+                    self.pending.lock().unwrap().push(name);
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "hung"))
+                }
+                Create::FailedListed => {
+                    self.land(&name);
+                    output(1, "create failed")
+                }
+                Create::FailedNone => output(1, "create failed"),
+                Create::FailedLandsLater => {
+                    self.pending.lock().unwrap().push(name);
+                    output(1, "create failed")
+                }
+                Create::HangsUntilCancelled => {
+                    panic!("a hanging create must run cancellable")
+                }
+            }
+        }
+
+        fn docker_ps(&self, arguments: &[String]) -> io::Result<CommandOutput> {
+            if self
+                .containers_unreadable
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return output(1, "Cannot connect to the Docker daemon");
+            }
+            let all = arguments.iter().any(|argument| argument == "--all");
+            let filtered = arguments.iter().any(|argument| argument == "--filter");
+            // Running containers: listed unless a status filter
+            // leaves `running` out.
+            let mut ids = if !filtered
+                || arguments
+                    .iter()
+                    .any(|argument| argument == "status=running")
+            {
+                self.containers.lock().unwrap().clone().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            // Moby foldFilter sets All=true for any status filter:
+            // https://github.com/moby/moby/blob/v28.5.2/daemon/list.go
+            let status_filtered = arguments
+                .windows(2)
+                .any(|pair| pair[0] == "--filter" && pair[1].starts_with("status="));
+            if (all || status_filtered)
+                && (!filtered
+                    || arguments
+                        .iter()
+                        .any(|argument| argument == "status=created"))
+            {
+                ids.extend(self.created_containers.lock().unwrap().iter().cloned());
+            }
+            if all && !filtered {
+                ids.extend(self.exited.lock().unwrap().iter().cloned());
+            }
+            for (state, id) in self.review_states.lock().unwrap().iter() {
+                let wanted = format!("status={state}");
+                let selected = if filtered {
+                    arguments
+                        .windows(2)
+                        .any(|pair| pair == ["--filter", &wanted])
+                } else {
+                    all || matches!(*state, "running" | "restarting" | "paused")
+                };
+                if selected {
+                    ids.push(id.clone());
+                }
+            }
+            if let Some(hook) = self.review_after_ps.lock().unwrap().take() {
+                hook();
+            }
+            Ok(CommandOutput {
+                exit_code: Some(0),
+                stdout: ids.join("\n").into_bytes(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
     impl CommandRunner for Stock {
         fn run(&self, invocation: &Invocation) -> io::Result<CommandOutput> {
             self.run_bounded(invocation, Duration::from_secs(1))
         }
 
-        #[allow(clippy::too_many_lines)] // One scripted stock CLI.
         fn run_bounded(&self, invocation: &Invocation, _: Duration) -> io::Result<CommandOutput> {
             let arguments = invocation
                 .arguments
                 .iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
-            if let Some(image) = self.review_registry_image.lock().unwrap().as_ref() {
-                let reply = if invocation.program == std::ffi::OsStr::new("docker") {
-                    let day = if arguments.iter().any(|arg| arg == image) {
-                        "02"
-                    } else {
-                        "01"
-                    };
-                    Some(format!(
-                        r#"{{"config":{{"Labels":{{"org.marsh.kit.contract":"1"}}}},"created":"2026-01-{day}T00:00:00Z"}}"#
-                    ))
-                } else if arguments.first().is_some_and(|arg| arg == "kit") {
-                    Some(format!(r#"{{"sandbox":{{"image":"{image}"}}}}"#))
-                } else {
-                    None
-                };
-                if let Some(reply) = reply {
-                    return Ok(CommandOutput {
-                        exit_code: Some(0),
-                        stdout: reply.into_bytes(),
-                        stderr: vec![],
-                    });
-                }
+            if let Some(reply) = self.registry_reply(invocation, &arguments) {
+                return Ok(reply);
             }
             match arguments.first().map(String::as_str) {
-                Some("ls") => {
-                    if self
-                        .review_list_failure
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        return output(1, "stock inventory unavailable");
-                    }
-                    let hook = self.before_list.lock().unwrap().take();
-                    if let Some(hook) = hook {
-                        hook();
-                    }
-                    let rows = self
-                        .vms
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .map(|(name, id)| {
-                            let status = if self.stopped.lock().unwrap().contains(name) {
-                                "stopped"
-                            } else {
-                                "running"
-                            };
-                            format!(r#"{{"name":"{name}","id":"{id}","status":"{status}"}}"#)
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let after = self.after_list_snapshot.lock().unwrap().take();
-                    if let Some(hook) = after {
-                        hook();
-                    }
-                    Ok(CommandOutput {
-                        exit_code: Some(0),
-                        stdout: format!(r#"{{"sandboxes":[{rows}]}}"#).into_bytes(),
-                        stderr: Vec::new(),
-                    })
-                }
-                Some("create") => {
-                    let hook = self.before_create.lock().unwrap().take();
-                    if let Some(hook) = hook {
-                        hook();
-                    }
-                    let name = arguments
-                        .iter()
-                        .position(|argument| argument == "--name")
-                        .map(|index| arguments[index + 1].clone())
-                        .unwrap();
-                    if self.vms.lock().unwrap().contains_key(&name)
-                        || self.pending.lock().unwrap().contains(&name)
-                    {
-                        return output(1, "sandbox name already in use");
-                    }
-                    self.created.lock().unwrap().push(name.clone());
-                    let outcome = self
-                        .outcomes
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .unwrap_or(Create::TimedOut);
-                    match outcome {
-                        Create::TimedOut => Err(io::Error::new(io::ErrorKind::TimedOut, "hung")),
-                        Create::TimedOutLandsLater => {
-                            self.pending.lock().unwrap().push(name);
-                            Err(io::Error::new(io::ErrorKind::TimedOut, "hung"))
-                        }
-                        Create::FailedListed => {
-                            self.land(&name);
-                            output(1, "create failed")
-                        }
-                        Create::FailedNone => output(1, "create failed"),
-                        Create::FailedLandsLater => {
-                            self.pending.lock().unwrap().push(name);
-                            output(1, "create failed")
-                        }
-                        Create::HangsUntilCancelled => {
-                            panic!("a hanging create must run cancellable")
-                        }
-                    }
-                }
+                Some("ls") => self.stock_ls(),
+                Some("create") => self.stock_create(&arguments),
                 Some("rm") => {
                     if self
                         .review_rm_error
@@ -725,62 +798,7 @@ mod tests {
                 }
                 Some("stop") => output(0, ""),
                 Some("exec") if arguments.iter().any(|argument| argument == "ps") => {
-                    if self
-                        .containers_unreadable
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        return output(1, "Cannot connect to the Docker daemon");
-                    }
-                    let all = arguments.iter().any(|argument| argument == "--all");
-                    let filtered = arguments.iter().any(|argument| argument == "--filter");
-                    // Running containers: listed unless a status filter
-                    // leaves `running` out.
-                    let mut ids = if !filtered
-                        || arguments
-                            .iter()
-                            .any(|argument| argument == "status=running")
-                    {
-                        self.containers.lock().unwrap().clone().unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    // Moby foldFilter sets All=true for any status filter:
-                    // https://github.com/moby/moby/blob/v28.5.2/daemon/list.go
-                    let status_filtered = arguments
-                        .windows(2)
-                        .any(|pair| pair[0] == "--filter" && pair[1].starts_with("status="));
-                    if (all || status_filtered)
-                        && (!filtered
-                            || arguments
-                                .iter()
-                                .any(|argument| argument == "status=created"))
-                    {
-                        ids.extend(self.created_containers.lock().unwrap().iter().cloned());
-                    }
-                    if all && !filtered {
-                        ids.extend(self.exited.lock().unwrap().iter().cloned());
-                    }
-                    for (state, id) in self.review_states.lock().unwrap().iter() {
-                        let wanted = format!("status={state}");
-                        let selected = if filtered {
-                            arguments
-                                .windows(2)
-                                .any(|pair| pair == ["--filter", &wanted])
-                        } else {
-                            all || matches!(*state, "running" | "restarting" | "paused")
-                        };
-                        if selected {
-                            ids.push(id.clone());
-                        }
-                    }
-                    if let Some(hook) = self.review_after_ps.lock().unwrap().take() {
-                        hook();
-                    }
-                    Ok(CommandOutput {
-                        exit_code: Some(0),
-                        stdout: ids.join("\n").into_bytes(),
-                        stderr: Vec::new(),
-                    })
+                    self.docker_ps(&arguments)
                 }
                 _ => Err(io::Error::other(format!(
                     "unexpected stock call {arguments:?}"
@@ -1118,12 +1136,74 @@ mod tests {
         assert_eq!(lab.stock.listed(), NONE);
     }
 
-    #[allow(clippy::too_many_lines)] // One store scenario: worker, jobs, quarantine, reset.
+    /// Register a Ready worker for `vm`, of Kit `kit_ref`, serving `command`.
+    fn ready_worker(store: &DaemonStore, vm: &str, kit_ref: &str, command: &str) {
+        store
+            .register_worker(marsh_daemon::WorkerStatus {
+                worker_id: vm.to_owned(),
+                vm_id: vm.to_owned(),
+                scope_id: store.status(None).scope_id,
+                kit_ref: kit_ref.to_owned(),
+                kits: vec![command.into()],
+                warm: true,
+                health: marsh_daemon::WorkerHealth::Ready,
+                container_capacity: 8,
+                active_container_ids: vec![],
+                quarantine: None,
+            })
+            .unwrap();
+    }
+
+    /// A job of `command` (Kit `kit_ref`) in `session`, reserved on `vm`
+    /// and running there in `container`.
+    fn running_job(
+        store: &DaemonStore,
+        session: &str,
+        vm: &str,
+        (command, kit_ref): (&str, &str),
+        container: &str,
+    ) -> String {
+        let (job, _) = store
+            .begin_job(marsh_daemon::NewJob {
+                label: None,
+                session_id: session.to_owned(),
+                command: command.into(),
+                kit_ref: kit_ref.to_owned(),
+                workload_image: kit_ref.to_owned(),
+                mounts: vec![],
+            })
+            .unwrap();
+        store.reserve_worker(&job, vm, vm).unwrap();
+        store.mark_running(&job, vm, vm, container).unwrap();
+        job
+    }
+
+    /// End `job` with `execution` and exit `code` (`cause`), its cleanup
+    /// uncertain.
+    fn finish_uncertain(
+        store: &DaemonStore,
+        job: &str,
+        execution: marsh_contracts::execution::ExecutionOutcome,
+        (code, cause): (i32, &str),
+    ) {
+        store
+            .finish_job_with_execution(
+                job,
+                execution,
+                marsh_daemon::ExitStatus {
+                    code: Some(code),
+                    cause: cause.into(),
+                },
+                false,
+                marsh_daemon::CleanupState::Uncertain,
+                marsh_daemon::TimingReport::default(),
+            )
+            .unwrap();
+    }
+
     fn reset_with_a_quarantined_job(complete: bool, named: bool) {
-        use marsh_daemon::{
-            CleanupState, ExitStatus, NewJob, SessionAuthority, TimingReport, WorkerHealth,
-            WorkerStatus,
-        };
+        use marsh_contracts::execution::ExecutionOutcome;
+        use marsh_daemon::SessionAuthority;
         let lab = Lab::new();
         if named {
             lab.register("hf", &reference('c'));
@@ -1142,20 +1222,7 @@ mod tests {
         lab.stock.seed(&idle);
         lab.backend.sbx.stock_inventory(true).unwrap();
         let store = lab.store();
-        store
-            .register_worker(WorkerStatus {
-                worker_id: vm.clone(),
-                vm_id: vm.clone(),
-                scope_id: store.status(None).scope_id,
-                kit_ref: reference('c'),
-                kits: vec!["hf".into()],
-                warm: true,
-                health: WorkerHealth::Ready,
-                container_capacity: 8,
-                active_container_ids: vec![],
-                quarantine: None,
-            })
-            .unwrap();
+        ready_worker(store, &vm, &reference('c'), "hf");
         let session = store.attach_shell(
             1,
             SessionAuthority {
@@ -1168,68 +1235,23 @@ mod tests {
                 ephemeral_home: false,
             },
         );
-        let (job, _) = store
-            .begin_job(NewJob {
-                label: None,
-                session_id: session.clone(),
-                command: "hf".into(),
-                kit_ref: reference('c'),
-                workload_image: reference('c'),
-                mounts: vec![],
-            })
-            .unwrap();
-        store.reserve_worker(&job, &vm, &vm).unwrap();
-        store.mark_running(&job, &vm, &vm, &"a".repeat(64)).unwrap();
+        let hf = ("hf", reference('c'));
+        let job = running_job(store, &session, &vm, (hf.0, &hf.1), &"a".repeat(64));
         if named && !complete {
             // One concurrent job fails cleanup and quarantines the whole VM;
             // the first job is still running on it.
-            let (sibling, _) = store
-                .begin_job(NewJob {
-                    label: None,
-                    session_id: session,
-                    command: "hf".into(),
-                    kit_ref: reference('c'),
-                    workload_image: reference('c'),
-                    mounts: vec![],
-                })
-                .unwrap();
-            store.reserve_worker(&sibling, &vm, &vm).unwrap();
-            store
-                .mark_running(&sibling, &vm, &vm, &"b".repeat(64))
-                .unwrap();
+            let sibling = running_job(store, &session, &vm, (hf.0, &hf.1), &"b".repeat(64));
             // It exited (observed); only its container's removal failed.
-            store
-                .finish_job_with_execution(
-                    &sibling,
-                    marsh_contracts::execution::ExecutionOutcome::Exited { code: 0 },
-                    ExitStatus {
-                        code: Some(0),
-                        cause: "cleanup_failed".into(),
-                    },
-                    false,
-                    CleanupState::Uncertain,
-                    TimingReport::default(),
-                )
-                .unwrap();
+            let exited = ExecutionOutcome::Exited { code: 0 };
+            finish_uncertain(store, &sibling, exited, (0, "cleanup_failed"));
         }
         if complete {
             // A known exit: only the removal of its container is uncertain.
             // Nothing can verify the VM (its Docker cannot be read): the
             // release rests on the exit alone.
             lab.stock.containers_unreadable();
-            store
-                .finish_job_with_execution(
-                    &job,
-                    marsh_contracts::execution::ExecutionOutcome::Exited { code: 1 },
-                    ExitStatus {
-                        code: Some(1),
-                        cause: "cleanup_failed".into(),
-                    },
-                    false,
-                    CleanupState::Uncertain,
-                    TimingReport::default(),
-                )
-                .unwrap();
+            let exited = ExecutionOutcome::Exited { code: 1 };
+            finish_uncertain(store, &job, exited, (1, "cleanup_failed"));
         }
         store
             .quarantine_worker(&vm, "container may still run")
@@ -2095,10 +2117,12 @@ mod tests {
         review_v2e_ephemeral_close_fixture(true);
     }
 
-    #[allow(clippy::too_many_lines, clippy::similar_names)] // One ephemeral session scenario.
-    fn review_v2e_ephemeral_close_fixture(lost: bool) {
-        let mut lab = Lab::new();
-        let lease = lab.backend.sbx.allocate_ephemeral_home().unwrap();
+    /// Attach a private-home shell session in `lease` through the daemon's
+    /// public request: its id and spec.
+    fn attach_ephemeral_session(
+        lab: &mut Lab,
+        lease: &marsh_sbx::EphemeralHomeLease,
+    ) -> (String, marsh_daemon::SessionSpec) {
         let token = lease.token();
         lab.store = None;
         let server = marsh_daemon::Server::bind(lab.home.path())
@@ -2140,6 +2164,14 @@ mod tests {
             terminal: false,
             terminal_size: None,
         };
+        (session_id, session)
+    }
+
+    #[allow(clippy::similar_names)] // One ephemeral session scenario.
+    fn review_v2e_ephemeral_close_fixture(lost: bool) {
+        let mut lab = Lab::new();
+        let lease = lab.backend.sbx.allocate_ephemeral_home().unwrap();
+        let (session_id, session) = attach_ephemeral_session(&mut lab, &lease);
         for digit in ['c', 'd'] {
             lab.register(&digit.to_string(), &reference(digit));
             let spec = lab
@@ -2165,47 +2197,11 @@ mod tests {
                 .kit_spec_for_session("d", &session, lab.store())
                 .unwrap();
             let store = lab.store();
-            store
-                .register_worker(marsh_daemon::WorkerStatus {
-                    worker_id: spec.name.clone(),
-                    vm_id: spec.name.clone(),
-                    scope_id: store.status(None).scope_id,
-                    kit_ref: reference('d'),
-                    kits: vec!["d".into()],
-                    warm: true,
-                    health: marsh_daemon::WorkerHealth::Ready,
-                    container_capacity: 8,
-                    active_container_ids: vec![],
-                    quarantine: None,
-                })
-                .unwrap();
-            let (job, _) = store
-                .begin_job(marsh_daemon::NewJob {
-                    label: None,
-                    session_id: session_id.clone(),
-                    command: "d".into(),
-                    kit_ref: reference('d'),
-                    workload_image: reference('d'),
-                    mounts: vec![],
-                })
-                .unwrap();
-            store.reserve_worker(&job, &spec.name, &spec.name).unwrap();
-            store
-                .mark_running(&job, &spec.name, &spec.name, &"a".repeat(64))
-                .unwrap();
-            store
-                .finish_job_with_execution(
-                    &job,
-                    marsh_contracts::execution::ExecutionOutcome::Unknown,
-                    marsh_daemon::ExitStatus {
-                        code: Some(125),
-                        cause: "transport_lost".into(),
-                    },
-                    false,
-                    marsh_daemon::CleanupState::Uncertain,
-                    marsh_daemon::TimingReport::default(),
-                )
-                .unwrap();
+            ready_worker(store, &spec.name, &reference('d'), "d");
+            let kit = reference('d');
+            let job = running_job(store, &session_id, &spec.name, ("d", &kit), &"a".repeat(64));
+            let unknown = marsh_contracts::execution::ExecutionOutcome::Unknown;
+            finish_uncertain(store, &job, unknown, (125, "transport_lost"));
             lab.stock.run_containers(&["a".repeat(64)]);
             lease.close_admission().unwrap();
             let closed = lab.backend.close_ephemeral_kits(&session_id, store);

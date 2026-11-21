@@ -189,6 +189,20 @@ To clear it yourself, run `marsh workers reset KIT`, using the Kit name in the
 message, or `marsh workers reset all` to retire every Kit VM this scope owns
 that is idle or quarantined.
 
+A job marsh knows ended (it exited, hit a limit, or failed to start) and whose
+container's removal is merely uncertain never holds the VM: `marsh workers
+reset KIT` removes it at once. A job marsh lost track of while it ran (the
+connection to the VM was lost, or the daemon restarted under it) may still be
+running, so `marsh workers reset KIT`, like the automatic retirement, first
+checks the VM afresh, and removes it only when it is stopped or gone or its
+Docker lists no running container. If it cannot verify that (a container still
+runs, or `sbx` cannot reach the VM), it removes nothing and names the jobs that
+may still run. Wait for them and try again, or run `marsh stop --force`: it
+removes the VM anyway, ending whatever still runs there. A plain `marsh stop` or
+`marsh reset` keeps such a VM and reports it as cleanup uncertain. So no
+quarantine is permanent: it ends on its own once nothing runs, or with
+`marsh stop --force`. `marsh workers reset all` skips such a VM.
+
 For a `marsh kit install NAME` that failed, use the name it was given:
 `marsh workers reset NAME` removes the VM its create left. That works after a
 daemon restart too, and for a create that lands after the install gave up:
@@ -202,8 +216,8 @@ names, a VM it must not remove (a job runs on it, a job's cleanup is not
 verified, another VM holds its name, or a live private-home session uses it),
 and removes the others. `marsh workers reset all` also skips a quarantined VM that
 still holds pins of shell sessions that have ended (`marsh workers reset KIT`
-clears it). No reset removes a VM a job is still running on, even a
-quarantined one; a reset that waits more than 30 seconds for a Kit that is
+clears it). No reset removes a VM a job is still running on, or may
+still be running on, even a quarantined one; a reset that waits more than 30 seconds for a Kit that is
 busy (a job starting, a recovery, a Kit change) stops, removes nothing, and
 names that Kit.
 

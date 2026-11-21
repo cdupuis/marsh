@@ -197,7 +197,9 @@ impl StockDaemonBackend {
         spec: Option<&KitVmSpec>,
     ) -> Result<(), DaemonError> {
         if let Some(spec) = spec {
-            let claim = Self::claim_retirement(store, vec![vm.to_owned()])?;
+            // The caller verified that no container runs on it.
+            let verified = BTreeSet::from([vm.to_owned()]);
+            let claim = Self::claim_retirement(store, vec![vm.to_owned()], &verified)?;
             return self.retire_claimed(
                 store,
                 &BTreeMap::from([(vm.to_owned(), spec.clone())]),
@@ -218,7 +220,10 @@ impl StockDaemonBackend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(vm);
-        if store.begin_workers_reset(&[vm.to_owned()]).is_ok() {
+        if store
+            .begin_verified_workers_reset(&[vm.to_owned()], &BTreeSet::from([vm.to_owned()]))
+            .is_ok()
+        {
             store.finish_worker_reset(vm, true)?;
         }
         Ok(())

@@ -1680,6 +1680,177 @@ fn worker_reset_refuses_active_selection_atomically_and_preserves_other_state() 
     assert_eq!(store.job(&job).unwrap().state, JobState::Cancelled);
 }
 
+/// Claude's round 4: the operator claim judges a job that ended with its
+/// cleanup uncertain by its typed execution. `Unknown` and
+/// `SupervisionFailed` are no proof it ended (refused unless the VM was verified to run no
+/// container); a known exit, a limit, a setup failure or no start are.
+/// Fails when `SupervisionFailed` counts as ended, or the execution is ignored.
+#[test]
+fn the_operator_claim_judges_an_ended_job_by_its_execution() {
+    use marsh_contracts::execution::{ResourceLimit, SetupStage};
+    let cases = [
+        (ExecutionOutcome::Unknown, false),
+        (ExecutionOutcome::SupervisionFailed, false),
+        (ExecutionOutcome::Exited { code: 3 }, true),
+        (
+            ExecutionOutcome::LimitExceeded {
+                resource: ResourceLimit::Memory,
+            },
+            true,
+        ),
+        (
+            ExecutionOutcome::SetupFailed {
+                stage: SetupStage::Start,
+            },
+            true,
+        ),
+        (ExecutionOutcome::NotStarted, true),
+    ];
+    for (execution, ended) in cases {
+        let home = home();
+        let store = reopen(home.path()).unwrap();
+        let session = store.attach_shell(1, authority("/Users/example/project", home.path()));
+        store
+            .register_worker(WorkerStatus {
+                worker_id: "target".into(),
+                vm_id: "target".into(),
+                scope_id: store.status(None).scope_id,
+                kit_ref: "kit:test".into(),
+                kits: vec![],
+                warm: true,
+                health: WorkerHealth::Ready,
+                container_capacity: 8,
+                active_container_ids: vec![],
+                quarantine: None,
+            })
+            .unwrap();
+        let (job, _) = store
+            .begin_job(NewJob {
+                label: None,
+                session_id: session,
+                command: "hf".into(),
+                kit_ref: "kit:test".into(),
+                workload_image: format!("fixture@sha256:{}", "a".repeat(64)),
+                mounts: vec![],
+            })
+            .unwrap();
+        store.reserve_worker(&job, "target", "target").unwrap();
+        store
+            .mark_running(&job, "target", "target", &"a".repeat(64))
+            .unwrap();
+        store
+            .finish_job_with_execution(
+                &job,
+                execution.clone(),
+                ExitStatus {
+                    code: Some(125),
+                    cause: "probe".into(),
+                },
+                false,
+                CleanupState::Uncertain,
+                TimingReport::default(),
+            )
+            .unwrap();
+        let selected = vec!["target".to_owned()];
+        assert_eq!(
+            store.jobs_whose_execution_may_run("target").is_empty(),
+            ended,
+            "{execution:?}"
+        );
+        let claimed = store.begin_workers_reset(&selected);
+        assert_eq!(claimed.is_ok(), ended, "{execution:?}: {claimed:?}");
+        if !ended {
+            let verified = selected.iter().cloned().collect();
+            store
+                .begin_verified_workers_reset(&selected, &verified)
+                .unwrap();
+        }
+    }
+}
+
+/// GPT's round 4 (Claude's nit: Queued and Detached load-bearing): every
+/// claim refuses a VM with a queued, running or detached job, registered
+/// worker or not, verified or not, and claims no other VM.
+#[test]
+fn review_v2d_claims_refuse_queued_running_detached_even_without_worker_registration() {
+    for job_state in [JobState::Queued, JobState::Running, JobState::Detached] {
+        for registered in [true, false] {
+            let home = home();
+            let store = reopen(home.path()).unwrap();
+            let session = store.attach_shell(1, authority("/Users/example/project", home.path()));
+            for worker in ["idle", "target"] {
+                store
+                    .register_worker(WorkerStatus {
+                        worker_id: worker.into(),
+                        vm_id: worker.into(),
+                        scope_id: store.status(None).scope_id,
+                        kit_ref: "kit:test".into(),
+                        kits: vec![],
+                        warm: true,
+                        health: WorkerHealth::Ready,
+                        container_capacity: 8,
+                        active_container_ids: vec![],
+                        quarantine: None,
+                    })
+                    .unwrap();
+            }
+            let (job, _) = store
+                .begin_job(NewJob {
+                    label: None,
+                    session_id: session,
+                    command: "hf".into(),
+                    kit_ref: "kit:test".into(),
+                    workload_image: format!("fixture@sha256:{}", "a".repeat(64)),
+                    mounts: vec![],
+                })
+                .unwrap();
+            store.reserve_worker(&job, "target", "target").unwrap();
+            if job_state != JobState::Queued {
+                store
+                    .mark_running(&job, "target", "target", &"a".repeat(64))
+                    .unwrap();
+            }
+            store
+                .quarantine_worker("target", "sibling cleanup uncertain")
+                .unwrap();
+            {
+                let mut state = store.lock();
+                state.jobs.get_mut(&job).unwrap().state = job_state;
+                // Exercise recorded jobs alone, without reservation/container guards.
+                state.reservations.clear();
+                state
+                    .workers
+                    .get_mut("target")
+                    .unwrap()
+                    .active_container_ids
+                    .clear();
+                if !registered {
+                    state.workers.remove("target");
+                }
+            }
+            let selected = vec!["idle".into(), "target".into()];
+            assert!(
+                store.begin_workers_reset(&selected).is_err(),
+                "{job_state:?}, registered={registered}"
+            );
+            assert_eq!(store.lock().workers["idle"].health, WorkerHealth::Ready);
+            // A verification that no container runs releases only a job whose
+            // execution is unknown, never one the daemon still runs.
+            let verified = selected.iter().cloned().collect();
+            assert!(
+                store
+                    .begin_verified_workers_reset(&selected, &verified)
+                    .is_err(),
+                "{job_state:?}, registered={registered}"
+            );
+            assert_eq!(store.lock().workers["idle"].health, WorkerHealth::Ready);
+            assert!(store.begin_settled_workers_reset(&selected).is_err());
+            assert_eq!(store.lock().workers["idle"].health, WorkerHealth::Ready);
+            assert!(store.begin_automatic_retire("target").is_err());
+        }
+    }
+}
+
 /// Garbage collection and drained Kit changes claim a VM only when nothing
 /// recorded can still run there; unlike an operator reset they never take a
 /// quarantined worker (whose containers are cleanup-uncertain).
@@ -5005,6 +5176,8 @@ struct BlockingLifecycleBackend {
 #[derive(Debug, Default)]
 struct DeadlineRecordingBackend {
     deadline: Mutex<Option<Instant>>,
+    /// `DaemonStore::forced_stop_active` in each teardown.
+    forced: Mutex<Vec<bool>>,
 }
 
 impl DaemonBackend for DeadlineRecordingBackend {
@@ -5015,10 +5188,11 @@ impl DaemonBackend for DeadlineRecordingBackend {
     fn teardown_scope(
         &self,
         action: ScopeLifecycleAction,
-        _store: DaemonStore,
+        store: DaemonStore,
         deadline: Instant,
     ) -> ScopeLifecycleReport {
         *self.deadline.lock().unwrap() = Some(deadline);
+        self.forced.lock().unwrap().push(store.forced_stop_active());
         ScopeLifecycleReport {
             action,
             cleanup_complete: false,
@@ -5062,6 +5236,30 @@ impl DaemonBackend for DeadlineRecordingBackend {
     ) -> Result<(), DaemonError> {
         unreachable!()
     }
+}
+
+/// Only `marsh stop --force`'s teardown is told it is forced (the override
+/// that removes a VM a lost job may still run on), and only while it runs.
+/// Fails when the flag is never set, or outlives the forced stop.
+#[test]
+fn only_the_forced_stops_teardown_is_forced() {
+    let home = home();
+    let backend = Arc::new(DeadlineRecordingBackend::default());
+    let server = Arc::new(
+        Server::bind(home.path())
+            .unwrap()
+            .with_backend(backend.clone()),
+    );
+    let (stop, task) = start_server(Arc::clone(&server));
+    let client = Client::connect(home.path()).unwrap();
+    client.reset_scope().unwrap();
+    client
+        .scope_lifecycle_with_timeout(PublicRequest::ForceStopScope, PATIENCE)
+        .unwrap();
+    client.reset_scope().unwrap();
+    assert_eq!(*backend.forced.lock().unwrap(), [false, true, false]);
+    stop.store(true, Ordering::Relaxed);
+    task.join().unwrap();
 }
 
 /// The daemon gives teardown one absolute deadline (its configured lifecycle

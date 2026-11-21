@@ -2235,6 +2235,19 @@ impl StockSbx {
         &self,
         deadline: Instant,
     ) -> Result<Vec<String>, SbxError> {
+        self.reset_stale_scope_kit_vms_keeping_before(deadline, &BTreeSet::new())
+    }
+
+    /// [`Self::reset_stale_scope_kit_vms_before`], leaving the VMs of `keep`
+    /// (a teardown keeps a VM a lost job may still run on).
+    ///
+    /// # Errors
+    /// As [`Self::reset_stale_scope_kit_vms_before`].
+    pub fn reset_stale_scope_kit_vms_keeping_before(
+        &self,
+        deadline: Instant,
+        keep: &BTreeSet<String>,
+    ) -> Result<Vec<String>, SbxError> {
         if Instant::now() >= deadline {
             return Err(SbxError::LifecycleDeadline {
                 operation: "list scope Kit VMs for reset",
@@ -2254,6 +2267,9 @@ impl StockSbx {
             if view.get(&vm).is_none() {
                 self.ownership
                     .forget_absent(&vm, observed.get(&vm).map(String::as_str))?;
+                continue;
+            }
+            if keep.contains(&vm) {
                 continue;
             }
             self.reset_stale_scope_kit_vm_candidate(&vm, deadline)?;

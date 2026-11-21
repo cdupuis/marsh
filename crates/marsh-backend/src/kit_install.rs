@@ -105,6 +105,8 @@ struct ResetPlan {
     targets: BTreeMap<String, String>,
     /// What the reply names.
     selected: Vec<String>,
+    /// Ownership key -> the Kit names (as typed) that need it.
+    names: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl StockDaemonBackend {
@@ -164,7 +166,9 @@ impl StockDaemonBackend {
         let deadline = std::time::Instant::now() + wait;
         for _ in 0..RESET_PLAN_ROUNDS {
             // The candidate Kits, found without assigning a name.
-            let keys = self.plan_reset(selection)?.keys;
+            let ResetPlan {
+                keys, names: kits, ..
+            } = self.plan_reset(selection)?;
             #[cfg(test)]
             if let Some(hook) = self
                 .reset_before_locks
@@ -190,7 +194,11 @@ impl StockDaemonBackend {
                     break None;
                 }
                 if std::time::Instant::now() >= deadline {
-                    let kit = keys.iter().nth(busy).cloned().unwrap_or_default();
+                    let key = keys.iter().nth(busy).cloned().unwrap_or_default();
+                    // The Kit as the user typed it, not its image reference.
+                    let kit = kits.get(&key).map_or(key, |names| {
+                        names.iter().cloned().collect::<Vec<_>>().join(", ")
+                    });
                     return Err(DaemonError::InvalidState(format!(
                         "the reset waited {} s for Kit {kit}, which a job's preparation, a recovery, a Kit change or garbage collection kept busy; nothing was removed, try again",
                         wait.as_secs()
@@ -220,7 +228,7 @@ impl StockDaemonBackend {
                     .into_iter()
                     .map(|(name, _, _)| name),
             );
-            let mut reply = plan.selected;
+            let mut reply = plan.selected.clone();
             let may_land = if matches!(selection, LoadSelection::All) {
                 // One target at a time: a busy one is skipped and reported,
                 // never retired, and the others still go.
@@ -244,7 +252,16 @@ impl StockDaemonBackend {
                 }
                 may_land
             } else {
-                let claim = Self::claim_retirement(store, plan.targets.keys().cloned().collect())?;
+                // A job whose execution is unknown (a restart lost it, or its
+                // executor could not read it) may still run: the VM goes only
+                // once a fresh look, under its Kit lock, finds no container
+                // running there (`KitInstall.tla` `releaseUnknown`).
+                let verified = self.verify_unknown_executions(store, &plan)?;
+                let claim = Self::claim_retirement(
+                    store,
+                    plan.targets.keys().cloned().collect(),
+                    &verified,
+                )?;
                 self.retire_claimed_named(store, &plan.targets, &claim)?
             };
             reply.extend(may_land.into_iter().filter(|vm| submitted.contains(vm)).map(|vm| {
@@ -255,6 +272,40 @@ impl StockDaemonBackend {
         Err(DaemonError::InvalidState(
             "the Kit VMs to reset kept changing while the reset waited for them; nothing was removed, try again".into(),
         ))
+    }
+
+    /// The targets of `plan` with a job whose execution is unknown on which
+    /// no container runs (`MarshSbx::verify_no_running_containers`: the VM
+    /// is gone or stopped, or its Docker lists none). Refuses, naming the
+    /// jobs, when that cannot be verified for one of them.
+    fn verify_unknown_executions(
+        &self,
+        store: &DaemonStore,
+        plan: &ResetPlan,
+    ) -> Result<BTreeSet<String>, DaemonError> {
+        let mut verified = BTreeSet::new();
+        for (name, owner) in &plan.targets {
+            let jobs = store.jobs_whose_execution_may_run(name);
+            if jobs.is_empty() {
+                continue;
+            }
+            match self.sbx.verify_no_running_containers(name) {
+                Ok(_) => {
+                    verified.insert(name.clone());
+                }
+                Err(why) => {
+                    let kit = plan.names.get(owner).map_or_else(
+                        || name.clone(),
+                        |names| names.iter().cloned().collect::<Vec<_>>().join(", "),
+                    );
+                    return Err(DaemonError::InvalidState(format!(
+                        "{kit}: job {} may still be running on its VM {name} (marsh lost track of its execution), and marsh could not verify that nothing runs there: {why}; nothing was removed. marsh retires the VM on its own once it verifies that; `marsh stop --force` removes it now, ending whatever still runs there",
+                        jobs.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok(verified)
     }
 
     /// What a reset of `selection` removes now (`KitInstall.tla`, rule 7):
@@ -279,6 +330,10 @@ impl StockDaemonBackend {
             if let Some(name) = self.sbx.recorded_vm_name(VmPurpose::Kit, &owner) {
                 plan.targets.insert(name, owner.clone());
             }
+            plan.names
+                .entry(owner.clone())
+                .or_default()
+                .insert(command.to_owned());
             plan.keys.insert(owner);
             Ok(())
         };
@@ -303,6 +358,10 @@ impl StockDaemonBackend {
                             continue;
                         }
                         plan.targets.insert(name.clone(), owner.clone());
+                        plan.names
+                            .entry(owner.clone())
+                            .or_default()
+                            .insert(command.clone());
                         plan.keys.insert(owner.clone());
                         found = true;
                     }
@@ -418,6 +477,10 @@ mod tests {
         hanging: std::sync::atomic::AtomicBool,
         stopped: Mutex<std::collections::BTreeSet<String>>,
         review_registry_image: Mutex<Option<String>>,
+        /// Container ids `docker ps` lists in every running VM; `None`:
+        /// `docker ps` fails (the VM's Docker cannot be read).
+        containers: Mutex<Option<Vec<String>>>,
+        containers_unreadable: std::sync::atomic::AtomicBool,
     }
 
     #[allow(clippy::unnecessary_wraps)] // A stock call's reply.
@@ -470,6 +533,17 @@ mod tests {
         /// Someone else's VM replaces the one listed under `name` (a new id).
         pub(super) fn replace(&self, name: &str) {
             self.land(name);
+        }
+
+        /// `docker ps` in a running VM lists `ids`.
+        pub(super) fn run_containers(&self, ids: &[String]) {
+            *self.containers.lock().unwrap() = Some(ids.to_vec());
+        }
+
+        /// `docker ps` in a running VM fails.
+        pub(super) fn containers_unreadable(&self) {
+            self.containers_unreadable
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         /// A stopped VM appears under `name`.
@@ -606,7 +680,20 @@ mod tests {
                     output(0, "")
                 }
                 Some("stop") => output(0, ""),
-                Some("exec") if arguments.iter().any(|argument| argument == "ps") => output(0, ""),
+                Some("exec") if arguments.iter().any(|argument| argument == "ps") => {
+                    if self
+                        .containers_unreadable
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return output(1, "Cannot connect to the Docker daemon");
+                    }
+                    let ids = self.containers.lock().unwrap().clone().unwrap_or_default();
+                    Ok(CommandOutput {
+                        exit_code: Some(0),
+                        stdout: ids.join("\n").into_bytes(),
+                        stderr: Vec::new(),
+                    })
+                }
                 _ => Err(io::Error::other(format!(
                     "unexpected stock call {arguments:?}"
                 ))),
@@ -1022,11 +1109,13 @@ mod tests {
             store
                 .mark_running(&sibling, &vm, &vm, &"b".repeat(64))
                 .unwrap();
+            // It exited (observed); only its container's removal failed.
             store
-                .finish_job(
+                .finish_job_with_execution(
                     &sibling,
+                    marsh_contracts::execution::ExecutionOutcome::Exited { code: 0 },
                     ExitStatus {
-                        code: Some(125),
+                        code: Some(0),
                         cause: "cleanup_failed".into(),
                     },
                     false,
@@ -1036,12 +1125,17 @@ mod tests {
                 .unwrap();
         }
         if complete {
+            // A known exit: only the removal of its container is uncertain.
+            // Nothing can verify the VM (its Docker cannot be read): the
+            // release rests on the exit alone.
+            lab.stock.containers_unreadable();
             store
-                .finish_job(
+                .finish_job_with_execution(
                     &job,
+                    marsh_contracts::execution::ExecutionOutcome::Exited { code: 1 },
                     ExitStatus {
-                        code: Some(125),
-                        cause: "worker_start_ambiguous".into(),
+                        code: Some(1),
+                        cause: "cleanup_failed".into(),
                     },
                     false,
                     CleanupState::Uncertain,
@@ -2451,9 +2545,259 @@ mod tests {
         assert!(finished.is_ok(), "the reset outwaited its deadline");
         let refused = refused.unwrap_err().to_string();
         assert!(
-            refused.contains(&reference('c')) && refused.contains("nothing was removed"),
+            refused.contains("for Kit g,")
+                && !refused.contains(&reference('c'))
+                && refused.contains("nothing was removed"),
             "{refused}"
         );
         assert_eq!(lab.stock.listed(), std::slice::from_ref(&vm));
+    }
+
+    /// GPT's round 4 (with Claude's): a job a daemon restart lost (its
+    /// execution unknown, its container still running) keeps its VM from
+    /// reset NAME. Fails when the guard judges by job state.
+    #[test]
+    fn review_v2d_reset_name_preserves_restart_lost_live_job() {
+        review_v2d_unknown_job_reset(true, false, Live::Running);
+    }
+
+    /// GPT's round 4: an executor that could not read its job's status
+    /// (execution unknown) keeps its VM while a container runs there.
+    #[test]
+    fn review_v2d_reset_name_preserves_unreadable_execution() {
+        review_v2d_unknown_job_reset(false, false, Live::Running);
+    }
+
+    /// A known exit with uncertain cleanup is released, as documented.
+    #[test]
+    fn review_v2d_reset_name_releases_observed_exit_with_uncertain_cleanup() {
+        review_v2d_unknown_job_reset(false, true, Live::Running);
+    }
+
+    /// The clearing path: once a fresh look at the VM finds no container
+    /// running, reset NAME releases a VM a lost job was recorded on. Fails
+    /// when reset NAME does not verify (it refuses for ever).
+    #[test]
+    fn reset_name_releases_a_lost_job_once_no_container_runs() {
+        review_v2d_unknown_job_reset(true, true, Live::None);
+        review_v2d_unknown_job_reset(false, true, Live::None);
+    }
+
+    /// The VM's Docker cannot be read: nothing is verified, reset NAME
+    /// refuses, naming the job and `marsh stop --force`.
+    #[test]
+    fn reset_name_refuses_a_lost_job_it_cannot_verify() {
+        review_v2d_unknown_job_reset(true, false, Live::Unreadable);
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Live {
+        Running,
+        None,
+        Unreadable,
+    }
+
+    /// `exited`: with `restart`, whether the reset is expected to release.
+    fn review_v2d_unknown_job_reset(restart: bool, exited: bool, live: Live) {
+        let released = exited;
+        let (lab, vm, job) = lab_with_ended_job(restart, exited && live == Live::Running, live);
+        let reply = lab.reset(&["hf"]);
+        if released {
+            reply.unwrap();
+            assert!(lab.stock.removed().contains(&vm));
+        } else {
+            assert!(
+                lab.stock.listed().contains(&vm),
+                "reset NAME removed a VM without a terminal execution observation: restart={restart}, reply={reply:?}, removed={:?}",
+                lab.stock.removed()
+            );
+            let refused = reply.unwrap_err().to_string();
+            assert!(
+                refused.contains(&job) && refused.contains("marsh stop --force"),
+                "{refused}"
+            );
+        }
+    }
+
+    /// A Kit VM with one job that a restart lost (`restart`), or that ended
+    /// with a known exit (`exited`) or an unknown execution, its cleanup
+    /// uncertain; `live` says what `docker ps` in the VM finds. Returns the
+    /// lab, the VM and the job.
+    fn lab_with_ended_job(restart: bool, exited: bool, live: Live) -> (Lab, String, String) {
+        use marsh_contracts::execution::ExecutionOutcome;
+        use marsh_daemon::{
+            CleanupState, ExitStatus, JobState, NewJob, SessionAuthority, TimingReport,
+            WorkerHealth, WorkerStatus,
+        };
+        let mut lab = Lab::new();
+        lab.register("hf", &reference('c'));
+        let vm = lab
+            .backend
+            .sbx
+            .vm_name(marsh_sbx::VmPurpose::Kit, &reference('c'))
+            .unwrap();
+        lab.stock.seed(&vm);
+        lab.backend.sbx.stock_inventory(true).unwrap();
+        let store = lab.store();
+        store
+            .register_worker(WorkerStatus {
+                worker_id: vm.clone(),
+                vm_id: vm.clone(),
+                scope_id: store.status(None).scope_id,
+                kit_ref: reference('c'),
+                kits: vec!["hf".into()],
+                warm: true,
+                health: WorkerHealth::Ready,
+                container_capacity: 8,
+                active_container_ids: vec![],
+                quarantine: None,
+            })
+            .unwrap();
+        let session = store.attach_shell(
+            1,
+            SessionAuthority {
+                username: "alice".into(),
+                uid: 501,
+                gid: 20,
+                launch_directory: lab.home.path().into(),
+                guest_home: "/Users/alice".into(),
+                home_backing: lab.home.path().into(),
+                ephemeral_home: false,
+            },
+        );
+        let (job, _) = store
+            .begin_job(NewJob {
+                label: None,
+                session_id: session,
+                command: "hf".into(),
+                kit_ref: reference('c'),
+                workload_image: reference('c'),
+                mounts: vec![],
+            })
+            .unwrap();
+        store.reserve_worker(&job, &vm, &vm).unwrap();
+        store.mark_running(&job, &vm, &vm, &"a".repeat(64)).unwrap();
+        match live {
+            Live::Running => lab.stock.run_containers(&["a".repeat(64)]),
+            Live::None => lab.stock.run_containers(&[]),
+            Live::Unreadable => lab.stock.containers_unreadable(),
+        }
+        if restart {
+            // No exit or container-stop observation: only daemon memory dies.
+            lab.restart();
+            lab.register("hf", &reference('c'));
+        } else {
+            store
+                .finish_job_with_execution(
+                    &job,
+                    if exited {
+                        ExecutionOutcome::Exited { code: 0 }
+                    } else {
+                        ExecutionOutcome::Unknown
+                    },
+                    ExitStatus {
+                        code: Some(if exited { 0 } else { 125 }),
+                        cause: "review_probe".into(),
+                    },
+                    exited,
+                    CleanupState::Uncertain,
+                    TimingReport::default(),
+                )
+                .unwrap();
+        }
+        let receipt = lab.store().job(&job).unwrap();
+        assert_eq!(receipt.state, JobState::Unknown);
+        if !exited {
+            assert_eq!(receipt.execution, ExecutionOutcome::Unknown);
+        }
+        assert_eq!(receipt.cleanup, CleanupState::Uncertain);
+        assert!(receipt.finished_unix_ms.is_some());
+        assert_eq!(
+            receipt.execution,
+            if exited {
+                ExecutionOutcome::Exited { code: 0 }
+            } else {
+                ExecutionOutcome::Unknown
+            }
+        );
+        (lab, vm, job)
+    }
+
+    /// A plain `marsh stop`/`marsh reset` keeps a VM a lost job's container
+    /// still runs on, naming the job and `marsh stop --force`; with nothing
+    /// running there it removes it. Fails when the teardown does not verify.
+    #[test]
+    fn a_plain_teardown_keeps_a_vm_a_lost_job_may_still_run_on() {
+        for live in [Live::Running, Live::Unreadable, Live::None] {
+            let (lab, vm, job) = lab_with_ended_job(true, false, live);
+            let report = lab.backend.teardown_scope(
+                marsh_daemon::ScopeLifecycleAction::Reset,
+                lab.store().clone(),
+                std::time::Instant::now() + Duration::from_secs(30),
+            );
+            if live == Live::None {
+                assert!(lab.stock.removed().contains(&vm), "{report:?}");
+                continue;
+            }
+            assert!(lab.stock.listed().contains(&vm), "{report:?}");
+            assert!(!report.cleanup_complete);
+            assert!(
+                report.components.iter().any(|component| {
+                    component.vm.as_deref() == Some(vm.as_str())
+                        && component.detail.as_deref().is_some_and(|detail| {
+                            detail.contains(&job) && detail.contains("marsh stop --force")
+                        })
+                }),
+                "{report:?}"
+            );
+        }
+    }
+
+    /// Automatic recovery clears a quarantine a job with an unknown
+    /// execution left once it verifies that no container runs on the VM,
+    /// and keeps it while one does: no such quarantine is permanent. Fails
+    /// when recovery's claim ignores its own verification.
+    #[test]
+    fn recovery_retires_a_lost_jobs_vm_once_no_container_runs() {
+        for live in [Live::None, Live::Running] {
+            let (lab, vm, _) = lab_with_ended_job(false, false, live);
+            lab.store()
+                .quarantine_worker(&vm, "the worker transport was lost")
+                .unwrap();
+            let recovered = lab.backend.recover_quarantined_vm(lab.store(), &vm);
+            if live == Live::None {
+                recovered.unwrap();
+                assert!(lab.stock.removed().contains(&vm));
+            } else {
+                assert!(recovered.unwrap_err().contains("still running"));
+                assert!(lab.stock.listed().contains(&vm));
+            }
+        }
+    }
+
+    /// `marsh stop --force` is the explicit override: its teardown keeps
+    /// a VM a lost job's container may run on in the claim, unverified.
+    #[test]
+    fn the_forced_teardown_removes_a_vm_a_lost_job_may_still_run_on() {
+        let (lab, vm, job) = lab_with_ended_job(true, false, Live::Unreadable);
+        let spec = lab.backend.kit_spec("hf").unwrap();
+        assert_eq!(spec.name, vm);
+        let mut by_vm = BTreeMap::from([(vm.clone(), (spec, vec!["hf".to_owned()]))]);
+        let mut components = Vec::new();
+        let verified = lab.backend.verify_unknown_executions_for_teardown(
+            lab.store(),
+            &mut by_vm,
+            &mut components,
+            true,
+        );
+        assert_eq!(verified, std::collections::BTreeSet::from([vm.clone()]));
+        assert!(
+            by_vm.contains_key(&vm) && components.is_empty(),
+            "{components:?}"
+        );
+        lab.store()
+            .begin_verified_workers_reset(std::slice::from_ref(&vm), &verified)
+            .unwrap();
+        assert_eq!(lab.store().jobs_whose_execution_may_run(&vm), [job]);
     }
 }

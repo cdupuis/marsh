@@ -2818,6 +2818,8 @@ struct State {
     ordinary_requests: BTreeMap<u64, String>,
     next_request: u64,
     lifecycle_active: bool,
+    /// The lifecycle transition under way is `marsh stop --force`.
+    forced_stop: bool,
     process: process::ProcessTable,
     /// Session of each running split shell branch -> (split, label): a Kit
     /// job it starts is that branch's child (`docs/design/processes.md` s9).
@@ -3043,6 +3045,7 @@ impl Drop for RequestAdmission {
         let mut state = self.store.lock();
         if self.lifecycle {
             state.lifecycle_active = false;
+            state.forced_stop = false;
         } else {
             state
                 .ordinary_requests
@@ -3162,6 +3165,7 @@ impl DaemonStore {
             ordinary_requests: BTreeMap::new(),
             next_request: 0,
             lifecycle_active: false,
+            forced_stop: false,
             branch_sessions: BTreeMap::new(),
             fenced_splits: std::collections::BTreeSet::new(),
             cancelled_splits: std::collections::BTreeSet::new(),
@@ -3359,11 +3363,20 @@ impl DaemonStore {
             return Err(DaemonError::InvalidState(BUSY_LIFECYCLE_MESSAGE.into()));
         }
         state.lifecycle_active = true;
+        state.forced_stop = true;
         Ok(RequestAdmission {
             store: self.clone(),
             lifecycle: true,
             id: 0,
         })
+    }
+
+    /// Whether the lifecycle transition under way is `marsh stop --force`:
+    /// its teardown removes a VM a job whose execution is unknown may still
+    /// run on (the explicit override, `KitInstall.tla` `StopEnd`).
+    #[must_use]
+    pub fn forced_stop_active(&self) -> bool {
+        self.lock().forced_stop
     }
 
     /// Wait until no request is in flight, or `deadline`: what is still in
@@ -3851,7 +3864,35 @@ impl DaemonStore {
     /// Atomically block admission to every selected worker before destructive
     /// lifecycle work. No worker is claimed if any selected worker is active.
     pub fn begin_workers_reset(&self, worker_ids: &[String]) -> Result<(), DaemonError> {
-        self.claim_workers_reset(worker_ids, false)
+        self.claim_workers_reset(worker_ids, false, &std::collections::BTreeSet::new())
+    }
+
+    /// [`Self::begin_workers_reset`] where the caller verified, under the
+    /// VM's Kit lock, that no container runs on each VM of `verified` (or
+    /// is `marsh stop --force`, which removes it anyway): a job recorded
+    /// there whose execution is unknown does not refuse it. A queued,
+    /// running or detached job, or a reservation, still does.
+    pub fn begin_verified_workers_reset(
+        &self,
+        worker_ids: &[String],
+        verified: &std::collections::BTreeSet<String>,
+    ) -> Result<(), DaemonError> {
+        self.claim_workers_reset(worker_ids, false, verified)
+    }
+
+    /// The jobs recorded on `vm` whose execution may still run although the
+    /// daemon is not running them ([`Self::execution_may_run`]): a restart
+    /// lost them, or their executor could not read their status. Only a
+    /// verification that no container runs there releases the VM.
+    #[must_use]
+    pub fn jobs_whose_execution_may_run(&self, vm: &str) -> Vec<String> {
+        let state = self.lock();
+        state
+            .jobs
+            .values()
+            .filter(|job| Self::recorded_on(job, vm) && Self::execution_may_run(job))
+            .map(|job| job.job_id.clone())
+            .collect()
     }
 
     /// [`Self::begin_workers_reset`] for a bulk reset (`marsh workers reset
@@ -3859,10 +3900,15 @@ impl DaemonStore {
     /// step it also refuses a VM any job of which is unfinished, or whose
     /// cleanup is pending or uncertain, registered worker or not.
     pub fn begin_settled_workers_reset(&self, worker_ids: &[String]) -> Result<(), DaemonError> {
-        self.claim_workers_reset(worker_ids, true)
+        self.claim_workers_reset(worker_ids, true, &std::collections::BTreeSet::new())
     }
 
-    fn claim_workers_reset(&self, worker_ids: &[String], settled: bool) -> Result<(), DaemonError> {
+    fn claim_workers_reset(
+        &self,
+        worker_ids: &[String],
+        settled: bool,
+        verified: &std::collections::BTreeSet<String>,
+    ) -> Result<(), DaemonError> {
         let mut state = self.lock();
         if settled
             && let Some(vm) = worker_ids.iter().find(|vm| {
@@ -3882,6 +3928,17 @@ impl DaemonStore {
                     "worker {worker_id} has a job that has not finished; wait for it before resetting"
                 )));
             }
+            if !verified.contains(worker_id)
+                && let Some(job) = state
+                    .jobs
+                    .values()
+                    .find(|job| Self::recorded_on(job, worker_id) && Self::execution_may_run(job))
+            {
+                return Err(DaemonError::InvalidState(format!(
+                    "worker {worker_id}: job {} may still be running there (its execution is unknown); nothing verified that no container runs on it",
+                    job.job_id
+                )));
+            }
             let Some(worker) = state.workers.get(worker_id) else {
                 continue;
             };
@@ -3898,6 +3955,10 @@ impl DaemonStore {
             let quarantined = worker.health == WorkerHealth::Quarantined;
             if reserved
                 || Self::job_running_on(&state, &worker.vm_id)
+                || (!verified.contains(worker_id)
+                    && state.jobs.values().any(|job| {
+                        Self::recorded_on(job, &worker.vm_id) && Self::execution_may_run(job)
+                    }))
                 || (!quarantined && !worker.active_container_ids.is_empty())
             {
                 return Err(DaemonError::InvalidState(format!(
@@ -3957,16 +4018,11 @@ impl DaemonStore {
         Ok(true)
     }
 
-    /// Whether a job recorded on `vm` is unfinished or its cleanup pending or
-    /// uncertain (a container of it may still run there).
-    /// Whether a job recorded on `vm` (worker or VM id) has not finished:
-    /// queued, running or detached. Its container may be live. A job that
-    /// ended, even with its cleanup uncertain, has: `finish_job` records
-    /// that as `Unknown` (as a restart does for a job it lost), and releasing
-    /// its VM is the operator's documented action.
+    /// Whether a job recorded on `vm` (worker or VM id) is queued, running
+    /// or detached: the daemon runs it, and its container may be live.
     fn job_running_on(state: &State, vm: &str) -> bool {
         state.jobs.values().any(|job| {
-            (job.worker_id.as_deref() == Some(vm) || job.vm_id.as_deref() == Some(vm))
+            Self::recorded_on(job, vm)
                 && matches!(
                     job.state,
                     JobState::Queued | JobState::Running | JobState::Detached
@@ -3974,6 +4030,32 @@ impl DaemonStore {
         })
     }
 
+    fn recorded_on(job: &JobReceipt, vm: &str) -> bool {
+        job.worker_id.as_deref() == Some(vm) || job.vm_id.as_deref() == Some(vm)
+    }
+
+    /// Whether `job`'s execution may still run, judged by its typed
+    /// execution, not its state: a restart records a job it lost as
+    /// `Unknown` with no exit observed, as an executor that could not read
+    /// its status does. Known to have ended: it never started, it exited, a
+    /// limit or its setup ended it, or its container was verified removed
+    /// (or it had none). `KitInstall.tla` `releaseUnknown`.
+    fn execution_may_run(job: &JobReceipt) -> bool {
+        let ended = matches!(
+            job.execution,
+            ExecutionOutcome::NotStarted
+                | ExecutionOutcome::Exited { .. }
+                | ExecutionOutcome::LimitExceeded { .. }
+                | ExecutionOutcome::SetupFailed { .. }
+        ) || matches!(
+            job.cleanup,
+            CleanupState::Verified | CleanupState::NotRequired
+        );
+        !ended
+    }
+
+    /// Whether a job recorded on `vm` is unfinished or its cleanup pending or
+    /// uncertain (a container of it may still run there).
     fn recorded_busy(state: &State, vm: &str) -> bool {
         state.jobs.values().any(|job| {
             (job.worker_id.as_deref() == Some(vm) || job.vm_id.as_deref() == Some(vm))

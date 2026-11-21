@@ -1047,7 +1047,11 @@ impl StockDaemonBackend {
         failed
     }
 
-    fn reset_stale_scope_components(&self, deadline: Instant) -> Vec<ScopeCleanupComponent> {
+    fn reset_stale_scope_components(
+        &self,
+        deadline: Instant,
+        keep: &BTreeSet<String>,
+    ) -> Vec<ScopeCleanupComponent> {
         let component = |state, vm, detail| ScopeCleanupComponent {
             kind: "kit".into(),
             label: "stale-generations".into(),
@@ -1055,7 +1059,10 @@ impl StockDaemonBackend {
             vm,
             detail,
         };
-        match self.sbx.reset_stale_scope_kit_vms_before(deadline) {
+        match self
+            .sbx
+            .reset_stale_scope_kit_vms_keeping_before(deadline, keep)
+        {
             Ok(removed) if removed.is_empty() => {
                 vec![component(ScopeCleanupState::Absent, None, None)]
             }
@@ -2084,8 +2091,22 @@ impl DaemonBackend for StockDaemonBackend {
         let mut by_vm = BTreeMap::<String, (KitVmSpec, Vec<String>)>::new();
         let mut components = Vec::new();
         let resolution_failed = self.resolve_scope_kits(&mut by_vm, &mut components);
+        let planned = by_vm.keys().cloned().collect::<BTreeSet<_>>();
+        let verified = self.verify_unknown_executions_for_teardown(
+            &store,
+            &mut by_vm,
+            &mut components,
+            store.forced_stop_active(),
+        );
+        let kept = planned
+            .into_iter()
+            .filter(|vm| !by_vm.contains_key(vm))
+            .collect::<BTreeSet<_>>();
         let worker_ids = by_vm.keys().cloned().collect::<Vec<_>>();
-        if store.begin_workers_reset(&worker_ids).is_err() {
+        if store
+            .begin_verified_workers_reset(&worker_ids, &verified)
+            .is_err()
+        {
             return ScopeLifecycleReport {
                 action,
                 cleanup_complete: false,
@@ -2163,7 +2184,7 @@ impl DaemonBackend for StockDaemonBackend {
                 detail,
             });
         }
-        components.extend(self.reset_stale_scope_components(deadline));
+        components.extend(self.reset_stale_scope_components(deadline, &kept));
         components.extend(self.services_scope_teardown(action, deadline));
         self.finish_shell_warmup();
         for shell in self.sbx.shell_recovery_specs(&self.config.shell) {
@@ -5421,11 +5442,63 @@ struct RetirementClaim {
 }
 
 impl StockDaemonBackend {
+    /// For a teardown: the VMs of `by_vm` a job whose execution is unknown
+    /// (a restart lost it) is recorded on and that may go, because nothing
+    /// is verified to run there or this is `marsh stop --force` (`forced`,
+    /// the explicit override). Any other such VM leaves `by_vm` and is
+    /// reported kept (`KitInstall.tla` `Teardown`, `StopEnd`).
+    fn verify_unknown_executions_for_teardown(
+        &self,
+        store: &DaemonStore,
+        by_vm: &mut BTreeMap<String, (KitVmSpec, Vec<String>)>,
+        components: &mut Vec<ScopeCleanupComponent>,
+        forced: bool,
+    ) -> BTreeSet<String> {
+        let mut verified = BTreeSet::new();
+        by_vm.retain(|vm, (_, labels)| {
+            let jobs = store.jobs_whose_execution_may_run(vm);
+            if jobs.is_empty() {
+                return true;
+            }
+            let checked = if forced {
+                Ok(String::new())
+            } else {
+                self.sbx.verify_no_running_containers(vm)
+            };
+            match checked {
+                Ok(_) => {
+                    verified.insert(vm.clone());
+                    true
+                }
+                Err(why) => {
+                    labels.sort();
+                    components.push(ScopeCleanupComponent {
+                        kind: "kit".into(),
+                        label: labels.join(","),
+                        state: ScopeCleanupState::CleanupUncertain,
+                        vm: Some(vm.clone()),
+                        detail: Some(format!(
+                            "kept: job {} may still be running there (marsh lost track of its execution), and marsh could not verify that nothing runs: {why}; `marsh stop --force` removes it, ending whatever still runs",
+                            jobs.join(", ")
+                        )),
+                    });
+                    false
+                }
+            }
+        });
+        verified
+    }
+
     /// Marks workers as being reset, refusing any with running jobs. Release an
     /// unused claim with [`DaemonStore::cancel_workers_reset`].
+    ///
+    /// A VM of `verified` was verified to run no container (or this is the
+    /// forced stop): a job on it whose execution is unknown does not refuse
+    /// it ([`DaemonStore::begin_verified_workers_reset`]).
     fn claim_retirement(
         store: &DaemonStore,
         worker_ids: Vec<String>,
+        verified: &BTreeSet<String>,
     ) -> Result<RetirementClaim, DaemonError> {
         // An owned quarantined VM is always retirable; pins held by shells
         // that are no longer attached are leftovers of ended sessions.
@@ -5437,7 +5510,7 @@ impl StockDaemonBackend {
             .map(|worker| worker.worker_id)
             .collect::<BTreeSet<_>>();
         let live = store.attached_session_ids();
-        store.begin_workers_reset(&worker_ids)?;
+        store.begin_verified_workers_reset(&worker_ids, verified)?;
         Ok(RetirementClaim {
             worker_ids,
             live,

@@ -52,3 +52,4 @@ KitInstall_run_pass.cfg 190000
 KitInstall_lost_pass.cfg 65000
 KitInstall_runsw_pass.cfg 1200000
 KitInstall_lostsw_pass.cfg 950000
+KitInstall_assignVolatileOnly_pass.cfg 80000

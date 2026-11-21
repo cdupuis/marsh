@@ -3879,7 +3879,7 @@ impl DaemonStore {
             // job is still running on.
             if Self::job_running_on(&state, worker_id) {
                 return Err(DaemonError::InvalidState(format!(
-                    "worker {worker_id} has a running job; wait for it before resetting"
+                    "worker {worker_id} has a job that has not finished; wait for it before resetting"
                 )));
             }
             let Some(worker) = state.workers.get(worker_id) else {
@@ -3959,12 +3959,18 @@ impl DaemonStore {
 
     /// Whether a job recorded on `vm` is unfinished or its cleanup pending or
     /// uncertain (a container of it may still run there).
-    /// Whether a job recorded on `vm` (worker or VM id) is queued or
-    /// running: its container may be live.
+    /// Whether a job recorded on `vm` (worker or VM id) has not finished:
+    /// queued, running or detached. Its container may be live. A job that
+    /// ended, even with its cleanup uncertain, has: `finish_job` records
+    /// that as `Unknown` (as a restart does for a job it lost), and releasing
+    /// its VM is the operator's documented action.
     fn job_running_on(state: &State, vm: &str) -> bool {
         state.jobs.values().any(|job| {
             (job.worker_id.as_deref() == Some(vm) || job.vm_id.as_deref() == Some(vm))
-                && matches!(job.state, JobState::Queued | JobState::Running)
+                && matches!(
+                    job.state,
+                    JobState::Queued | JobState::Running | JobState::Detached
+                )
         })
     }
 
@@ -7733,7 +7739,11 @@ impl ConnectionHandler {
         let admission = if request.body == PublicRequest::ForceStopScope {
             self.store.begin_forced_stop()
         } else if lifecycle_request {
-            let cancelled = self.drain_background_pass();
+            // A restart (`Shutdown`: `marsh restart`, the post-upgrade probe)
+            // never stops running work, the background pass included: it is
+            // answered busy at once, which its client waits out or falls back
+            // on (its reply timeout is shorter than this drain's bound).
+            let cancelled = request.body != PublicRequest::Shutdown && self.drain_background_pass();
             let admission = self.store.begin_lifecycle_request();
             if cancelled {
                 // Admitted or not, no new background pass starts under a

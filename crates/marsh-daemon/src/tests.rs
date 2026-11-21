@@ -6509,6 +6509,7 @@ struct InstallInFlight {
     /// The background pass does not end when its creates are cancelled.
     background_ignores_cancel: bool,
     background_cancelled: AtomicBool,
+    background_resumed: AtomicBool,
     review_background_entered: AtomicBool,
     review_background_released: AtomicBool,
     review_teardown_overlapped_background: AtomicBool,
@@ -6569,6 +6570,10 @@ impl DaemonBackend for InstallInFlightBackend {
 
     fn cancel_creates(&self) {
         self.0.cancelled.store(true, Ordering::Release);
+    }
+
+    fn resume_background_creates(&self) {
+        self.0.background_resumed.store(true, Ordering::Release);
     }
 
     fn cancel_background_creates(&self) {
@@ -6840,6 +6845,10 @@ fn a_plain_stop_cancels_the_background_pass_and_stops() {
     assert!(report.cleanup_complete, "{report:?}");
     assert!(backend.0.background_cancelled.load(Ordering::Acquire));
     assert!(
+        backend.0.background_resumed.load(Ordering::Acquire),
+        "the drain left background creates disabled"
+    );
+    assert!(
         !backend.0.cancelled.load(Ordering::Acquire),
         "user creates were cancelled"
     );
@@ -6981,5 +6990,37 @@ fn a_background_pass_that_does_not_end_refuses_a_plain_reset_with_the_force_hint
         refused.contains("the background Kit pass") && refused.contains("marsh stop --force"),
         "{refused}"
     );
+    // The refused reset lets the background pass create again.
+    assert!(backend.0.background_resumed.load(Ordering::Acquire));
     assert!(backend.0.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn claude_v2c_probe_shutdown_during_uncancellable_background_pass() {
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        review_background: true,
+        background_ignores_cancel: true,
+        ..InstallInFlight::default()
+    }));
+    let (home, end, task) = serve_with_held_background_pass(&backend, Duration::from_secs(8));
+    let client = Client::connect(home.path()).unwrap();
+    let started = Instant::now();
+    // The probe as the upgrade check runs it, with its busy wait shortened
+    // (30 s in production) below the held pass.
+    let result =
+        client.shutdown_resident_waiting(Duration::from_millis(250), Duration::from_secs(1));
+    let took = started.elapsed();
+    backend
+        .0
+        .review_background_released
+        .store(true, Ordering::Release);
+    thread::sleep(Duration::from_millis(500));
+    end.store(true, Ordering::Release);
+    task.join().unwrap();
+    match result {
+        Err(DaemonError::Remote(message)) if message.starts_with(BUSY_BLOCKED) => {}
+        other => panic!("after {took:?}: not a busy refusal: {other:?}"),
+    }
+    // A restart never stops running work: the pass's create was not cancelled.
+    assert!(!backend.0.background_cancelled.load(Ordering::Acquire));
 }

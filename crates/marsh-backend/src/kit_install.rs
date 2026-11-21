@@ -1127,6 +1127,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_v2c_probe_reset_name_keeps_a_quarantined_vm_with_a_running_job() {
+        use marsh_daemon::{
+            CleanupState, ExitStatus, NewJob, SessionAuthority, TimingReport, WorkerHealth,
+            WorkerStatus,
+        };
+        let lab = Lab::new();
+        lab.register("hf", &reference('c'));
+        let vm = lab
+            .backend
+            .sbx
+            .vm_name(marsh_sbx::VmPurpose::Kit, &reference('c'))
+            .unwrap();
+        lab.stock.seed(&vm);
+        lab.backend.sbx.stock_inventory(true).unwrap();
+        let store = lab.store();
+        store
+            .register_worker(WorkerStatus {
+                worker_id: vm.clone(),
+                vm_id: vm.clone(),
+                scope_id: store.status(None).scope_id,
+                kit_ref: reference('c'),
+                kits: vec!["hf".into()],
+                warm: true,
+                health: WorkerHealth::Ready,
+                container_capacity: 8,
+                active_container_ids: vec![],
+                quarantine: None,
+            })
+            .unwrap();
+        let session = store.attach_shell(
+            1,
+            SessionAuthority {
+                username: "alice".into(),
+                uid: 501,
+                gid: 20,
+                launch_directory: lab.home.path().into(),
+                guest_home: "/Users/alice".into(),
+                home_backing: lab.home.path().into(),
+                ephemeral_home: false,
+            },
+        );
+        let mut jobs = Vec::new();
+        for digit in ['a', 'b'] {
+            let (job, _) = store
+                .begin_job(NewJob {
+                    label: None,
+                    session_id: session.clone(),
+                    command: "hf".into(),
+                    kit_ref: reference('c'),
+                    workload_image: reference('c'),
+                    mounts: vec![],
+                })
+                .unwrap();
+            store.reserve_worker(&job, &vm, &vm).unwrap();
+            store
+                .mark_running(&job, &vm, &vm, &digit.to_string().repeat(64))
+                .unwrap();
+            jobs.push(job);
+        }
+        // Job a ends with uncertain cleanup: the worker is quarantined while
+        // job b still runs on it.
+        store
+            .finish_job(
+                &jobs[0],
+                ExitStatus {
+                    code: Some(125),
+                    cause: "worker_start_ambiguous".into(),
+                },
+                false,
+                CleanupState::Uncertain,
+                TimingReport::default(),
+            )
+            .unwrap();
+        assert!(store.worker_quarantine(&vm).is_some());
+        let reply = lab.reset(&["hf"]);
+        assert!(
+            lab.stock.listed().contains(&vm),
+            "reset NAME removed a VM with a running job: {reply:?}"
+        );
+    }
+
     /// `resetIgnoresRecords` (#194 itself): `workers reset NAME` of a
     /// `kit install` that never registered its command reaches the VM its
     /// create left. Fails when reset targets only registered commands.

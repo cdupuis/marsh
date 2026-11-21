@@ -6308,9 +6308,14 @@ impl StockSbx {
             .as_deref()
             .filter(|_| lifecycle_grant.ephemeral.is_none())
             .and_then(|cache| cached_local_build(cache, fingerprint));
+        // The create runs on its own thread: it keeps the caller's
+        // cancellation (the background pass's, `in_background`).
+        let background = BACKGROUND_CREATES.with(std::cell::Cell::get);
         let (create_result, build_result) = thread::scope(|scope| {
-            let create =
-                scope.spawn(|| self.create_local_vm(spec, source, lifecycle_grant, rebuild));
+            let create = scope.spawn(|| {
+                BACKGROUND_CREATES.with(|flag| flag.set(background));
+                self.create_local_vm(spec, source, lifecycle_grant, rebuild)
+            });
             let build = scope.spawn(|| match cached {
                 Some(cached) => Ok(cached),
                 None => self.build_local_source(source, fingerprint, build_workspace),

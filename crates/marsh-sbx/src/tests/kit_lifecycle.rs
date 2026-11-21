@@ -1579,3 +1579,67 @@ fn a_plain_stop_cancels_only_the_background_passs_create() {
     adapter.cancel_creates();
     assert!(matches!(install.join().unwrap(), Err(SbxError::Io(_))));
 }
+
+/// Claude's round 3 (N1): `marsh stop --force` cancels the background pass's
+/// Kit VM create too, and a plain stop's resumption of background creates
+/// does not undo a forced stop that is under way. Fails when the forced stop
+/// leaves the background cancellation alone, or the resumption ignores it.
+#[test]
+fn a_forced_stop_cancels_the_background_create_too() {
+    let model = StockModel::new();
+    model.hold_creates_until_cancelled();
+    let adapter = Arc::new(model.adapter());
+    let kit = KitFixture::published(KIT);
+    let (creating, spec) = (Arc::clone(&adapter), kit.spec.clone());
+    let pass = std::thread::spawn(move || creating.in_background(|| creating.ensure_kit_vm(&spec)));
+    model.wait_for_held_create();
+    adapter.cancel_creates();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !pass.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the forced stop did not cancel the background create"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(pass.join().unwrap(), Err(SbxError::Io(_))));
+    adapter.resume_background_creates();
+    let other = KitFixture::published("marsh-kit-other");
+    let (creating, spec) = (Arc::clone(&adapter), other.spec.clone());
+    let refused =
+        std::thread::spawn(move || creating.in_background(|| creating.ensure_kit_vm(&spec)));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !refused.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a background create was submitted during a forced stop"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(refused.join().unwrap(), Err(SbxError::Stopping)));
+}
+
+/// A local Kit's create runs on a thread of its own: in the background pass
+/// it still runs under the background cancellation, so a plain stop cancels
+/// it. Fails when that thread loses the pass's mark.
+#[test]
+fn a_plain_stop_cancels_a_background_local_kit_create() {
+    let model = StockModel::new();
+    model.hold_creates_until_cancelled();
+    let adapter = Arc::new(model.adapter());
+    let kit = KitFixture::local("marsh-kit-local");
+    let (creating, spec) = (Arc::clone(&adapter), kit.spec.clone());
+    let pass = std::thread::spawn(move || creating.in_background(|| creating.ensure_kit_vm(&spec)));
+    model.wait_for_held_create();
+    adapter.cancel_background_creates();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !pass.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            // Let the stuck create go before failing.
+            adapter.cancel_creates();
+            panic!("the background local Kit create was not cancelled");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(pass.join().unwrap().is_err());
+}

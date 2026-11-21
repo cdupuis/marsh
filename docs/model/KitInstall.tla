@@ -876,7 +876,8 @@ PendStart ==
                  iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 
 SiblingQuarantine ==
-  /\ \E n \in (running \cup lost) \ quar : quar' = quar \cup {n}
+  \* A submitted job's VM too: a VM holds several jobs (round 7).
+  /\ \E n \in (Busy(W0) \cup lost) \ quar : quar' = quar \cup {n}
   /\ UNCHANGED <<st, kit, stock, inflight, mk, unsure, rec, bad, running, lost, alive, pend, subm, wst, ghost, runBad, reg, owner, pc,
                  iVars, jVars, rVars, sVars, eVars, xVars, bVars>>
 

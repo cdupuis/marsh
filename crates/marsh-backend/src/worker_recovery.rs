@@ -207,7 +207,14 @@ impl StockDaemonBackend {
             );
         }
         // No command names this VM (a failed install, an update's new image).
-        self.sbx.retire_quarantined_vm(vm).map_err(backend_error)?;
+        // Claimed in the store before the removal, as a named VM is: no job
+        // reserves it while it goes. The caller verified that no container
+        // runs on it.
+        store.begin_verified_workers_reset(&[vm.to_owned()], &BTreeSet::from([vm.to_owned()]))?;
+        if let Err(error) = self.sbx.retire_quarantined_vm(vm) {
+            let _ = store.finish_worker_reset(vm, false);
+            return Err(backend_error(error));
+        }
         self.ready_kits
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -220,12 +227,7 @@ impl StockDaemonBackend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(vm);
-        if store
-            .begin_verified_workers_reset(&[vm.to_owned()], &BTreeSet::from([vm.to_owned()]))
-            .is_ok()
-        {
-            store.finish_worker_reset(vm, true)?;
-        }
+        store.finish_worker_reset(vm, true)?;
         Ok(())
     }
 

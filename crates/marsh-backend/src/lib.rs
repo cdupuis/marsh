@@ -2092,16 +2092,22 @@ impl DaemonBackend for StockDaemonBackend {
         let mut components = Vec::new();
         let resolution_failed = self.resolve_scope_kits(&mut by_vm, &mut components);
         let planned = by_vm.keys().cloned().collect::<BTreeSet<_>>();
+        let forced = store.forced_stop_active();
         let verified = self.verify_unknown_executions_for_teardown(
             &store,
             &mut by_vm,
             &mut components,
-            store.forced_stop_active(),
+            forced,
         );
-        let kept = planned
-            .into_iter()
-            .filter(|vm| !by_vm.contains_key(vm))
+        let mut kept = planned
+            .iter()
+            .filter(|vm| !by_vm.contains_key(*vm))
+            .cloned()
             .collect::<BTreeSet<_>>();
+        // The stale-generation sweep below removes every other owned Kit VM
+        // (one a Kit switch, update or uninstall left draining): it gets the
+        // same check (`KitInstall.tla` `sweepUnchecked`).
+        kept.extend(self.keep_unverified_generations(&store, &planned, &mut components, forced));
         let worker_ids = by_vm.keys().cloned().collect::<Vec<_>>();
         if store
             .begin_verified_workers_reset(&worker_ids, &verified)
@@ -5487,6 +5493,47 @@ impl StockDaemonBackend {
             }
         });
         verified
+    }
+
+    /// The owned Kit VMs outside `planned` (older generations, which the
+    /// stale-generation sweep removes) that a job whose execution is unknown
+    /// is recorded on and that nothing verifies to run no container: kept
+    /// and reported, unless this is the forced stop (`forced`).
+    fn keep_unverified_generations(
+        &self,
+        store: &DaemonStore,
+        planned: &BTreeSet<String>,
+        components: &mut Vec<ScopeCleanupComponent>,
+        forced: bool,
+    ) -> BTreeSet<String> {
+        let mut kept = BTreeSet::new();
+        if forced {
+            return kept;
+        }
+        let owned = self
+            .sbx
+            .owned_kit_vm_names()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for (vm, jobs) in store.vms_whose_execution_may_run() {
+            if planned.contains(&vm) || !owned.contains(&vm) {
+                continue;
+            }
+            if let Err(why) = self.sbx.verify_no_running_containers(&vm) {
+                components.push(ScopeCleanupComponent {
+                    kind: "kit".into(),
+                    label: "stale-generations".into(),
+                    state: ScopeCleanupState::CleanupUncertain,
+                    vm: Some(vm.clone()),
+                    detail: Some(format!(
+                        "kept: job {} may still be running there (marsh lost track of its execution), and marsh could not verify that nothing runs: {why}; `marsh stop --force` removes it, ending whatever still runs",
+                        jobs.join(", ")
+                    )),
+                });
+                kept.insert(vm);
+            }
+        }
+        kept
     }
 
     /// Marks workers as being reset, refusing any with running jobs. Release an

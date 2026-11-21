@@ -1684,7 +1684,8 @@ fn worker_reset_refuses_active_selection_atomically_and_preserves_other_state() 
 /// cleanup uncertain by its typed execution. `Unknown` and
 /// `SupervisionFailed` are no proof it ended (refused unless the VM was verified to run no
 /// container); a known exit, a limit, a setup failure or no start are.
-/// Fails when `SupervisionFailed` counts as ended, or the execution is ignored.
+/// Registered worker or not (Claude's round 5). Fails when
+/// `SupervisionFailed` counts as ended, or the execution is ignored.
 #[test]
 fn the_operator_claim_judges_an_ended_job_by_its_execution() {
     use marsh_contracts::execution::{ResourceLimit, SetupStage};
@@ -1706,7 +1707,10 @@ fn the_operator_claim_judges_an_ended_job_by_its_execution() {
         ),
         (ExecutionOutcome::NotStarted, true),
     ];
-    for (execution, ended) in cases {
+    for ((execution, ended), unregistered) in cases
+        .into_iter()
+        .flat_map(|case| [(case.clone(), false), (case, true)])
+    {
         let home = home();
         let store = reopen(home.path()).unwrap();
         let session = store.attach_shell(1, authority("/Users/example/project", home.path()));
@@ -1751,14 +1755,27 @@ fn the_operator_claim_judges_an_ended_job_by_its_execution() {
                 TimingReport::default(),
             )
             .unwrap();
+        if unregistered {
+            // After a restart no worker is registered: the claim's own
+            // per-VM check is the only store guard.
+            store.lock().workers.remove("target");
+        }
         let selected = vec!["target".to_owned()];
         assert_eq!(
             store.jobs_whose_execution_may_run("target").is_empty(),
             ended,
             "{execution:?}"
         );
+        assert_eq!(
+            store.vms_whose_execution_may_run().contains_key("target"),
+            !ended
+        );
         let claimed = store.begin_workers_reset(&selected);
-        assert_eq!(claimed.is_ok(), ended, "{execution:?}: {claimed:?}");
+        assert_eq!(
+            claimed.is_ok(),
+            ended,
+            "{execution:?}, unregistered={unregistered}: {claimed:?}"
+        );
         if !ended {
             let verified = selected.iter().cloned().collect();
             store

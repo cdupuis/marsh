@@ -1033,6 +1033,50 @@ fn created_container_identity_is_published_before_terminal_report() {
     assert_eq!(report.container_id, Some(container_id));
 }
 
+/// Evidence for the backend's delayed-start schedule: the receipt can be
+/// Running while the worker has not even called attach/start yet. Losing
+/// that receipt to a restart does not fence the worker's remaining steps.
+#[test]
+fn review_v2e_started_event_precedes_actual_container_launch() {
+    struct Controls(marsh_runtime::Cancellation);
+    impl ControlSource for Controls {
+        fn receive(&mut self, _: Duration) -> Result<Option<WorkerControl>, WorkerError> {
+            Ok(None)
+        }
+        fn cancellation(&self) -> Option<marsh_runtime::Cancellation> {
+            Some(self.0.clone())
+        }
+    }
+    struct ObserveStart(Arc<FakeRuntime>, marsh_runtime::Cancellation);
+    impl EventSink for ObserveStart {
+        fn publish(&mut self, event: &WorkerEvent) -> Result<(), WorkerError> {
+            assert!(matches!(event, WorkerEvent::Started { .. }));
+            assert_eq!(*self.0.calls.lock().unwrap(), ["create"]);
+            // Even notifying the old worker of cancellation at this point
+            // does not fence the subsequent, uncancellable attach/start.
+            self.1.cancel();
+            Ok(())
+        }
+    }
+    let runtime = Arc::new(FakeRuntime::default());
+    let worker = worker(
+        runtime.clone(),
+        Arc::new(FixedSupervisor(ExecutionOutcome::Exited { code: 0 })),
+    );
+    let cancel = marsh_runtime::Cancellation::default();
+    let report = worker.run_with_events(
+        &job(),
+        &mut Controls(cancel.clone()),
+        streams(),
+        &mut ObserveStart(runtime.clone(), cancel),
+    );
+    assert_eq!(report.execution, ExecutionOutcome::Exited { code: 0 });
+    assert_eq!(
+        *runtime.calls.lock().unwrap(),
+        ["create", "attach", "start", "delete"]
+    );
+}
+
 #[test]
 fn pre_create_failure_publishes_a_terminal_setup_event() {
     let runtime = Arc::new(FakeRuntime {

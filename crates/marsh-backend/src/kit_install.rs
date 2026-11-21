@@ -481,6 +481,13 @@ mod tests {
         /// `docker ps` fails (the VM's Docker cannot be read).
         containers: Mutex<Option<Vec<String>>>,
         containers_unreadable: std::sync::atomic::AtomicBool,
+        /// Containers created and not started (listed only by `docker ps
+        /// --all` asking for `status=created`), and exited ones (listed only
+        /// by `--all` with no status filter).
+        created_containers: Mutex<Vec<String>>,
+        exited: Mutex<Vec<String>>,
+        review_after_ps: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        review_list_failure: std::sync::atomic::AtomicBool,
     }
 
     #[allow(clippy::unnecessary_wraps)] // A stock call's reply.
@@ -538,6 +545,29 @@ mod tests {
         /// `docker ps` in a running VM lists `ids`.
         pub(super) fn run_containers(&self, ids: &[String]) {
             *self.containers.lock().unwrap() = Some(ids.to_vec());
+        }
+
+        /// A container created in every running VM, its start pending.
+        pub(super) fn create_container(&self, id: &str) {
+            self.created_containers.lock().unwrap().push(id.to_owned());
+        }
+
+        /// A container that exited in every running VM.
+        pub(super) fn exit_container(&self, id: &str) {
+            self.exited.lock().unwrap().push(id.to_owned());
+        }
+
+        /// The pending start of created container `id` runs.
+        pub(super) fn start_created(&self, id: &str) {
+            self.created_containers
+                .lock()
+                .unwrap()
+                .retain(|created| created != id);
+            self.containers
+                .lock()
+                .unwrap()
+                .get_or_insert_with(Vec::new)
+                .push(id.to_owned());
         }
 
         /// `docker ps` in a running VM fails.
@@ -602,6 +632,12 @@ mod tests {
             }
             match arguments.first().map(String::as_str) {
                 Some("ls") => {
+                    if self
+                        .review_list_failure
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return output(1, "stock inventory unavailable");
+                    }
                     let hook = self.before_list.lock().unwrap().take();
                     if let Some(hook) = hook {
                         hook();
@@ -687,7 +723,23 @@ mod tests {
                     {
                         return output(1, "Cannot connect to the Docker daemon");
                     }
-                    let ids = self.containers.lock().unwrap().clone().unwrap_or_default();
+                    let mut ids = self.containers.lock().unwrap().clone().unwrap_or_default();
+                    let all = arguments.iter().any(|argument| argument == "--all");
+                    let filtered = arguments.iter().any(|argument| argument == "--filter");
+                    if all
+                        && arguments
+                            .iter()
+                            .any(|argument| argument == "status=created")
+                    {
+                        ids.extend(self.created_containers.lock().unwrap().iter().cloned());
+                    }
+                    if all && !filtered {
+                        ids.extend(self.created_containers.lock().unwrap().iter().cloned());
+                        ids.extend(self.exited.lock().unwrap().iter().cloned());
+                    }
+                    if let Some(hook) = self.review_after_ps.lock().unwrap().take() {
+                        hook();
+                    }
                     Ok(CommandOutput {
                         exit_code: Some(0),
                         stdout: ids.join("\n").into_bytes(),
@@ -1999,6 +2051,16 @@ mod tests {
 
     #[test]
     fn review_v2b_ephemeral_close_deduplicates_and_takes_kit_keys_in_order() {
+        review_v2e_ephemeral_close_fixture(false);
+    }
+
+    #[test]
+    fn review_v2e_ephemeral_close_keeps_lost_job_vm_and_home() {
+        review_v2e_ephemeral_close_fixture(true);
+    }
+
+    #[allow(clippy::too_many_lines, clippy::similar_names)] // One ephemeral session scenario.
+    fn review_v2e_ephemeral_close_fixture(lost: bool) {
         let mut lab = Lab::new();
         let lease = lab.backend.sbx.allocate_ephemeral_home().unwrap();
         let token = lease.token();
@@ -2060,6 +2122,63 @@ mod tests {
                     .unwrap()
                     .insert(duplicate.name.clone(), duplicate);
             }
+        }
+        if lost {
+            let spec = lab
+                .backend
+                .kit_spec_for_session("d", &session, lab.store())
+                .unwrap();
+            let store = lab.store();
+            store
+                .register_worker(marsh_daemon::WorkerStatus {
+                    worker_id: spec.name.clone(),
+                    vm_id: spec.name.clone(),
+                    scope_id: store.status(None).scope_id,
+                    kit_ref: reference('d'),
+                    kits: vec!["d".into()],
+                    warm: true,
+                    health: marsh_daemon::WorkerHealth::Ready,
+                    container_capacity: 8,
+                    active_container_ids: vec![],
+                    quarantine: None,
+                })
+                .unwrap();
+            let (job, _) = store
+                .begin_job(marsh_daemon::NewJob {
+                    label: None,
+                    session_id: session_id.clone(),
+                    command: "d".into(),
+                    kit_ref: reference('d'),
+                    workload_image: reference('d'),
+                    mounts: vec![],
+                })
+                .unwrap();
+            store.reserve_worker(&job, &spec.name, &spec.name).unwrap();
+            store
+                .mark_running(&job, &spec.name, &spec.name, &"a".repeat(64))
+                .unwrap();
+            store
+                .finish_job_with_execution(
+                    &job,
+                    marsh_contracts::execution::ExecutionOutcome::Unknown,
+                    marsh_daemon::ExitStatus {
+                        code: Some(125),
+                        cause: "transport_lost".into(),
+                    },
+                    false,
+                    marsh_daemon::CleanupState::Uncertain,
+                    marsh_daemon::TimingReport::default(),
+                )
+                .unwrap();
+            lab.stock.run_containers(&["a".repeat(64)]);
+            lease.close_admission().unwrap();
+            let closed = lab.backend.close_ephemeral_kits(&session_id, store);
+            assert!(closed.is_err(), "{closed:?}");
+            assert!(lab.stock.listed().contains(&spec.name));
+            assert!(!lab.stock.removed().contains(&spec.name));
+            assert!(store.ephemeral_home_token(&session_id).is_some());
+            assert!(lease.path().is_dir());
+            return;
         }
         lease.close_admission().unwrap();
         let first = lab
@@ -2769,7 +2888,11 @@ mod tests {
                 recovered.unwrap();
                 assert!(lab.stock.removed().contains(&vm));
             } else {
-                assert!(recovered.unwrap_err().contains("still running"));
+                assert!(
+                    recovered
+                        .unwrap_err()
+                        .contains("running or waiting to start")
+                );
                 assert!(lab.stock.listed().contains(&vm));
             }
         }
@@ -2799,5 +2922,175 @@ mod tests {
             .begin_verified_workers_reset(std::slice::from_ref(&vm), &verified)
             .unwrap();
         assert_eq!(lab.store().jobs_whose_execution_may_run(&vm), [job]);
+    }
+
+    /// A Kit update leaves its old VM owned but no longer selected by the
+    /// command. That old generation must get the same lost-job protection.
+    #[test]
+    fn review_v2e_plain_teardown_keeps_old_generation_with_lost_live_job() {
+        review_v2e_old_generation(false, Live::Running);
+    }
+
+    #[test]
+    fn review_v2e_plain_stop_keeps_old_generation_with_unverifiable_job() {
+        review_v2e_old_generation(true, Live::Unreadable);
+    }
+
+    /// `marsh stop --force` removes such an old generation anyway (the
+    /// explicit override). Fails when the forced stop checks it too.
+    #[test]
+    fn the_forced_stop_removes_an_old_generation_a_lost_job_may_run_on() {
+        let (mut lab, vm, _) = lab_with_ended_job(true, false, Live::Unreadable);
+        lab.register("hf", &reference('d'));
+        let report = review_v2e_lifecycle(&mut lab, marsh_daemon::PublicRequest::ForceStopScope);
+        assert!(lab.stock.removed().contains(&vm), "{report:?}");
+    }
+
+    fn review_v2e_old_generation(stop: bool, live: Live) {
+        let (mut lab, vm, job) = lab_with_ended_job(true, false, live);
+        // This is the registry state after changing hf to a new image. The
+        // old owned VM and its receipt survive the daemon restart.
+        let old_spec = lab.backend.kit_spec("hf").unwrap();
+        lab.register("hf", &reference('d'));
+        lab.backend.drain(crate::DrainingKit {
+            command: "hf".into(),
+            spec: old_spec,
+            change: "update",
+            to: Some(reference('d')),
+        });
+        let request = if stop {
+            marsh_daemon::PublicRequest::StopScope
+        } else {
+            marsh_daemon::PublicRequest::ResetScope
+        };
+        let report = review_v2e_lifecycle(&mut lab, request);
+        assert!(
+            !lab.stock.removed().contains(&vm),
+            "plain teardown removed old VM {vm} of lost job {job}: {report:?}"
+        );
+        assert!(lab.stock.listed().contains(&vm));
+    }
+
+    fn review_v2e_lifecycle(
+        lab: &mut Lab,
+        request: marsh_daemon::PublicRequest,
+    ) -> marsh_daemon::PublicReply {
+        lab.store = None;
+        let server = marsh_daemon::Server::bind(lab.home.path())
+            .unwrap()
+            .with_backend(lab.backend.clone());
+        lab.store = Some(server.store());
+        let task = std::thread::spawn(move || server.serve_one().unwrap());
+        let reply = marsh_daemon::Client::connect(lab.home.path())
+            .unwrap()
+            .request(request)
+            .unwrap();
+        task.join().unwrap();
+        reply
+    }
+
+    #[test]
+    fn review_v2e_public_forced_stop_removes_unverifiable_lost_job_vm() {
+        let (mut lab, vm, _) = lab_with_ended_job(true, false, Live::Unreadable);
+        let report = review_v2e_lifecycle(&mut lab, marsh_daemon::PublicRequest::ForceStopScope);
+        assert!(lab.stock.removed().contains(&vm), "{report:?}");
+    }
+
+    #[test]
+    fn review_v2e_inventory_failure_never_counts_as_empty() {
+        let (lab, vm, _) = lab_with_ended_job(true, false, Live::None);
+        lab.stock
+            .review_list_failure
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(lab.reset(&["hf"]).is_err());
+        assert!(lab.stock.listed().contains(&vm));
+        assert!(!lab.stock.removed().contains(&vm));
+    }
+
+    /// GPT's round 5: the old worker/Docker start request is not governed by
+    /// this daemon's new Kit mutex: a lost job's container, created before
+    /// the worker reported Started, may start right after the check. The
+    /// check counts a created container (`docker ps --all`, status
+    /// created/running/restarting/paused), so reset NAME (here) and recovery
+    /// (below) keep the VM. Fail when the check lists running containers only.
+    #[test]
+    fn review_v2e_empty_snapshot_does_not_fence_a_lost_jobs_delayed_start() {
+        review_v2e_delayed_start(false);
+    }
+
+    #[test]
+    fn review_v2e_recovery_check_does_not_fence_a_lost_jobs_delayed_start() {
+        review_v2e_delayed_start(true);
+    }
+
+    /// A lost job whose container exited (or is gone) is released: an
+    /// exited container is never started again. Fails when the check counts
+    /// every container `docker ps --all` lists.
+    #[test]
+    fn reset_name_releases_a_lost_job_whose_container_exited() {
+        let (lab, vm, _) = lab_with_ended_job(true, false, Live::None);
+        lab.stock.exit_container(&"a".repeat(64));
+        lab.reset(&["hf"]).unwrap();
+        assert!(lab.stock.removed().contains(&vm));
+    }
+
+    fn review_v2e_delayed_start(recovery: bool) {
+        let (lab, vm, _) = lab_with_ended_job(!recovery, false, Live::None);
+        // The realistic order: the worker created the container before it
+        // reported Started; its start is still pending at the check, and runs
+        // right after it.
+        lab.stock.create_container(&"a".repeat(64));
+        let stock = lab.stock.clone();
+        *lab.stock.review_after_ps.lock().unwrap() = Some(Box::new(move || {
+            stock.start_created(&"a".repeat(64));
+        }));
+        let reply = if recovery {
+            lab.store().quarantine_worker(&vm, "lost worker").unwrap();
+            format!("{:?}", lab.backend.recover_quarantined_vm(lab.store(), &vm))
+        } else {
+            format!("{:?}", lab.reset(&["hf"]))
+        };
+        // The pending start ran after the check.
+        assert_eq!(
+            lab.stock.containers.lock().unwrap().as_deref(),
+            Some(&["a".repeat(64)][..])
+        );
+        assert!(
+            !lab.stock.removed().contains(&vm),
+            "recovery={recovery} removed the VM of a lost job that started after ps: {reply}"
+        );
+    }
+
+    /// claude-v2e: a lost job's VM that is no longer the registered Kit's
+    /// VM (the Kit switched away from it, or was uninstalled: `claim_old_vm`
+    /// refused it via `recorded_busy`, so it stayed owned) is still swept
+    /// by a plain teardown's stale-generation pass, unverified.
+    fn review_v2e_stale(switch: bool) {
+        let (lab, vm, _job) = lab_with_ended_job(true, false, Live::Running);
+        if switch {
+            lab.register("hf", &reference('d'));
+        } else {
+            lab.backend.installed_commands.lock().unwrap().remove("hf");
+        }
+        let report = lab.backend.teardown_scope(
+            marsh_daemon::ScopeLifecycleAction::Reset,
+            lab.store().clone(),
+            std::time::Instant::now() + Duration::from_secs(30),
+        );
+        assert!(
+            lab.stock.listed().contains(&vm),
+            "plain teardown removed the VM a lost job's container still runs on: removed={:?} report={report:?}",
+            lab.stock.removed()
+        );
+    }
+
+    #[test]
+    fn review_v2e_plain_teardown_keeps_switched_away_lost_vm() {
+        review_v2e_stale(true);
+    }
+
+    #[test]
+    fn review_v2e_plain_teardown_keeps_uninstalled_lost_vm() {
+        review_v2e_stale(false);
     }
 }

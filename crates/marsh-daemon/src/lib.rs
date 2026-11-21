@@ -3895,6 +3895,32 @@ impl DaemonStore {
             .collect()
     }
 
+    /// Every VM (worker or VM id) a job whose execution may still run is
+    /// recorded on, with those jobs ([`Self::jobs_whose_execution_may_run`]):
+    /// what a teardown must check, current Kit generation or not.
+    #[must_use]
+    pub fn vms_whose_execution_may_run(&self) -> BTreeMap<String, Vec<String>> {
+        let state = self.lock();
+        let mut vms = BTreeMap::<String, Vec<String>>::new();
+        for job in state
+            .jobs
+            .values()
+            .filter(|job| Self::execution_may_run(job))
+        {
+            let mut ids = job
+                .worker_id
+                .iter()
+                .chain(job.vm_id.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            ids.dedup();
+            for id in ids {
+                vms.entry(id).or_default().push(job.job_id.clone());
+            }
+        }
+        vms
+    }
+
     /// [`Self::begin_workers_reset`] for a bulk reset (`marsh workers reset
     /// all`), which is no operator's release of a particular VM: in the same
     /// step it also refuses a VM any job of which is unfinished, or whose

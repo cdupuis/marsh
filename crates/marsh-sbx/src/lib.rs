@@ -2445,6 +2445,13 @@ impl StockSbx {
         self.ownership.live_kit_entries()
     }
 
+    /// Every Kit VM name the map records a UUID for: what the stale
+    /// generation sweep (`reset_stale_scope_kit_vms_keeping_before`) visits.
+    #[must_use]
+    pub fn owned_kit_vm_names(&self) -> Vec<String> {
+        self.ownership.owned_kit_names()
+    }
+
     /// The recorded name of `(purpose, key)`, never assigning one.
     #[must_use]
     pub fn recorded_vm_name(&self, purpose: VmPurpose, key: &str) -> Option<String> {
@@ -5713,11 +5720,16 @@ impl StockSbx {
             .clone()
     }
 
-    /// Whether a quarantined Kit VM can have a job container running in it.
-    /// `Ok` names the evidence that none can: the VM is gone, stopped (the
-    /// quarantine stop took effect), or running with no container in its
-    /// Docker. `Err` says why that could not be shown; then the VM stays
-    /// quarantined. Only this daemon's recorded VM is inspected.
+    /// Whether a Kit VM can have a job container running in it, now or
+    /// later. `Ok` names the evidence that none can: the VM is gone, stopped
+    /// (the quarantine stop took effect; every process in it, a lost
+    /// worker's included, ended), or running with no container in its Docker
+    /// that runs or may still start: created (a worker reports Started after
+    /// `docker create`, before `docker start`), running, restarting or
+    /// paused. An exited or dead container is not started again: the worker
+    /// starts its container once, never re-creates it, and creates it with
+    /// no restart policy. `Err` says why that could not be shown; then the VM
+    /// stays. Only this daemon's recorded VM is inspected.
     ///
     /// # Errors
     /// Returns the reason verification was impossible or failed.
@@ -5762,8 +5774,17 @@ impl StockSbx {
                             vm,
                             "docker",
                             "ps",
+                            "--all",
                             "--quiet",
                             "--no-trunc",
+                            "--filter",
+                            "status=created",
+                            "--filter",
+                            "status=running",
+                            "--filter",
+                            "status=restarting",
+                            "--filter",
+                            "status=paused",
                         ],
                     )
                     .map_err(|error| format!("cannot list the VM's containers: {error}"))?;
@@ -5777,10 +5798,10 @@ impl StockSbx {
                     .split_whitespace()
                     .count();
                 if running == 0 {
-                    Ok("no container is running in the VM".into())
+                    Ok("no container is running or waiting to start in the VM".into())
                 } else {
                     Err(format!(
-                        "{running} container(s) still running in the VM; a job may still be writing"
+                        "{running} container(s) running or waiting to start in the VM; a job may still be writing"
                     ))
                 }
             }

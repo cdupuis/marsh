@@ -3292,7 +3292,10 @@ mod tests {
         );
         // Round 6: the assignment was journaled before the submission.
         assert_eq!(receipt.vm_id.as_deref(), Some(vm.as_str()));
-        assert_eq!(lab.store().jobs_whose_execution_may_run(&vm), std::slice::from_ref(&job));
+        assert_eq!(
+            lab.store().jobs_whose_execution_may_run(&vm),
+            std::slice::from_ref(&job)
+        );
         let reply = match path {
             0 => format!("{:?}", lab.reset(&["hf"])),
             1..=3 => {

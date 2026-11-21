@@ -5518,6 +5518,7 @@ impl StockSbx {
             attempt: attempt.to_owned(),
             generation: worker.generation,
             spec,
+            started_ack: true,
         };
         let start_write =
             write_start_bounded(&worker, request, self.preparation_timeouts.start_write);

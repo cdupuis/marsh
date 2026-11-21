@@ -4557,9 +4557,16 @@ impl DaemonStore {
         Self::fenced(&state, &mounts)?;
         let receipt = state
             .jobs
-            .get_mut(job_id)
+            .get(job_id)
             .ok_or_else(|| DaemonError::NotFound(job_id.into()))?;
-        receipt.execution = ExecutionOutcome::Unknown;
+        // Journaled (synced) before the Start is submitted, with the VM the
+        // job reserved: a daemon that dies before the worker's Started still
+        // finds the job on its VM after a restart (`KitInstall.tla`
+        // `assignVolatile`). A failed write fails the submission.
+        let mut updated = receipt.clone();
+        updated.execution = ExecutionOutcome::Unknown;
+        state.journal.append(&updated, true)?;
+        state.jobs.insert(job_id.into(), updated);
         Ok(())
     }
 
@@ -4784,7 +4791,9 @@ impl DaemonStore {
         updated.container_id = Some(container_id.into());
         updated.state = JobState::Running;
         updated.execution = ExecutionOutcome::Unknown;
-        state.journal.append(&updated, false)?;
+        // Synced: the worker starts the container only once the daemon
+        // acknowledges this record (`KitInstall.tla` `noStartedAck`).
+        state.journal.append(&updated, true)?;
         state.jobs.insert(job_id.into(), updated);
         if state.journal.exceeds_size_limit() {
             let receipts = state.jobs.clone();

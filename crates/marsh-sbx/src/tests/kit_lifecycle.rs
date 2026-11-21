@@ -379,6 +379,8 @@ fn quarantine_stop_waits_for_an_inflight_retained_start() {
     launching.join().unwrap().unwrap();
     stop_receive.recv_timeout(WAIT_LIMIT).unwrap().unwrap();
     assert_eq!(model.written_worker_starts(KIT), ["attempt-start-fence"]);
+    // Round 6's launch fence: every Start asks for the acknowledgement.
+    assert_eq!(model.written_worker_starts_ask_ack(KIT), [true]);
     assert!(!model.vm(KIT).unwrap().running);
     assert!(matches!(
         adapter.ensure_kit_vm(&kit.spec),

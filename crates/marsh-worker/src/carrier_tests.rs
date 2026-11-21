@@ -623,6 +623,7 @@ fn retained_terminal_follows_all_output_and_joined_carrier() {
             attempt: "real".into(),
             generation: 1,
             spec,
+            started_ack: false,
         },
     )
     .unwrap();
@@ -693,6 +694,7 @@ fn a_panicking_attempt_reports_a_terminal_and_frees_its_slot() {
                 attempt: attempt.into(),
                 generation: 1,
                 spec: super::tests::job(),
+                started_ack: false,
             },
         )
         .unwrap();
@@ -841,6 +843,7 @@ fn retained_cancel_finishes_started_frame_before_terminal() {
             attempt: "blocked".into(),
             generation: 1,
             spec,
+            started_ack: false,
         },
     )
     .unwrap();

@@ -68,6 +68,19 @@ pub enum WorkerRequest {
         attempt: String,
         generation: u64,
         spec: JobSpec,
+        /// The worker starts the container only once the daemon
+        /// acknowledges its `Started` ([`WorkerRequest::StartedAck`]),
+        /// having journaled it; it deletes a container never acknowledged.
+        /// A worker older than this field rejects the frame
+        /// (`deny_unknown_fields`), so a daemon that asks for the fence never
+        /// runs a job without it.
+        #[serde(default)]
+        started_ack: bool,
+    },
+    /// The daemon journaled the attempt's `Started` (its job Running on
+    /// this VM, with its container): the worker may start the container.
+    StartedAck {
+        attempt: String,
     },
     Input {
         attempt: String,
@@ -362,7 +375,17 @@ pub trait EventSink {
     /// # Errors
     /// Returns an error when the event cannot be durably published.
     fn publish(&mut self, event: &WorkerEvent) -> Result<(), WorkerError>;
+
+    /// When the controller acknowledges `Started`, the flag its
+    /// acknowledgement sets; the container is started only once it is set.
+    fn started_acknowledgement(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
 }
+
+/// How long a worker waits for the daemon to acknowledge `Started` before
+/// it deletes the container it never started.
+pub const STARTED_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct IgnoreEvents;
 
@@ -471,6 +494,7 @@ pub struct Worker {
     runtime: Arc<dyn JobRuntime>,
     supervisor: Arc<dyn Supervisor>,
     grants: Arc<dyn GrantVerifier>,
+    started_ack_timeout: Duration,
 }
 
 impl Worker {
@@ -480,6 +504,7 @@ impl Worker {
             runtime,
             supervisor,
             grants: Arc::new(FilesystemGrantVerifier),
+            started_ack_timeout: STARTED_ACK_TIMEOUT,
         }
     }
 
@@ -493,7 +518,16 @@ impl Worker {
             runtime,
             supervisor,
             grants,
+            started_ack_timeout: STARTED_ACK_TIMEOUT,
         }
+    }
+
+    /// How long to wait for the daemon's acknowledgement of `Started`
+    /// ([`STARTED_ACK_TIMEOUT`]; shorter in tests).
+    #[must_use]
+    pub fn with_started_ack_timeout(mut self, timeout: Duration) -> Self {
+        self.started_ack_timeout = timeout;
+        self
     }
 
     /// Runs one job and always attempts exact-container deletion after create.
@@ -582,16 +616,7 @@ impl Worker {
                 )
             })?;
         if let Some(delivery) = &controls.stopped {
-            let cleanup = self.delete(&container);
-            return Err(WorkerReport {
-                container_id: Some(container),
-                execution: ExecutionOutcome::NotStarted,
-                delivery: delivery.clone(),
-                cleanup,
-                quarantine: cleanup == CleanupOutcome::Uncertain,
-                control_errors: 0,
-                retained_processes: Vec::new(),
-            });
+            return Err(self.never_started(container, delivery.clone()));
         }
         if events
             .publish(&WorkerEvent::Started {
@@ -610,7 +635,30 @@ impl Worker {
                 retained_processes: Vec::new(),
             });
         }
+        // The launch fence: a container the daemon never acknowledged (it
+        // died, or its transport did, before it journaled Started) is never
+        // started; it is deleted (`KitInstall.tla` `noStartedAck`).
+        if let Some(acked) = events.started_acknowledgement()
+            && !controls.await_flag(&acked, self.started_ack_timeout)
+        {
+            let delivery = controls.stopped.clone().unwrap_or(DeliveryOutcome::Failed);
+            return Err(self.never_started(container, delivery));
+        }
         Ok((grants, container))
+    }
+
+    /// A created container that is never started: deleted.
+    fn never_started(&self, container: ContainerId, delivery: DeliveryOutcome) -> WorkerReport {
+        let cleanup = self.delete(&container);
+        WorkerReport {
+            container_id: Some(container),
+            execution: ExecutionOutcome::NotStarted,
+            delivery,
+            cleanup,
+            quarantine: cleanup == CleanupOutcome::Uncertain,
+            control_errors: 0,
+            retained_processes: Vec::new(),
+        }
     }
 
     fn delete(&self, container: &ContainerId) -> CleanupOutcome {
@@ -953,6 +1001,8 @@ struct AttemptMailbox {
     state: Mutex<AttemptMailboxState>,
     ready: Condvar,
     attempt_cancel: Option<marsh_runtime::Cancellation>,
+    /// Set by the daemon's [`WorkerRequest::StartedAck`].
+    started_acked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AttemptMailbox {
@@ -1124,6 +1174,8 @@ struct MultiplexedEventSink {
     output: Publisher,
     /// The job's container once it exists: what the port forwards inspect.
     container: Arc<Mutex<Option<ContainerId>>>,
+    /// The daemon acknowledges `Started` (its Start asked for that).
+    acknowledged: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl EventSink for MultiplexedEventSink {
@@ -1143,6 +1195,10 @@ impl EventSink for MultiplexedEventSink {
             WorkerEvent::SetupFailed { .. } => return Ok(()),
         };
         self.output.send(&response)
+    }
+
+    fn started_acknowledgement(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        self.acknowledged.clone()
     }
 }
 
@@ -1329,10 +1385,21 @@ pub fn serve_retained(
                     forwards.set_ports(&ports);
                 }
             }
+            WorkerRequest::StartedAck { attempt } => {
+                let active = controls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(route) = active.get(&attempt) {
+                    route
+                        .started_acked
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
             WorkerRequest::Start {
                 attempt,
                 generation: requested,
                 mut spec,
+                started_ack,
             } => {
                 let rejection =
                     if !marsh_runtime::poll_retained_processes(Duration::ZERO).is_empty() {
@@ -1423,6 +1490,7 @@ pub fn serve_retained(
                             attempt: attempt.clone(),
                             output: task_output.clone(),
                             container: container_slot,
+                            acknowledged: started_ack.then(|| Arc::clone(&mailbox.started_acked)),
                         };
                         let report = task_worker.run_with_events(
                             &spec,
@@ -1490,6 +1558,7 @@ pub fn serve_retained(
                     ),
                     WorkerRequest::Ping { .. }
                     | WorkerRequest::Start { .. }
+                    | WorkerRequest::StartedAck { .. }
                     | WorkerRequest::CapData { .. }
                     | WorkerRequest::CapClose { .. }
                     | WorkerRequest::ChanEof { .. }

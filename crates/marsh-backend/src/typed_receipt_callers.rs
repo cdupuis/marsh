@@ -314,6 +314,7 @@ fn worker_observation(root: &Path, mode: &'static str) -> (WorkerReport, Vec<u8>
             attempt: "attempt-1".into(),
             generation: 1,
             spec,
+            started_ack: false,
         },
     )
     .unwrap();

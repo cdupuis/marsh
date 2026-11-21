@@ -2921,6 +2921,15 @@ impl DaemonBackend for StockDaemonBackend {
                             transport_detail = Some(detail);
                             break lost;
                         }
+                        // Journaled (synced) with its VM and container: the
+                        // worker may start it now. Unacknowledged, it deletes
+                        // the container and never starts it.
+                        let _ = control.send_bounded(
+                            &WorkerRequest::StartedAck {
+                                attempt: attempt_id.clone(),
+                            },
+                            WORKER_CANCEL_WRITE_TIMEOUT,
+                        );
                     }
                     Ok(WorkerResponse::Stdout { bytes, .. }) => {
                         first_output_at.get_or_insert_with(Instant::now);
@@ -9090,6 +9099,11 @@ mod tests {
         let arm = &arm[..arm.find("Ok(WorkerResponse::Stdout {").unwrap()];
         assert!(arm.contains("record_start("), "{arm}");
         assert!(arm.contains("break lost;"), "{arm}");
+        // The launch fence: acknowledged only after record_start journaled it.
+        let ack = arm
+            .find("WorkerRequest::StartedAck")
+            .expect("the arm acknowledges Started");
+        assert!(arm.find("record_start(").unwrap() < ack, "{arm}");
         assert!(!arm.contains('?'), "the arm must not return early: {arm}");
     }
 

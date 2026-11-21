@@ -289,6 +289,8 @@ struct FakeRuntime {
     setup_failure: Option<SetupStage>,
     create_error: Mutex<Option<RuntimeError>>,
     delete_fails: bool,
+    review_create: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    review_attach: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl FakeRuntime {
@@ -340,6 +342,9 @@ impl JobRuntime for FakeRuntime {
     }
     fn create(&self, _spec: &JobSpec) -> Result<ContainerId, RuntimeError> {
         self.calls.lock().unwrap().push("create");
+        if let Some(hook) = self.review_create.lock().unwrap().take() {
+            hook();
+        }
         if let Some(error) = self.create_error.lock().unwrap().take() {
             return Err(error);
         }
@@ -360,6 +365,9 @@ impl JobRuntime for FakeRuntime {
         _terminal_size: Option<TerminalSize>,
     ) -> Result<Attachment, RuntimeError> {
         self.calls.lock().unwrap().push("attach");
+        if let Some(hook) = self.review_attach.lock().unwrap().take() {
+            hook();
+        }
         if self.setup_failure == Some(SetupStage::Attach) {
             Err(RuntimeError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -519,6 +527,7 @@ fn retained_transport_multiplexes_fresh_containers_and_terminal_reports() {
                 attempt: attempt.into(),
                 generation: 7,
                 spec: job(),
+                started_ack: false,
             },
         )
         .unwrap();
@@ -553,6 +562,7 @@ fn write_start(controller: &mut UnixStream, attempt: &str) {
             attempt: attempt.into(),
             generation: 7,
             spec: job(),
+            started_ack: false,
         },
     )
     .unwrap();
@@ -732,6 +742,7 @@ fn late_controls_after_fast_terminal_are_ignored_without_false_rejection() {
             attempt: "fast".into(),
             generation: 7,
             spec: job(),
+            started_ack: false,
         },
     )
     .unwrap();
@@ -1075,6 +1086,232 @@ fn review_v2e_started_event_precedes_actual_container_launch() {
         *runtime.calls.lock().unwrap(),
         ["create", "attach", "start", "delete"]
     );
+}
+
+/// Uses the real retained protocol and OS socket. A carrier need not read or
+/// forward Started for publication to succeed. (A Start that does not ask
+/// for the acknowledgement, as an older daemon's: the worker launches at
+/// once, as before round 6.) A delayed EOF at an upstream
+/// controller is therefore different from a failed guest output write.
+#[test]
+fn review_v2f_create_can_finish_and_launch_without_controller_receiving_started() {
+    let (mut carrier, worker_socket) = UnixStream::pair().unwrap();
+    carrier.set_read_timeout(Some(CONDITION_DEADLINE)).unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    let (creating_tx, creating) = mpsc::channel();
+    let (create_tx, create_rx) = mpsc::channel();
+    *runtime.review_create.lock().unwrap() = Some(Box::new(move || {
+        creating_tx.send(()).unwrap();
+        create_rx.recv_timeout(CONDITION_DEADLINE).unwrap();
+    }));
+    let (launch_tx, launched) = mpsc::channel();
+    let (finish_tx, finish_rx) = mpsc::channel();
+    *runtime.review_attach.lock().unwrap() = Some(Box::new(move || {
+        launch_tx.send(()).unwrap();
+        finish_rx.recv_timeout(CONDITION_DEADLINE).unwrap();
+    }));
+    let retained = Arc::new(worker(
+        runtime.clone(),
+        Arc::new(FixedSupervisor(ExecutionOutcome::Exited { code: 0 })),
+    ));
+    let transport = WorkerTransport::from_socket(worker_socket).unwrap();
+    let server = thread::spawn(move || super::serve_retained(&retained, 1, 8, transport));
+    assert!(matches!(
+        read_frame::<WorkerResponse>(&mut carrier).unwrap(),
+        WorkerResponse::Ready { .. }
+    ));
+    write_frame(
+        &mut carrier,
+        &WorkerRequest::Start {
+            attempt: "late-create".into(),
+            generation: 1,
+            spec: job(),
+            started_ack: false,
+        },
+    )
+    .unwrap();
+    creating.recv_timeout(CONDITION_DEADLINE).unwrap();
+    // The controller's old sbx carrier is still connected, but no controller
+    // consumes any further response. A new daemon can sample Docker here.
+    create_tx.send(()).unwrap();
+    let launch_result = launched.recv_timeout(CONDITION_DEADLINE);
+    // Unblock and join every task before making assertions.
+    finish_tx.send(()).unwrap();
+    let started = read_frame::<WorkerResponse>(&mut carrier).unwrap();
+    let terminal = read_frame::<WorkerResponse>(&mut carrier).unwrap();
+    carrier.shutdown(std::net::Shutdown::Both).unwrap();
+    server.join().unwrap().unwrap();
+    assert!(
+        launch_result.is_ok(),
+        "launch waited for a controller acknowledgement"
+    );
+    assert!(matches!(started, WorkerResponse::Started { .. }));
+    assert!(matches!(terminal, WorkerResponse::Terminal { .. }));
+    assert_eq!(
+        *runtime.calls.lock().unwrap(),
+        ["create", "attach", "start", "delete"]
+    );
+}
+
+/// The launch fence (round 6): a Start that asks for the acknowledgement
+/// starts its container only once the daemon acknowledges `Started`. With no
+/// acknowledgement (the daemon died, or its transport did) the container is
+/// deleted, never attached or started: after its timeout, or when the
+/// transport closes. Fails when the worker starts without waiting.
+#[test]
+fn an_unacknowledged_started_container_is_deleted_and_never_started() {
+    for close in [false, true] {
+        let (mut carrier, worker_socket) = UnixStream::pair().unwrap();
+        carrier.set_read_timeout(Some(CONDITION_DEADLINE)).unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let retained = Arc::new(
+            worker(
+                runtime.clone(),
+                Arc::new(FixedSupervisor(ExecutionOutcome::Exited { code: 0 })),
+            )
+            .with_started_ack_timeout(if close {
+                CONDITION_DEADLINE
+            } else {
+                Duration::from_millis(200)
+            }),
+        );
+        let transport = WorkerTransport::from_socket(worker_socket).unwrap();
+        let server = thread::spawn(move || super::serve_retained(&retained, 1, 8, transport));
+        assert!(matches!(
+            read_frame::<WorkerResponse>(&mut carrier).unwrap(),
+            WorkerResponse::Ready { .. }
+        ));
+        write_frame(
+            &mut carrier,
+            &WorkerRequest::Start {
+                attempt: "fenced".into(),
+                generation: 1,
+                spec: job(),
+                started_ack: true,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_frame::<WorkerResponse>(&mut carrier).unwrap(),
+            WorkerResponse::Started { .. }
+        ));
+        let waited = Instant::now();
+        if close {
+            carrier.shutdown(std::net::Shutdown::Write).unwrap();
+        } else {
+            match read_frame::<WorkerResponse>(&mut carrier).unwrap() {
+                WorkerResponse::Terminal { report, .. } => {
+                    assert_eq!(report.execution, ExecutionOutcome::NotStarted);
+                    assert_eq!(report.cleanup, CleanupOutcome::Verified);
+                }
+                other => panic!("not a terminal report: {other:?}"),
+            }
+            carrier.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        let _ = server.join().unwrap();
+        // A closed transport ends the wait at once, not at its timeout.
+        assert!(waited.elapsed() < CONDITION_DEADLINE, "close={close}");
+        assert_eq!(
+            *runtime.calls.lock().unwrap(),
+            ["create", "delete"],
+            "close={close}"
+        );
+    }
+}
+
+/// Acknowledged, the container starts as before.
+#[test]
+fn an_acknowledged_started_container_starts() {
+    let (mut carrier, worker_socket) = UnixStream::pair().unwrap();
+    carrier.set_read_timeout(Some(CONDITION_DEADLINE)).unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    let retained = Arc::new(worker(
+        runtime.clone(),
+        Arc::new(FixedSupervisor(ExecutionOutcome::Exited { code: 0 })),
+    ));
+    let transport = WorkerTransport::from_socket(worker_socket).unwrap();
+    let server = thread::spawn(move || super::serve_retained(&retained, 1, 8, transport));
+    assert!(matches!(
+        read_frame::<WorkerResponse>(&mut carrier).unwrap(),
+        WorkerResponse::Ready { .. }
+    ));
+    write_frame(
+        &mut carrier,
+        &WorkerRequest::Start {
+            attempt: "acked".into(),
+            generation: 1,
+            spec: job(),
+            started_ack: true,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        read_frame::<WorkerResponse>(&mut carrier).unwrap(),
+        WorkerResponse::Started { .. }
+    ));
+    write_frame(
+        &mut carrier,
+        &WorkerRequest::StartedAck {
+            attempt: "acked".into(),
+        },
+    )
+    .unwrap();
+    match read_frame::<WorkerResponse>(&mut carrier).unwrap() {
+        WorkerResponse::Terminal { report, .. } => {
+            assert_eq!(report.execution, ExecutionOutcome::Exited { code: 0 });
+        }
+        other => panic!("not a terminal report: {other:?}"),
+    }
+    carrier.shutdown(std::net::Shutdown::Both).unwrap();
+    let _ = server.join().unwrap();
+    assert_eq!(
+        *runtime.calls.lock().unwrap(),
+        ["create", "attach", "start", "delete"]
+    );
+}
+
+/// A worker older than the acknowledgement rejects a Start that asks for
+/// it: `deny_unknown_fields` (here, an unknown field the same way), so a
+/// daemon never runs a job on a worker without the fence.
+#[test]
+fn a_start_with_an_unknown_field_is_rejected() {
+    let frame = serde_json::json!({
+        "type": "start",
+        "attempt": "a",
+        "generation": 1,
+        "spec": serde_json::to_value(job()).unwrap(),
+        "started_ack": true,
+        "from_the_future": true,
+    });
+    assert!(serde_json::from_value::<WorkerRequest>(frame.clone()).is_err());
+    let mut known = frame;
+    known.as_object_mut().unwrap().remove("from_the_future");
+    assert!(matches!(
+        serde_json::from_value::<WorkerRequest>(known).unwrap(),
+        WorkerRequest::Start {
+            started_ack: true,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn review_v2f_failed_started_publication_deletes_without_launching() {
+    struct Broken;
+    impl EventSink for Broken {
+        fn publish(&mut self, _: &WorkerEvent) -> Result<(), WorkerError> {
+            Err(WorkerError::ControlClosed)
+        }
+    }
+    let runtime = Arc::new(FakeRuntime::default());
+    let worker = worker(
+        runtime.clone(),
+        Arc::new(FixedSupervisor(ExecutionOutcome::Exited { code: 0 })),
+    );
+    let report = worker.run_with_events(&job(), &mut EmptyControls, streams(), &mut Broken);
+    assert_eq!(report.execution, ExecutionOutcome::SupervisionFailed);
+    assert_eq!(report.cleanup, CleanupOutcome::Verified);
+    assert_eq!(*runtime.calls.lock().unwrap(), ["create", "delete"]);
 }
 
 #[test]

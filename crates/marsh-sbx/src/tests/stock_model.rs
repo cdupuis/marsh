@@ -692,6 +692,28 @@ impl StockModel {
         .collect()
     }
 
+    /// Whether each Start written to `vm`'s worker asks for the
+    /// acknowledgement of `Started`.
+    pub fn written_worker_starts_ask_ack(&self, vm: &str) -> Vec<bool> {
+        let written = self
+            .state
+            .lock()
+            .unwrap()
+            .worker_input
+            .get(vm)
+            .cloned()
+            .unwrap_or_default();
+        let mut reader = Cursor::new(written);
+        std::iter::from_fn(|| {
+            marsh_worker::read_frame::<marsh_worker::WorkerRequest>(&mut reader).ok()
+        })
+        .filter_map(|request| match request {
+            marsh_worker::WorkerRequest::Start { started_ack, .. } => Some(started_ack),
+            _ => None,
+        })
+        .collect()
+    }
+
     /// Send `response` to the host as `vm`'s retained worker.
     pub fn worker_says(&self, vm: &str, response: &marsh_worker::WorkerResponse) {
         let socket = self

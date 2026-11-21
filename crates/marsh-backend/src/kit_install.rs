@@ -488,6 +488,8 @@ mod tests {
         exited: Mutex<Vec<String>>,
         review_after_ps: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         review_list_failure: std::sync::atomic::AtomicBool,
+        review_states: Mutex<Vec<(&'static str, String)>>,
+        review_rm_error: std::sync::atomic::AtomicBool,
     }
 
     #[allow(clippy::unnecessary_wraps)] // A stock call's reply.
@@ -710,6 +712,12 @@ mod tests {
                     }
                 }
                 Some("rm") => {
+                    if self
+                        .review_rm_error
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return output(1, "scripted removal failed");
+                    }
                     let name = arguments.last().unwrap().clone();
                     self.vms.lock().unwrap().remove(&name);
                     self.removed.lock().unwrap().push(name);
@@ -723,19 +731,47 @@ mod tests {
                     {
                         return output(1, "Cannot connect to the Docker daemon");
                     }
-                    let mut ids = self.containers.lock().unwrap().clone().unwrap_or_default();
                     let all = arguments.iter().any(|argument| argument == "--all");
                     let filtered = arguments.iter().any(|argument| argument == "--filter");
-                    if all
-                        && arguments
+                    // Running containers: listed unless a status filter
+                    // leaves `running` out.
+                    let mut ids = if !filtered
+                        || arguments
                             .iter()
-                            .any(|argument| argument == "status=created")
+                            .any(|argument| argument == "status=running")
+                    {
+                        self.containers.lock().unwrap().clone().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    // Moby foldFilter sets All=true for any status filter:
+                    // https://github.com/moby/moby/blob/v28.5.2/daemon/list.go
+                    let status_filtered = arguments
+                        .windows(2)
+                        .any(|pair| pair[0] == "--filter" && pair[1].starts_with("status="));
+                    if (all || status_filtered)
+                        && (!filtered
+                            || arguments
+                                .iter()
+                                .any(|argument| argument == "status=created"))
                     {
                         ids.extend(self.created_containers.lock().unwrap().iter().cloned());
                     }
                     if all && !filtered {
-                        ids.extend(self.created_containers.lock().unwrap().iter().cloned());
                         ids.extend(self.exited.lock().unwrap().iter().cloned());
+                    }
+                    for (state, id) in self.review_states.lock().unwrap().iter() {
+                        let wanted = format!("status={state}");
+                        let selected = if filtered {
+                            arguments
+                                .windows(2)
+                                .any(|pair| pair == ["--filter", &wanted])
+                        } else {
+                            all || matches!(*state, "running" | "restarting" | "paused")
+                        };
+                        if selected {
+                            ids.push(id.clone());
+                        }
                     }
                     if let Some(hook) = self.review_after_ps.lock().unwrap().take() {
                         hook();
@@ -2743,6 +2779,15 @@ mod tests {
     /// uncertain; `live` says what `docker ps` in the VM finds. Returns the
     /// lab, the VM and the job.
     fn lab_with_ended_job(restart: bool, exited: bool, live: Live) -> (Lab, String, String) {
+        review_v2f_job_fixture(restart, exited, live, false)
+    }
+
+    fn review_v2f_job_fixture(
+        restart: bool,
+        exited: bool,
+        live: Live,
+        creating: bool,
+    ) -> (Lab, String, String) {
         use marsh_contracts::execution::ExecutionOutcome;
         use marsh_daemon::{
             CleanupState, ExitStatus, JobState, NewJob, SessionAuthority, TimingReport,
@@ -2795,7 +2840,11 @@ mod tests {
             })
             .unwrap();
         store.reserve_worker(&job, &vm, &vm).unwrap();
-        store.mark_running(&job, &vm, &vm, &"a".repeat(64)).unwrap();
+        if creating {
+            store.mark_execution_submitted(&job).unwrap();
+        } else {
+            store.mark_running(&job, &vm, &vm, &"a".repeat(64)).unwrap();
+        }
         match live {
             Live::Running => lab.stock.run_containers(&["a".repeat(64)]),
             Live::None => lab.stock.run_containers(&[]),
@@ -3092,5 +3141,244 @@ mod tests {
     #[test]
     fn review_v2e_plain_teardown_keeps_uninstalled_lost_vm() {
         review_v2e_stale(false);
+    }
+
+    #[test]
+    fn review_v2f_status_filter_keeps_only_containers_that_can_run() {
+        for state in [
+            "created",
+            "running",
+            "restarting",
+            "paused",
+            "exited",
+            "dead",
+            "removing",
+        ] {
+            let (lab, vm, _) = lab_with_ended_job(true, false, Live::None);
+            lab.stock
+                .review_states
+                .lock()
+                .unwrap()
+                .push((state, "a".repeat(64)));
+            let result = lab.reset(&["hf"]);
+            let may_run = matches!(state, "created" | "running" | "restarting" | "paused");
+            assert_eq!(
+                lab.stock.listed().contains(&vm),
+                may_run,
+                "{state}: {result:?}"
+            );
+            assert_eq!(
+                lab.stock.removed().contains(&vm),
+                !may_run,
+                "{state}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_v2f_unnamed_recovery_claim_refuses_late_reserved_job() {
+        let (lab, vm) = review_v2f_unnamed_fixture();
+        let store = lab.store().clone();
+        let target = vm.clone();
+        *lab.stock.review_after_ps.lock().unwrap() = Some(Box::new(move || {
+            // An already-prepared job reaches reservation after the initial
+            // unfinished-job check, before the atomic retirement claim.
+            let session = store.attach_shell(
+                1,
+                marsh_daemon::SessionAuthority {
+                    username: "alice".into(),
+                    uid: 501,
+                    gid: 20,
+                    launch_directory: "/Users/alice/project".into(),
+                    guest_home: "/Users/alice".into(),
+                    home_backing: "/Users/alice".into(),
+                    ephemeral_home: false,
+                },
+            );
+            let (job, _) = store
+                .begin_job(marsh_daemon::NewJob {
+                    label: None,
+                    session_id: session,
+                    command: "old".into(),
+                    kit_ref: reference('c'),
+                    workload_image: reference('c'),
+                    mounts: vec![],
+                })
+                .unwrap();
+            store.reserve_worker(&job, &target, &target).unwrap();
+        }));
+        let result = lab.backend.recover_quarantined_vm(lab.store(), &vm);
+        assert!(result.is_err(), "{result:?}");
+        assert!(!lab.stock.removed().contains(&vm), "{result:?}");
+        assert!(lab.stock.listed().contains(&vm));
+    }
+
+    #[test]
+    fn review_v2f_unnamed_recovery_failed_removal_requarantines_claim() {
+        let (lab, vm) = review_v2f_unnamed_fixture();
+        lab.stock
+            .review_rm_error
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            lab.backend
+                .recover_quarantined_vm(lab.store(), &vm)
+                .is_err()
+        );
+        let worker = lab
+            .store()
+            .status(None)
+            .workers
+            .into_iter()
+            .find(|worker| worker.vm_id == vm)
+            .unwrap();
+        assert_eq!(worker.health, marsh_daemon::WorkerHealth::Quarantined);
+        assert!(lab.stock.listed().contains(&vm));
+    }
+
+    fn review_v2f_unnamed_fixture() -> (Lab, String) {
+        let lab = Lab::new();
+        lab.stock.script(&[Create::FailedListed]);
+        lab.install("hf", &reference('c')).unwrap_err();
+        let vm = lab.stock.created()[0].clone();
+        lab.stock.run_containers(&[]);
+        assert!(lab.backend.kit_spec_lookup("hf").is_none());
+        lab.store()
+            .register_worker(marsh_daemon::WorkerStatus {
+                worker_id: vm.clone(),
+                vm_id: vm.clone(),
+                scope_id: lab.store().status(None).scope_id,
+                kit_ref: reference('c'),
+                kits: vec![],
+                warm: true,
+                health: marsh_daemon::WorkerHealth::Ready,
+                container_capacity: 8,
+                active_container_ids: vec![],
+                quarantine: None,
+            })
+            .unwrap();
+        (lab, vm)
+    }
+
+    /// The guest can start before the daemon consumes/journals Started. The
+    /// VM reservation is memory-only, so the reopened Unknown receipt has no
+    /// VM at all. Even a container already running before the crash is missed.
+    #[test]
+    fn review_v2f_name_reset_keeps_lost_job_started_before_started_was_journaled() {
+        review_v2f_unjournaled_start(0);
+    }
+
+    #[test]
+    fn review_v2f_plain_teardown_keeps_lost_job_started_before_started_was_journaled() {
+        review_v2f_unjournaled_start(1);
+    }
+
+    #[test]
+    fn review_v2f_stale_sweep_keeps_lost_job_started_before_started_was_journaled() {
+        review_v2f_unjournaled_start(2);
+    }
+
+    #[test]
+    fn review_v2f_plain_stop_keeps_lost_job_started_before_started_was_journaled() {
+        review_v2f_unjournaled_start(3);
+    }
+
+    fn review_v2f_unjournaled_start(path: u8) {
+        let (mut lab, vm, job) = review_v2f_job_fixture(true, false, Live::Running, true);
+        let receipt = lab.store().job(&job).unwrap();
+        assert!(receipt.container_id.is_none());
+        eprintln!(
+            "reopened job {job}: worker={:?}, vm={:?}, execution={:?}",
+            receipt.worker_id, receipt.vm_id, receipt.execution
+        );
+        // Round 6: the assignment was journaled before the submission.
+        assert_eq!(receipt.vm_id.as_deref(), Some(vm.as_str()));
+        assert_eq!(lab.store().jobs_whose_execution_may_run(&vm), std::slice::from_ref(&job));
+        let reply = match path {
+            0 => format!("{:?}", lab.reset(&["hf"])),
+            1..=3 => {
+                if path == 2 {
+                    lab.register("hf", &reference('d'));
+                }
+                let request = if path == 3 {
+                    marsh_daemon::PublicRequest::StopScope
+                } else {
+                    marsh_daemon::PublicRequest::ResetScope
+                };
+                format!("{:?}", review_v2e_lifecycle(&mut lab, request))
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            lab.stock.containers.lock().unwrap().as_deref(),
+            Some(&["a".repeat(64)][..])
+        );
+        assert!(
+            !lab.stock.removed().contains(&vm),
+            "path={path} removed VM {vm} while lost job {job} runs; its reservation was not journaled: {reply}"
+        );
+    }
+
+    /// claude-v2f: an old generation's kept VM is reported cleanup
+    /// uncertain (never `cleanup_complete`), naming the VM and the override.
+    fn review_v2f_old_generation(
+        live: Live,
+        created: bool,
+    ) -> (Lab, String, marsh_daemon::ScopeLifecycleReport) {
+        let (lab, vm, job) = lab_with_ended_job(true, false, live);
+        if created {
+            lab.stock.create_container(&"b".repeat(64));
+        }
+        lab.register("hf", &reference('d'));
+        let report = lab.backend.teardown_scope(
+            marsh_daemon::ScopeLifecycleAction::Stop,
+            lab.store().clone(),
+            std::time::Instant::now() + Duration::from_secs(30),
+        );
+        let _ = job;
+        (lab, vm, report)
+    }
+
+    fn review_v2f_assert_kept(lab: &Lab, vm: &str, report: &marsh_daemon::ScopeLifecycleReport) {
+        assert!(!lab.stock.removed().iter().any(|r| r == vm), "{report:?}");
+        assert!(!report.cleanup_complete, "{report:?}");
+        assert!(
+            report
+                .components
+                .iter()
+                .any(|c| c.label == "stale-generations"
+                    && c.state == marsh_daemon::ScopeCleanupState::CleanupUncertain
+                    && c.vm.as_deref() == Some(vm)
+                    && c.detail
+                        .as_deref()
+                        .is_some_and(|d| d.contains("marsh stop --force"))),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn review_v2f_old_generation_kept_running_reports_uncertain() {
+        let (lab, vm, report) = review_v2f_old_generation(Live::Running, false);
+        review_v2f_assert_kept(&lab, &vm, &report);
+    }
+
+    #[test]
+    fn review_v2f_old_generation_kept_unreadable_reports_uncertain() {
+        let (lab, vm, report) = review_v2f_old_generation(Live::Unreadable, false);
+        review_v2f_assert_kept(&lab, &vm, &report);
+    }
+
+    /// A created (start pending) container in an old generation fences the
+    /// teardown too, not just reset NAME and recovery.
+    #[test]
+    fn review_v2f_old_generation_kept_created_reports_uncertain() {
+        let (lab, vm, report) = review_v2f_old_generation(Live::None, true);
+        review_v2f_assert_kept(&lab, &vm, &report);
+    }
+
+    /// Nothing runs or may start: the old generation goes.
+    #[test]
+    fn review_v2f_old_generation_released_when_empty() {
+        let (lab, vm, report) = review_v2f_old_generation(Live::None, false);
+        assert!(lab.stock.removed().iter().any(|r| r == &vm), "{report:?}");
     }
 }

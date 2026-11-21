@@ -1680,6 +1680,59 @@ fn worker_reset_refuses_active_selection_atomically_and_preserves_other_state() 
     assert_eq!(store.job(&job).unwrap().state, JobState::Cancelled);
 }
 
+/// GPT's round 6: the job's VM assignment is journaled, synced, before its
+/// Start is submitted, so a daemon that dies before the worker's Started
+/// still finds the job on its VM after a restart; a failed write fails the
+/// submission. Fails when `mark_execution_submitted` does not journal.
+#[test]
+fn a_submitted_jobs_vm_assignment_survives_a_restart() {
+    for failing in [false, true] {
+        let home = home();
+        let store = reopen(home.path()).unwrap();
+        let session = store.attach_shell(1, authority("/Users/example/project", home.path()));
+        store
+            .register_worker(WorkerStatus {
+                worker_id: "target".into(),
+                vm_id: "target".into(),
+                scope_id: store.status(None).scope_id,
+                kit_ref: "kit:test".into(),
+                kits: vec![],
+                warm: true,
+                health: WorkerHealth::Ready,
+                container_capacity: 8,
+                active_container_ids: vec![],
+                quarantine: None,
+            })
+            .unwrap();
+        let (job, _) = store
+            .begin_job(NewJob {
+                label: None,
+                session_id: session,
+                command: "hf".into(),
+                kit_ref: "kit:test".into(),
+                workload_image: format!("fixture@sha256:{}", "a".repeat(64)),
+                mounts: vec![],
+            })
+            .unwrap();
+        store.reserve_worker(&job, "target", "target").unwrap();
+        if failing {
+            store.lock().journal.fail_for_test();
+            assert!(store.mark_execution_submitted(&job).is_err());
+            assert_eq!(
+                store.job(&job).unwrap().execution,
+                ExecutionOutcome::NotStarted
+            );
+            continue;
+        }
+        store.mark_execution_submitted(&job).unwrap();
+        drop(store);
+        let store = reopen(home.path()).unwrap();
+        let receipt = store.job(&job).unwrap();
+        assert_eq!(receipt.vm_id.as_deref(), Some("target"));
+        assert_eq!(store.jobs_whose_execution_may_run("target"), [job]);
+    }
+}
+
 /// Claude's round 4: the operator claim judges a job that ended with its
 /// cleanup uncertain by its typed execution. `Unknown` and
 /// `SupervisionFailed` are no proof it ended (refused unless the VM was verified to run no

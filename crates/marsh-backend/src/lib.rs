@@ -2906,30 +2906,38 @@ impl DaemonBackend for StockDaemonBackend {
                         // A start the store refuses ends the attempt as lost
                         // (the container is cancelled; grants are revoked and
                         // the container reconciled below like any loss).
-                        if let Err((detail, lost)) =
-                            record_start(&store, &job_id, &vm.name, container_id, || {
+                        if let Err((detail, lost)) = record_start(
+                            &store,
+                            &job_id,
+                            &vm.name,
+                            container_id,
+                            || {
                                 let _ = control.send_bounded(
                                     &WorkerRequest::Cancel {
                                         attempt: attempt_id.clone(),
                                     },
                                     WORKER_CANCEL_WRITE_TIMEOUT,
                                 );
-                            })
-                        {
+                            },
+                            // Journaled (synced) with its VM and container:
+                            // the worker may start it now. The send's result
+                            // is ignored on purpose: a lost write shows up as
+                            // the worker's lost route, or as its own ack
+                            // timeout, which deletes the container unstarted.
+                            || {
+                                let _ = control.send_bounded(
+                                    &WorkerRequest::StartedAck {
+                                        attempt: attempt_id.clone(),
+                                    },
+                                    WORKER_CANCEL_WRITE_TIMEOUT,
+                                );
+                            },
+                        ) {
                             transport_lost = true;
                             output_complete = false;
                             transport_detail = Some(detail);
                             break lost;
                         }
-                        // Journaled (synced) with its VM and container: the
-                        // worker may start it now. Unacknowledged, it deletes
-                        // the container and never starts it.
-                        let _ = control.send_bounded(
-                            &WorkerRequest::StartedAck {
-                                attempt: attempt_id.clone(),
-                            },
-                            WORKER_CANCEL_WRITE_TIMEOUT,
-                        );
                     }
                     Ok(WorkerResponse::Stdout { bytes, .. }) => {
                         first_output_at.get_or_insert_with(Instant::now);
@@ -4157,20 +4165,25 @@ fn cleanup_diagnostic(message: &str, output_budget: u64, output_used: u64) -> Ve
 
 /// Record the worker's `Started` on the receipt. When the store refuses it
 /// the container may be running: `cancel` is called, and the loss is returned
-/// for the response loop to break out with, never an early return.
+/// for the response loop to break out with, never an early return. Once the
+/// store journaled it, `acknowledge` is called (the worker's launch fence),
+/// and only then.
 fn record_start(
     store: &DaemonStore,
     job_id: &str,
     vm: &str,
     container_id: marsh_contracts::ContainerId,
     cancel: impl FnOnce(),
+    acknowledge: impl FnOnce(),
 ) -> Result<(), (String, WorkerReport)> {
     store
         .mark_running(job_id, vm, vm, container_id.as_str())
         .map_err(|error| {
             cancel();
             unrecorded_start(Some(container_id), &error)
-        })
+        })?;
+    acknowledge();
+    Ok(())
 }
 
 /// The worker reported a started container that the store refused to record
@@ -9065,9 +9078,14 @@ mod tests {
         let container = marsh_contracts::ContainerId::parse("a".repeat(64)).unwrap();
         let (store, job) = reserved_cleanup_job(home.path(), &vm, &container);
         let cancelled = std::cell::Cell::new(false);
-        let (detail, report) = record_start(&store, &job, &vm.name, container.clone(), || {
-            cancelled.set(true);
-        })
+        let (detail, report) = record_start(
+            &store,
+            &job,
+            &vm.name,
+            container.clone(),
+            || cancelled.set(true),
+            || panic!("review v2g: a refused start must not be acknowledged"),
+        )
         .unwrap_err();
         assert!(cancelled.get(), "the container was not cancelled");
         assert!(detail.contains("could not be recorded"), "{detail}");
@@ -9099,11 +9117,9 @@ mod tests {
         let arm = &arm[..arm.find("Ok(WorkerResponse::Stdout {").unwrap()];
         assert!(arm.contains("record_start("), "{arm}");
         assert!(arm.contains("break lost;"), "{arm}");
-        // The launch fence: acknowledged only after record_start journaled it.
-        let ack = arm
-            .find("WorkerRequest::StartedAck")
-            .expect("the arm acknowledges Started");
-        assert!(arm.find("record_start(").unwrap() < ack, "{arm}");
+        // The launch fence: the acknowledgement is record_start's (tested
+        // behaviourally above); the arm sends it nowhere else.
+        assert_eq!(arm.matches("WorkerRequest::StartedAck").count(), 1, "{arm}");
         assert!(!arm.contains('?'), "the arm must not return early: {arm}");
     }
 
@@ -9140,10 +9156,28 @@ mod tests {
             })
             .unwrap();
         store.reserve_worker(&job, &vm.name, &vm.name).unwrap();
-        record_start(&store, &job, &vm.name, container, || {
-            panic!("a recorded start must not cancel")
-        })
+        let acknowledged = std::cell::Cell::new(false);
+        record_start(
+            &store,
+            &job,
+            &vm.name,
+            container.clone(),
+            || panic!("a recorded start must not cancel"),
+            || {
+                // review v2g: acknowledged only once the store holds Running
+                // with the VM and container.
+                let receipt = store.job(&job).unwrap();
+                assert_eq!(receipt.state, marsh_daemon::JobState::Running);
+                assert_eq!(receipt.vm_id.as_deref(), Some(vm.name.as_str()));
+                assert_eq!(receipt.container_id.as_deref(), Some(container.as_str()));
+                acknowledged.set(true);
+            },
+        )
         .unwrap();
+        assert!(
+            acknowledged.get(),
+            "review v2g: a recorded start is acknowledged"
+        );
         assert_eq!(
             store.job(&job).unwrap().state,
             marsh_daemon::JobState::Running

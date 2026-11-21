@@ -1199,13 +1199,25 @@ fn an_unacknowledged_started_container_is_deleted_and_never_started() {
         if close {
             carrier.shutdown(std::net::Shutdown::Write).unwrap();
         } else {
-            match read_frame::<WorkerResponse>(&mut carrier).unwrap() {
-                WorkerResponse::Terminal { report, .. } => {
-                    assert_eq!(report.execution, ExecutionOutcome::NotStarted);
-                    assert_eq!(report.cleanup, CleanupOutcome::Verified);
+            // Round 7: the timeout says what happened on the job's stderr.
+            let mut stderr = Vec::new();
+            let report = loop {
+                match read_frame::<WorkerResponse>(&mut carrier).unwrap() {
+                    WorkerResponse::Stderr { bytes, .. } => stderr.extend(bytes),
+                    WorkerResponse::Terminal { report, .. } => break report,
+                    other => panic!("not a terminal report: {other:?}"),
                 }
-                other => panic!("not a terminal report: {other:?}"),
-            }
+            };
+            assert_eq!(report.execution, ExecutionOutcome::NotStarted);
+            assert_eq!(report.cleanup, CleanupOutcome::Verified);
+            assert_eq!(report.delivery, DeliveryOutcome::Complete);
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert!(
+                stderr.contains("did not acknowledge")
+                    && stderr.contains("never started (nothing ran)")
+                    && stderr.contains("retrying is safe"),
+                "{stderr}"
+            );
             carrier.shutdown(std::net::Shutdown::Both).unwrap();
         }
         let _ = server.join().unwrap();
@@ -2961,4 +2973,105 @@ fn controller_loss_terminates_kills_and_verifies_container_cleanup() {
     let state = runtime.state.lock().unwrap();
     assert_stopped_with_kill(&state.signals);
     assert!(state.deleted);
+}
+
+/// Review claude-v2g: the acknowledgement is per attempt. Two concurrent
+/// fenced Starts on one worker; only one is acknowledged: it starts, the
+/// other is deleted at its timeout, never attached.
+#[test]
+fn review_v2g_ack_is_per_attempt_under_concurrent_starts() {
+    let (mut carrier, worker_socket) = UnixStream::pair().unwrap();
+    carrier.set_read_timeout(Some(CONDITION_DEADLINE)).unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    let retained = Arc::new(
+        worker(
+            runtime.clone(),
+            Arc::new(FixedSupervisor(ExecutionOutcome::Exited { code: 0 })),
+        )
+        .with_started_ack_timeout(Duration::from_millis(500)),
+    );
+    let transport = WorkerTransport::from_socket(worker_socket).unwrap();
+    let server = thread::spawn(move || super::serve_retained(&retained, 1, 8, transport));
+    assert!(matches!(
+        read_frame::<WorkerResponse>(&mut carrier).unwrap(),
+        WorkerResponse::Ready { .. }
+    ));
+    for attempt in ["acked", "unacked"] {
+        write_frame(
+            &mut carrier,
+            &WorkerRequest::Start {
+                attempt: attempt.into(),
+                generation: 1,
+                spec: job(),
+                started_ack: true,
+            },
+        )
+        .unwrap();
+    }
+    let mut terminals = BTreeMap::new();
+    while terminals.len() < 2 {
+        match read_frame::<WorkerResponse>(&mut carrier).unwrap() {
+            WorkerResponse::Started { attempt, .. } if attempt == "acked" => {
+                write_frame(&mut carrier, &WorkerRequest::StartedAck { attempt }).unwrap();
+            }
+            WorkerResponse::Terminal { attempt, report } => {
+                terminals.insert(attempt, report);
+            }
+            _ => {}
+        }
+    }
+    carrier.shutdown(std::net::Shutdown::Both).unwrap();
+    let _ = server.join().unwrap();
+    assert_eq!(
+        terminals["acked"].execution,
+        ExecutionOutcome::Exited { code: 0 }
+    );
+    assert_eq!(terminals["unacked"].execution, ExecutionOutcome::NotStarted);
+    assert_eq!(terminals["unacked"].cleanup, CleanupOutcome::Verified);
+    // Round 7: an ack timeout writes its diagnostic to the job's stderr,
+    // and that delivery succeeded (no `output_delivery_failed`).
+    assert_eq!(terminals["unacked"].delivery, DeliveryOutcome::Complete);
+    let calls = runtime.calls.lock().unwrap();
+    assert_eq!(calls.iter().filter(|call| **call == "attach").count(), 1);
+    assert_eq!(calls.iter().filter(|call| **call == "delete").count(), 2);
+}
+
+/// Review claude-v2g: what an older worker does with a Start carrying a
+/// field it does not know (as `started_ack` is to a pre-round-6 worker): the
+/// server returns an error naming the field, promptly; no hang, no launch.
+#[test]
+fn review_v2g_unknown_start_field_ends_the_server_with_a_named_error() {
+    let (mut carrier, worker_socket) = UnixStream::pair().unwrap();
+    carrier.set_read_timeout(Some(CONDITION_DEADLINE)).unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    let retained = Arc::new(worker(
+        runtime.clone(),
+        Arc::new(FixedSupervisor(ExecutionOutcome::Exited { code: 0 })),
+    ));
+    let transport = WorkerTransport::from_socket(worker_socket).unwrap();
+    let server = thread::spawn(move || super::serve_retained(&retained, 1, 8, transport));
+    assert!(matches!(
+        read_frame::<WorkerResponse>(&mut carrier).unwrap(),
+        WorkerResponse::Ready { .. }
+    ));
+    let frame = serde_json::to_vec(&serde_json::json!({
+        "type": "start",
+        "attempt": "a",
+        "generation": 1,
+        "spec": serde_json::to_value(job()).unwrap(),
+        "from_the_future": true,
+    }))
+    .unwrap();
+    carrier
+        .write_all(&u32::try_from(frame.len()).unwrap().to_be_bytes())
+        .unwrap();
+    carrier.write_all(&frame).unwrap();
+    let began = Instant::now();
+    let error = server.join().unwrap().unwrap_err();
+    assert!(began.elapsed() < Duration::from_secs(5));
+    assert!(error.to_string().contains("from_the_future"), "{error}");
+    assert!(runtime.calls.lock().unwrap().is_empty());
+    // The transport is closed: the daemon side sees EOF, not silence.
+    let mut rest = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut carrier, &mut rest);
 }

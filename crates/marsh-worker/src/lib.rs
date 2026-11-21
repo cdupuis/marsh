@@ -641,10 +641,44 @@ impl Worker {
         if let Some(acked) = events.started_acknowledgement()
             && !controls.await_flag(&acked, self.started_ack_timeout)
         {
-            let delivery = controls.stopped.clone().unwrap_or(DeliveryOutcome::Failed);
-            return Err(self.never_started(container, delivery));
+            return Err(self.never_acknowledged(spec, controls, streams, container));
         }
         Ok((grants, container))
+    }
+
+    /// The daemon never acknowledged `Started`: the container is deleted,
+    /// never started. On a timeout (the daemon is there but slow) the job's
+    /// stderr says so, and that a retry is safe.
+    fn never_acknowledged(
+        &self,
+        spec: &JobSpec,
+        controls: &mut setup::PreparedControls<'_>,
+        streams: &mut JobStreams,
+        container: ContainerId,
+    ) -> WorkerReport {
+        let timed_out = controls.stopped.is_none()
+            && !controls
+                .cancellation()
+                .is_some_and(|cancel| cancel.is_cancelled());
+        if timed_out {
+            write_setup_diagnostic(
+                streams,
+                spec.resources.output_bytes,
+                SetupStage::Start,
+                &format!(
+                    "the daemon did not acknowledge the container's start within {} s; the container was deleted and never started (nothing ran), so retrying is safe",
+                    self.started_ack_timeout.as_secs()
+                ),
+            );
+        }
+        let delivery = controls.stopped.clone().unwrap_or_else(|| {
+            if timed_out {
+                streams.delivery()
+            } else {
+                DeliveryOutcome::Failed
+            }
+        });
+        self.never_started(container, delivery)
     }
 
     /// A created container that is never started: deleted.

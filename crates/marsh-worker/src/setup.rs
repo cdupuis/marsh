@@ -8,9 +8,13 @@ use marsh_runtime::{Cancellation, JobRuntime, RuntimeError};
 use std::{
     collections::VecDeque,
     io,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub(crate) struct PreparedControls<'a> {
@@ -60,6 +64,23 @@ impl<'a> PreparedControls<'a> {
         }
         result
     }
+    /// Wait, polling controls as during setup, until `flag` is set: `false`
+    /// when the attempt stops (a kill, its transport closing) or `timeout`
+    /// passes first.
+    pub(crate) fn await_flag(&mut self, flag: &AtomicBool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if flag.load(Ordering::Acquire) {
+                return true;
+            }
+            self.poll_setup();
+            if self.stopped.is_some() || self.cancel.is_cancelled() || Instant::now() >= deadline {
+                return flag.load(Ordering::Acquire) && self.stopped.is_none();
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn poll_setup(&mut self) {
         if self.stopped.is_some() {
             return;

@@ -70,6 +70,12 @@ impl ReceiptJournal {
         ))
     }
 
+    /// Make every later append fail, as after an I/O failure (tests).
+    #[cfg(test)]
+    pub(crate) fn fail_for_test(&mut self) {
+        self.healthy = false;
+    }
+
     pub(crate) fn append(
         &mut self,
         receipt: &JobReceipt,

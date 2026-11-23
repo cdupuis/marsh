@@ -46,7 +46,7 @@ impl StockDaemonBackend {
         let mut commands = Vec::new();
         let mut found = None;
         for command in self.command_names() {
-            if let Ok(spec) = self.kit_spec(&command)
+            if let Some(spec) = self.kit_spec_lookup(&command)
                 && spec.name == vm
             {
                 commands.push(command);
@@ -119,8 +119,9 @@ impl StockDaemonBackend {
     }
 
     /// Retire one quarantined Kit VM if it is verifiably safe to. `Ok` is the
-    /// recorded recovery; `Err` says why the VM stays quarantined. The caller
-    /// must not hold the Kit's preparation lock.
+    /// recorded recovery; `Err` says why the VM stays quarantined. It takes
+    /// the Kit lock of the VM's ownership key, whether or not a command names
+    /// the VM (`recoveryNoLock`): the caller must not hold it.
     pub(super) fn recover_quarantined_vm(
         &self,
         store: &DaemonStore,
@@ -129,12 +130,27 @@ impl StockDaemonBackend {
         if !self.vm_quarantined(store, vm) {
             return Err("it is not quarantined".into());
         }
+        let owner = self.sbx.vm_ownership_key(vm).unwrap_or_default();
+        let lock = self
+            .kit_lock_for_key(&owner)
+            .map_err(|error| error.to_string())?;
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.recover_quarantined_vm_locked(store, vm)
+    }
+
+    /// [`Self::recover_quarantined_vm`] for a caller that holds the Kit lock
+    /// of `vm`'s ownership key.
+    pub(super) fn recover_quarantined_vm_locked(
+        &self,
+        store: &DaemonStore,
+        vm: &str,
+    ) -> Result<WorkerRecovery, String> {
+        if !self.vm_quarantined(store, vm) {
+            return Err("it is not quarantined".into());
+        }
         let (commands, spec) = self.spec_for_vm(vm);
-        let lock = spec.as_ref().and_then(|spec| self.kit_lock(spec).ok());
-        let _guard = lock.as_ref().map(|lock| {
-            lock.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
         let outcome = (|| {
             if store.worker_has_unfinished_jobs(vm) {
                 return Err("a job on it has not finished yet".to_owned());
@@ -181,7 +197,9 @@ impl StockDaemonBackend {
         spec: Option<&KitVmSpec>,
     ) -> Result<(), DaemonError> {
         if let Some(spec) = spec {
-            let claim = Self::claim_retirement(store, vec![vm.to_owned()])?;
+            // The caller verified that no container runs on it.
+            let verified = BTreeSet::from([vm.to_owned()]);
+            let claim = Self::claim_retirement(store, vec![vm.to_owned()], &verified)?;
             return self.retire_claimed(
                 store,
                 &BTreeMap::from([(vm.to_owned(), spec.clone())]),
@@ -189,7 +207,14 @@ impl StockDaemonBackend {
             );
         }
         // No command names this VM (a failed install, an update's new image).
-        self.sbx.retire_quarantined_vm(vm).map_err(backend_error)?;
+        // Claimed in the store before the removal, as a named VM is: no job
+        // reserves it while it goes. The caller verified that no container
+        // runs on it.
+        store.begin_verified_workers_reset(&[vm.to_owned()], &BTreeSet::from([vm.to_owned()]))?;
+        if let Err(error) = self.sbx.retire_quarantined_vm(vm) {
+            let _ = store.finish_worker_reset(vm, false);
+            return Err(backend_error(error));
+        }
         self.ready_kits
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -202,9 +227,7 @@ impl StockDaemonBackend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(vm);
-        if store.begin_workers_reset(&[vm.to_owned()]).is_ok() {
-            store.finish_worker_reset(vm, true)?;
-        }
+        store.finish_worker_reset(vm, true)?;
         Ok(())
     }
 
@@ -227,22 +250,6 @@ impl StockDaemonBackend {
         Some(self.recover_quarantined_vm(store, &spec.name))
     }
 
-    /// `marsh workers reset all`: Kit VMs quarantined by the adapter that no
-    /// command names any more (a failed `kit install`) are retired too.
-    pub(super) fn retire_unnamed_quarantined(
-        &self,
-        store: &DaemonStore,
-    ) -> Result<(), DaemonError> {
-        for vm in self.sbx.quarantined_vms().into_keys() {
-            if self.spec_for_vm(&vm).1.is_some() || store.worker_has_unfinished_jobs(&vm) {
-                continue;
-            }
-            self.retire_recovered(store, &vm, None)?;
-            self.note_recovery(store, &vm, None);
-        }
-        Ok(())
-    }
-
     /// `marsh status`: quarantines the adapter holds (with their reasons)
     /// on the store's workers, and VMs that are not registered workers.
     pub(super) fn annotate_quarantines(&self, workers: &mut Vec<WorkerStatus>, scope_id: &str) {
@@ -262,7 +269,11 @@ impl StockDaemonBackend {
                 worker.warm = false;
                 worker.quarantine.get_or_insert(record);
             } else {
-                let (kits, spec) = self.spec_for_vm(&vm);
+                let (mut kits, spec) = self.spec_for_vm(&vm);
+                if spec.is_none() {
+                    // A failed `kit install`: `workers reset` takes its name.
+                    kits = self.install_names_for_vm(&vm);
+                }
                 workers.push(WorkerStatus {
                     worker_id: vm.clone(),
                     vm_id: vm.clone(),

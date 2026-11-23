@@ -207,6 +207,9 @@ pub(super) enum Fault {
     FailAfterEffect(CommandOutput),
     /// The bounded call expired; `applied` says whether the effect landed.
     TimedOut { applied: bool },
+    /// The command exited but a helper held its output pipes open past the
+    /// drain grace (`marsh_runtime::OutputDrainTimeout`); `applied` as above.
+    OutputDrain { applied: bool },
     /// An attached spawn fails before starting.
     SpawnError(String),
 }
@@ -324,6 +327,10 @@ struct Running {
 #[derive(Default)]
 #[allow(clippy::struct_excessive_bools)] // Independent one-shot faults.
 struct State {
+    /// `create` calls run cancellable wait for their cancellation
+    /// (`marsh stop --force`); how many are waiting.
+    hold_creates: bool,
+    held_creates: usize,
     vms: BTreeMap<String, Vm>,
     calls: Vec<Call>,
     /// The bound each bounded call ran under, in order: (verb, bound).
@@ -685,6 +692,28 @@ impl StockModel {
         .collect()
     }
 
+    /// Whether each Start written to `vm`'s worker asks for the
+    /// acknowledgement of `Started`.
+    pub fn written_worker_starts_ask_ack(&self, vm: &str) -> Vec<bool> {
+        let written = self
+            .state
+            .lock()
+            .unwrap()
+            .worker_input
+            .get(vm)
+            .cloned()
+            .unwrap_or_default();
+        let mut reader = Cursor::new(written);
+        std::iter::from_fn(|| {
+            marsh_worker::read_frame::<marsh_worker::WorkerRequest>(&mut reader).ok()
+        })
+        .filter_map(|request| match request {
+            marsh_worker::WorkerRequest::Start { started_ack, .. } => Some(started_ack),
+            _ => None,
+        })
+        .collect()
+    }
+
     /// Send `response` to the host as `vm`'s retained worker.
     pub fn worker_says(&self, vm: &str, response: &marsh_worker::WorkerResponse) {
         let socket = self
@@ -805,6 +834,20 @@ impl StockModel {
         let result = match fault {
             Some(Fault::Respond(output)) => Ok(output),
             Some(Fault::FailAfterEffect(output)) => self.apply(call).map(|_| output),
+            Some(Fault::OutputDrain { applied }) => {
+                if applied {
+                    self.apply(call)?;
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    marsh_runtime::OutputDrainTimeout {
+                        status: Some(0),
+                        stdout_bytes: 7,
+                        stderr_bytes: 11,
+                        stderr_tail: "pulling image".into(),
+                    },
+                ))
+            }
             Some(Fault::TimedOut { applied }) => {
                 if applied {
                     self.apply(call)?;
@@ -1573,8 +1616,61 @@ impl CommandRunner for StockModel {
         self.respond(&call)
     }
 
+    fn run_bounded_cancellable(
+        &self,
+        invocation: &Invocation,
+        bound: Duration,
+        cancel: &marsh_runtime::Cancellation,
+    ) -> io::Result<CommandOutput> {
+        let call = Call::new(invocation);
+        let mut state = self.state.lock().unwrap();
+        if !(state.hold_creates && call.verb() == "create") {
+            drop(state);
+            return self.run_bounded(invocation, bound);
+        }
+        state.calls.push(call);
+        state.held_creates += 1;
+        self.changed.notify_all();
+        while !cancel.is_cancelled() {
+            state = self
+                .changed
+                .wait_timeout(state, Duration::from_millis(10))
+                .unwrap()
+                .0;
+        }
+        state.held_creates -= 1;
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "owned I/O cancelled",
+        ))
+    }
+
     fn spawn_attached(&self, invocation: &Invocation) -> io::Result<Attachment> {
         self.spawn(&Call::new(invocation))
+    }
+}
+
+impl StockModel {
+    /// From now on a cancellable `create` waits until it is cancelled.
+    pub(super) fn hold_creates_until_cancelled(&self) {
+        self.state.lock().unwrap().hold_creates = true;
+    }
+
+    /// Wait (at most 10 s) until a held `create` is in flight.
+    pub(super) fn wait_for_held_create(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut state = self.state.lock().unwrap();
+        while state.held_creates == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no create is waiting for its cancellation"
+            );
+            state = self
+                .changed
+                .wait_timeout(state, Duration::from_millis(10))
+                .unwrap()
+                .0;
+        }
     }
 }
 

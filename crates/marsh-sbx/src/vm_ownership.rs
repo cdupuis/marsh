@@ -130,6 +130,31 @@ struct LegacyGrant {
     names: BTreeMap<String, Option<String>>,
 }
 
+/// One `marsh kit install` attempt that chose this entry's name and has not
+/// published its command (`docs/model/KitInstall.tla`, rule 6). It lives in
+/// the entry, so retiring the name (removing the VM and forgetting the
+/// entry) ends it in the same write, and it survives a restart.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallRecord {
+    /// Unique per attempt, never reused (a random UUID).
+    pub attempt: String,
+    /// The command name the install was registering.
+    pub command: String,
+}
+
+impl InstallRecord {
+    /// A new attempt of `command` with a fresh random id: never reused, also
+    /// across a daemon restart, so no attempt overwrites a persisted record.
+    #[must_use]
+    pub fn new_attempt(command: &str) -> Self {
+        Self {
+            attempt: uuid::Uuid::new_v4().to_string(),
+            command: command.to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry {
@@ -137,6 +162,71 @@ struct Entry {
     key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     uuid: Option<String>,
+    /// Install attempts recorded under this name (several attempts may name
+    /// one VM). Persisted in the records file next to the map
+    /// ([`installs_path`]), never in the map: the map stays schema 2, which
+    /// an older marsh reads. (A map an earlier build of this change wrote,
+    /// schema 3 with records inline, is still read.)
+    #[serde(default, skip_serializing)]
+    installs: Vec<InstallRecord>,
+}
+
+const VERSION: u32 = 2;
+/// Read only: the schema an earlier build of this change wrote.
+const VERSION_WITH_INSTALLS: u32 = 3;
+
+/// The install records file: `name -> records`, next to the map. A record
+/// whose name is not an entry of the map is ended: it is dropped when the
+/// files are read, so a name an older marsh retired takes its records along.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallsFile {
+    version: u32,
+    installs: BTreeMap<String, Vec<InstallRecord>>,
+}
+
+/// The bytes last written in full of (the map, its records file).
+type OnDisk = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Where the install records of the map at `map` are kept.
+fn installs_path(map: &Path) -> PathBuf {
+    map.with_file_name(format!(
+        "{}-installs.json",
+        map.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("vm-ownership")
+    ))
+}
+
+/// The records file's records, attached to the entries they name.
+fn read_installs(map: &Path, entries: &mut BTreeMap<String, Entry>) -> Result<(), SbxError> {
+    let path = installs_path(map);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.is_file()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(SbxError::HostGrantFence(format!(
+                    "install records {} are not an owner-only regular file",
+                    path.display()
+                )));
+            }
+            let file: InstallsFile = serde_json::from_slice(&fs::read(&path)?)?;
+            for (name, records) in file.installs {
+                if let Some(entry) = entries.get_mut(&name) {
+                    for record in records {
+                        if !entry.installs.contains(&record) {
+                            entry.installs.push(record);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -193,6 +283,10 @@ pub(crate) struct VmOwnership {
     /// but not known durable. No ownership authority is handed out again until
     /// a later write succeeds in full (see [`Self::make_durable`]).
     undurable: AtomicBool,
+    /// The bytes of the map and of its records file as last written in full
+    /// (renamed and synced): a write whose bytes are unchanged is skipped,
+    /// so a record write touches only the records file. `None`: unknown.
+    on_disk: Mutex<OnDisk>,
 }
 
 /// Directories whose syncs fail (tests). Keyed by directory, so a test fails only
@@ -306,6 +400,7 @@ fn retire_dev_vms(
             purpose: RETIRED.into(),
             key: String::new(),
             uuid,
+            installs: Vec::new(),
         });
     }
     for entry in entries.values_mut() {
@@ -338,6 +433,7 @@ impl VmOwnership {
             view: Mutex::new(None),
             published: AtomicBool::new(false),
             undurable: AtomicBool::new(false),
+            on_disk: Mutex::new((None, None)),
         }
     }
 
@@ -357,7 +453,7 @@ impl VmOwnership {
                 }
                 let bytes = fs::read(&path)?;
                 if let Ok(file) = serde_json::from_slice::<OwnershipFile>(&bytes)
-                    && file.version == 2
+                    && (file.version == VERSION || file.version == VERSION_WITH_INSTALLS)
                 {
                     grants = file.grants;
                     file.vms
@@ -380,6 +476,7 @@ impl VmOwnership {
                                     purpose: UNKEYED.into(),
                                     key: String::new(),
                                     uuid: Some(uuid),
+                                    installs: Vec::new(),
                                 },
                             )
                         })
@@ -390,6 +487,8 @@ impl VmOwnership {
             Err(error) => return Err(error.into()),
         };
         let migrated = retire_dev_vms(&mut entries, grants);
+        let inline = entries.values().any(|entry| !entry.installs.is_empty());
+        read_installs(&path, &mut entries)?;
         let ownership = Self {
             path: Some(path),
             mirror: None,
@@ -400,8 +499,29 @@ impl VmOwnership {
             view: Mutex::new(None),
             published: AtomicBool::new(false),
             undurable: AtomicBool::new(false),
+            on_disk: Mutex::new((None, None)),
         };
-        if migrated {
+        // The records file as read: unchanged records are not written again
+        // (and no file is made for none).
+        {
+            let state = ownership.lock();
+            let loaded = Self::installs_bytes(&state)?;
+            if inline {
+                // A map an earlier build wrote with records inline: publish
+                // the records file first, while the map still holds them, so
+                // no crash between the two writes loses the only copy (both
+                // reviews). Its names are all entries of the map on disk.
+                if let Some(path) = &ownership.path {
+                    write_atomically(&installs_path(path), &loaded, None)?;
+                }
+            }
+            ownership
+                .on_disk
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .1 = Some(loaded);
+        }
+        if migrated || inline {
             ownership.persist(&ownership.lock())?;
         }
         Ok(ownership)
@@ -428,11 +548,27 @@ impl VmOwnership {
             )));
         }
         self.mirror = Some(mirror);
+        self.on_disk
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0 = None;
         {
             let state = self.lock();
             self.persist(&state)?;
         }
         Ok(self)
+    }
+
+    fn installs_bytes(state: &State) -> Result<Vec<u8>, SbxError> {
+        Ok(serde_json::to_vec_pretty(&InstallsFile {
+            version: 1,
+            installs: state
+                .entries
+                .iter()
+                .filter(|(_, entry)| !entry.installs.is_empty())
+                .map(|(name, entry)| (name.clone(), entry.installs.clone()))
+                .collect(),
+        })?)
     }
 
     fn persist(&self, state: &State) -> Result<(), SbxError> {
@@ -441,15 +577,39 @@ impl VmOwnership {
         };
         self.published.store(false, Ordering::Release);
         let bytes = serde_json::to_vec_pretty(&OwnershipFile {
-            version: 2,
+            version: VERSION,
             vms: state.entries.clone(),
             grants: BTreeMap::new(),
         })?;
-        // The mirror is written first: it never names fewer VMs than the map.
-        if let Some(mirror) = &self.mirror {
-            write_atomically(mirror, &bytes, None)?;
+        let installs = Self::installs_bytes(state)?;
+        let (map_written, installs_written) = self
+            .on_disk
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // The map, then its records: a record written before its name's
+        // entry would be dropped at the next read, never the other way.
+        // Either rename counts as published (memory then keeps the new
+        // state, and the next write completes both). Unchanged bytes are not
+        // written again.
+        if map_written.as_ref() != Some(&bytes) {
+            // The mirror is written first: it never names fewer VMs than the map.
+            if let Some(mirror) = &self.mirror {
+                write_atomically(mirror, &bytes, None)?;
+            }
+            write_atomically(path, &bytes, Some(&self.published))?;
+            self.on_disk
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0 = Some(bytes);
         }
-        write_atomically(path, &bytes, Some(&self.published))?;
+        if installs_written.as_ref() != Some(&installs) {
+            write_atomically(&installs_path(path), &installs, Some(&self.published))?;
+            self.on_disk
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .1 = Some(installs);
+        }
         self.undurable.store(false, Ordering::Release);
         Ok(())
     }
@@ -506,6 +666,7 @@ impl VmOwnership {
                 purpose: purpose.label().into(),
                 key: key.into(),
                 uuid: None,
+                installs: Vec::new(),
             },
         );
         if let Err(error) = self.persist(&state) {
@@ -640,6 +801,7 @@ impl VmOwnership {
                 purpose: UNKEYED.into(),
                 key: String::new(),
                 uuid: None,
+                installs: Vec::new(),
             })
         });
         if entry.uuid.as_deref() == Some(uuid) {
@@ -668,6 +830,10 @@ impl VmOwnership {
         let before = state.snapshot();
         if let Some(mut entry) = state.entries.remove(name) {
             entry.uuid = None;
+            // The entry, and with it every install record naming the name,
+            // leaves the persisted map in this write: retiring the name ends
+            // them. Only an immediate replacement under the same name
+            // (`restore_intent`) brings them back, in this process.
             state.retired.insert(name.to_owned(), entry);
             if let Err(error) = self.persist(&state) {
                 self.rollback(&mut state, before);
@@ -675,6 +841,49 @@ impl VmOwnership {
             }
         }
         Ok(())
+    }
+
+    /// Forget `name` after a listing found nothing under it. `observed` is
+    /// the UUID the map recorded for it before that listing was taken: only
+    /// that VM is proven gone by it. A name still an intent, or one whose UUID
+    /// was adopted since (a newer listing found a VM landing late), is kept:
+    /// forgetting it would make that VM nobody's. Returns whether it forgot.
+    pub(crate) fn forget_absent(
+        &self,
+        name: &str,
+        observed: Option<&str>,
+    ) -> Result<bool, SbxError> {
+        let mut state = self.lock();
+        let Some(entry) = state.entries.get(name) else {
+            return Ok(false);
+        };
+        if observed.is_none() || entry.uuid.as_deref() != observed {
+            return Ok(false);
+        }
+        let before = state.snapshot();
+        if let Some(mut entry) = state.entries.remove(name) {
+            entry.uuid = None;
+            state.retired.insert(name.to_owned(), entry);
+            if let Err(error) = self.persist(&state) {
+                self.rollback(&mut state, before);
+                return Err(error);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Owned Kit names with the UUID each has now, read before a listing
+    /// whose absences [`Self::forget_absent`] then acts on.
+    pub(crate) fn owned_kit_uuids(&self) -> Vec<(String, String)> {
+        let names = self.owned_kit_names();
+        let state = self.lock();
+        names
+            .into_iter()
+            .filter_map(|name| {
+                let uuid = state.entries.get(&name)?.uuid.clone()?;
+                Some((name, uuid))
+            })
+            .collect()
     }
 
     /// Persist a just-forgotten name again as an intent (no UUID), before a
@@ -719,6 +928,116 @@ impl VmOwnership {
             .iter()
             .find(|(_, entry)| entry.purpose == purpose.label() && entry.key == key)
             .map(|(name, _)| name.clone())
+    }
+
+    /// Whether a create may be submitted under `name`: it is an entry of the
+    /// map (an intent or a recorded VM). A persisted map (every daemon's)
+    /// refuses any other name. An in-memory map (a scope-less adapter, unit
+    /// tests) has no record of names given to it from outside, so there only
+    /// a name it forgot is refused.
+    pub(crate) fn is_live(&self, name: &str) -> bool {
+        let state = self.lock();
+        state.entries.contains_key(name)
+            || (self.path.is_none() && !state.retired.contains_key(name))
+    }
+
+    /// The ownership key of `name`, live or forgotten in this process.
+    pub(crate) fn key_of(&self, name: &str) -> Option<String> {
+        let state = self.lock();
+        state
+            .entries
+            .get(name)
+            .or_else(|| state.retired.get(name))
+            .map(|entry| entry.key.clone())
+    }
+
+    /// Every live Kit entry, intent or recorded, as `(name, key)`; and the
+    /// recorded legacy and retired-for-good Kit VMs.
+    pub(crate) fn live_kit_entries(&self) -> Vec<(String, String)> {
+        self.lock()
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.purpose == VmPurpose::Kit.label()
+                    || (entry.uuid.is_some()
+                        && (entry.purpose == UNKEYED || entry.purpose == RETIRED))
+            })
+            .map(|(name, entry)| (name.clone(), entry.key.clone()))
+            .collect()
+    }
+
+    /// Persist an install record under the live entry `name`. Refused when
+    /// `name` is not an entry.
+    pub(crate) fn begin_install(&self, name: &str, record: InstallRecord) -> Result<(), SbxError> {
+        let mut state = self.lock();
+        self.make_durable(&state)?;
+        let before = state.snapshot();
+        for entry in state.entries.values_mut() {
+            entry
+                .installs
+                .retain(|other| other.attempt != record.attempt);
+        }
+        let Some(entry) = state.entries.get_mut(name) else {
+            return Err(SbxError::StaleVmName(name.to_owned()));
+        };
+        entry.installs.push(record);
+        if let Err(error) = self.persist(&state) {
+            self.rollback(&mut state, before);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// End the install record `attempt`, wherever it is. Returns whether it
+    /// was found.
+    pub(crate) fn end_install(&self, attempt: &str) -> Result<bool, SbxError> {
+        let mut state = self.lock();
+        let before = state.snapshot();
+        let mut found = false;
+        for entry in state.entries.values_mut() {
+            let count = entry.installs.len();
+            entry.installs.retain(|record| record.attempt != attempt);
+            found |= entry.installs.len() != count;
+        }
+        if found && let Err(error) = self.persist(&state) {
+            self.rollback(&mut state, before);
+            return Err(error);
+        }
+        Ok(found)
+    }
+
+    /// End every record of `command` under `name` (its command was
+    /// published on that VM: the registry reaches it now). Returns how many.
+    pub(crate) fn end_installs_of(&self, name: &str, command: &str) -> Result<usize, SbxError> {
+        let mut state = self.lock();
+        let before = state.snapshot();
+        let Some(entry) = state.entries.get_mut(name) else {
+            return Ok(0);
+        };
+        let count = entry.installs.len();
+        entry.installs.retain(|record| record.command != command);
+        let ended = count - entry.installs.len();
+        if ended > 0
+            && let Err(error) = self.persist(&state)
+        {
+            self.rollback(&mut state, before);
+            return Err(error);
+        }
+        Ok(ended)
+    }
+
+    /// Every install record as `(name, key, record)`.
+    pub(crate) fn install_records(&self) -> Vec<(String, String, InstallRecord)> {
+        self.lock()
+            .entries
+            .iter()
+            .flat_map(|(name, entry)| {
+                entry
+                    .installs
+                    .iter()
+                    .map(|record| (name.clone(), entry.key.clone(), record.clone()))
+            })
+            .collect()
     }
 
     pub(crate) fn host_names(&self) -> BTreeSet<String> {

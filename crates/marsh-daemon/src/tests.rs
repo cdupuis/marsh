@@ -1680,6 +1680,247 @@ fn worker_reset_refuses_active_selection_atomically_and_preserves_other_state() 
     assert_eq!(store.job(&job).unwrap().state, JobState::Cancelled);
 }
 
+/// GPT's round 6: the job's VM assignment is journaled, synced, before its
+/// Start is submitted, so a daemon that dies before the worker's Started
+/// still finds the job on its VM after a restart; a failed write fails the
+/// submission. Fails when `mark_execution_submitted` does not journal.
+#[test]
+fn a_submitted_jobs_vm_assignment_survives_a_restart() {
+    for failing in [false, true] {
+        let home = home();
+        let store = reopen(home.path()).unwrap();
+        let session = store.attach_shell(1, authority("/Users/example/project", home.path()));
+        store
+            .register_worker(WorkerStatus {
+                worker_id: "target".into(),
+                vm_id: "target".into(),
+                scope_id: store.status(None).scope_id,
+                kit_ref: "kit:test".into(),
+                kits: vec![],
+                warm: true,
+                health: WorkerHealth::Ready,
+                container_capacity: 8,
+                active_container_ids: vec![],
+                quarantine: None,
+            })
+            .unwrap();
+        let (job, _) = store
+            .begin_job(NewJob {
+                label: None,
+                session_id: session,
+                command: "hf".into(),
+                kit_ref: "kit:test".into(),
+                workload_image: format!("fixture@sha256:{}", "a".repeat(64)),
+                mounts: vec![],
+            })
+            .unwrap();
+        store.reserve_worker(&job, "target", "target").unwrap();
+        if failing {
+            store.lock().journal.fail_for_test();
+            assert!(store.mark_execution_submitted(&job).is_err());
+            assert_eq!(
+                store.job(&job).unwrap().execution,
+                ExecutionOutcome::NotStarted
+            );
+            continue;
+        }
+        store.mark_execution_submitted(&job).unwrap();
+        drop(store);
+        let store = reopen(home.path()).unwrap();
+        let receipt = store.job(&job).unwrap();
+        assert_eq!(receipt.vm_id.as_deref(), Some("target"));
+        assert_eq!(store.jobs_whose_execution_may_run("target"), [job]);
+    }
+}
+
+/// Claude's round 4: the operator claim judges a job that ended with its
+/// cleanup uncertain by its typed execution. `Unknown` and
+/// `SupervisionFailed` are no proof it ended (refused unless the VM was verified to run no
+/// container); a known exit, a limit, a setup failure or no start are.
+/// Registered worker or not (Claude's round 5). Fails when
+/// `SupervisionFailed` counts as ended, or the execution is ignored.
+#[test]
+fn the_operator_claim_judges_an_ended_job_by_its_execution() {
+    use marsh_contracts::execution::{ResourceLimit, SetupStage};
+    let cases = [
+        (ExecutionOutcome::Unknown, false),
+        (ExecutionOutcome::SupervisionFailed, false),
+        (ExecutionOutcome::Exited { code: 3 }, true),
+        (
+            ExecutionOutcome::LimitExceeded {
+                resource: ResourceLimit::Memory,
+            },
+            true,
+        ),
+        (
+            ExecutionOutcome::SetupFailed {
+                stage: SetupStage::Start,
+            },
+            true,
+        ),
+        (ExecutionOutcome::NotStarted, true),
+    ];
+    for ((execution, ended), unregistered) in cases
+        .into_iter()
+        .flat_map(|case| [(case.clone(), false), (case, true)])
+    {
+        let home = home();
+        let store = reopen(home.path()).unwrap();
+        let session = store.attach_shell(1, authority("/Users/example/project", home.path()));
+        store
+            .register_worker(WorkerStatus {
+                worker_id: "target".into(),
+                vm_id: "target".into(),
+                scope_id: store.status(None).scope_id,
+                kit_ref: "kit:test".into(),
+                kits: vec![],
+                warm: true,
+                health: WorkerHealth::Ready,
+                container_capacity: 8,
+                active_container_ids: vec![],
+                quarantine: None,
+            })
+            .unwrap();
+        let (job, _) = store
+            .begin_job(NewJob {
+                label: None,
+                session_id: session,
+                command: "hf".into(),
+                kit_ref: "kit:test".into(),
+                workload_image: format!("fixture@sha256:{}", "a".repeat(64)),
+                mounts: vec![],
+            })
+            .unwrap();
+        store.reserve_worker(&job, "target", "target").unwrap();
+        store
+            .mark_running(&job, "target", "target", &"a".repeat(64))
+            .unwrap();
+        store
+            .finish_job_with_execution(
+                &job,
+                execution.clone(),
+                ExitStatus {
+                    code: Some(125),
+                    cause: "probe".into(),
+                },
+                false,
+                CleanupState::Uncertain,
+                TimingReport::default(),
+            )
+            .unwrap();
+        if unregistered {
+            // After a restart no worker is registered: the claim's own
+            // per-VM check is the only store guard.
+            store.lock().workers.remove("target");
+        }
+        let selected = vec!["target".to_owned()];
+        assert_eq!(
+            store.jobs_whose_execution_may_run("target").is_empty(),
+            ended,
+            "{execution:?}"
+        );
+        assert_eq!(
+            store.vms_whose_execution_may_run().contains_key("target"),
+            !ended
+        );
+        let claimed = store.begin_workers_reset(&selected);
+        assert_eq!(
+            claimed.is_ok(),
+            ended,
+            "{execution:?}, unregistered={unregistered}: {claimed:?}"
+        );
+        if !ended {
+            let verified = selected.iter().cloned().collect();
+            store
+                .begin_verified_workers_reset(&selected, &verified)
+                .unwrap();
+        }
+    }
+}
+
+/// GPT's round 4 (Claude's nit: Queued and Detached load-bearing): every
+/// claim refuses a VM with a queued, running or detached job, registered
+/// worker or not, verified or not, and claims no other VM.
+#[test]
+fn review_v2d_claims_refuse_queued_running_detached_even_without_worker_registration() {
+    for job_state in [JobState::Queued, JobState::Running, JobState::Detached] {
+        for registered in [true, false] {
+            let home = home();
+            let store = reopen(home.path()).unwrap();
+            let session = store.attach_shell(1, authority("/Users/example/project", home.path()));
+            for worker in ["idle", "target"] {
+                store
+                    .register_worker(WorkerStatus {
+                        worker_id: worker.into(),
+                        vm_id: worker.into(),
+                        scope_id: store.status(None).scope_id,
+                        kit_ref: "kit:test".into(),
+                        kits: vec![],
+                        warm: true,
+                        health: WorkerHealth::Ready,
+                        container_capacity: 8,
+                        active_container_ids: vec![],
+                        quarantine: None,
+                    })
+                    .unwrap();
+            }
+            let (job, _) = store
+                .begin_job(NewJob {
+                    label: None,
+                    session_id: session,
+                    command: "hf".into(),
+                    kit_ref: "kit:test".into(),
+                    workload_image: format!("fixture@sha256:{}", "a".repeat(64)),
+                    mounts: vec![],
+                })
+                .unwrap();
+            store.reserve_worker(&job, "target", "target").unwrap();
+            if job_state != JobState::Queued {
+                store
+                    .mark_running(&job, "target", "target", &"a".repeat(64))
+                    .unwrap();
+            }
+            store
+                .quarantine_worker("target", "sibling cleanup uncertain")
+                .unwrap();
+            {
+                let mut state = store.lock();
+                state.jobs.get_mut(&job).unwrap().state = job_state;
+                // Exercise recorded jobs alone, without reservation/container guards.
+                state.reservations.clear();
+                state
+                    .workers
+                    .get_mut("target")
+                    .unwrap()
+                    .active_container_ids
+                    .clear();
+                if !registered {
+                    state.workers.remove("target");
+                }
+            }
+            let selected = vec!["idle".into(), "target".into()];
+            assert!(
+                store.begin_workers_reset(&selected).is_err(),
+                "{job_state:?}, registered={registered}"
+            );
+            assert_eq!(store.lock().workers["idle"].health, WorkerHealth::Ready);
+            // A verification that no container runs releases only a job whose
+            // execution is unknown, never one the daemon still runs.
+            let verified = selected.iter().cloned().collect();
+            assert!(
+                store
+                    .begin_verified_workers_reset(&selected, &verified)
+                    .is_err(),
+                "{job_state:?}, registered={registered}"
+            );
+            assert_eq!(store.lock().workers["idle"].health, WorkerHealth::Ready);
+            assert!(store.begin_settled_workers_reset(&selected).is_err());
+            assert_eq!(store.lock().workers["idle"].health, WorkerHealth::Ready);
+            assert!(store.begin_automatic_retire("target").is_err());
+        }
+    }
+}
+
 /// Garbage collection and drained Kit changes claim a VM only when nothing
 /// recorded can still run there; unlike an operator reset they never take a
 /// quarantined worker (whose containers are cleanup-uncertain).
@@ -5005,6 +5246,8 @@ struct BlockingLifecycleBackend {
 #[derive(Debug, Default)]
 struct DeadlineRecordingBackend {
     deadline: Mutex<Option<Instant>>,
+    /// `DaemonStore::forced_stop_active` in each teardown.
+    forced: Mutex<Vec<bool>>,
 }
 
 impl DaemonBackend for DeadlineRecordingBackend {
@@ -5015,10 +5258,11 @@ impl DaemonBackend for DeadlineRecordingBackend {
     fn teardown_scope(
         &self,
         action: ScopeLifecycleAction,
-        _store: DaemonStore,
+        store: DaemonStore,
         deadline: Instant,
     ) -> ScopeLifecycleReport {
         *self.deadline.lock().unwrap() = Some(deadline);
+        self.forced.lock().unwrap().push(store.forced_stop_active());
         ScopeLifecycleReport {
             action,
             cleanup_complete: false,
@@ -5062,6 +5306,30 @@ impl DaemonBackend for DeadlineRecordingBackend {
     ) -> Result<(), DaemonError> {
         unreachable!()
     }
+}
+
+/// Only `marsh stop --force`'s teardown is told it is forced (the override
+/// that removes a VM a lost job may still run on), and only while it runs.
+/// Fails when the flag is never set, or outlives the forced stop.
+#[test]
+fn only_the_forced_stops_teardown_is_forced() {
+    let home = home();
+    let backend = Arc::new(DeadlineRecordingBackend::default());
+    let server = Arc::new(
+        Server::bind(home.path())
+            .unwrap()
+            .with_backend(backend.clone()),
+    );
+    let (stop, task) = start_server(Arc::clone(&server));
+    let client = Client::connect(home.path()).unwrap();
+    client.reset_scope().unwrap();
+    client
+        .scope_lifecycle_with_timeout(PublicRequest::ForceStopScope, PATIENCE)
+        .unwrap();
+    client.reset_scope().unwrap();
+    assert_eq!(*backend.forced.lock().unwrap(), [false, true, false]);
+    stop.store(true, Ordering::Relaxed);
+    task.join().unwrap();
 }
 
 /// The daemon gives teardown one absolute deadline (its configured lifecycle
@@ -6498,4 +6766,529 @@ fn receipt_journal_is_owner_only_and_keeps_no_job_or_prompt_content() {
             );
         }
     }
+}
+
+/// A backend whose `kit install` is a VM create in flight: it ends when
+/// creates are cancelled, or (`ignores_cancel`) only when released.
+#[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent switches of one fake.
+struct InstallInFlight {
+    review_background: bool,
+    /// The background pass does not end when its creates are cancelled.
+    background_ignores_cancel: bool,
+    background_cancelled: AtomicBool,
+    background_resumed: AtomicBool,
+    review_background_entered: AtomicBool,
+    review_background_released: AtomicBool,
+    review_teardown_overlapped_background: AtomicBool,
+    ignores_cancel: bool,
+    cleanup_uncertain: bool,
+    entered: AtomicBool,
+    cancelled: AtomicBool,
+    released: AtomicBool,
+    resumed: AtomicBool,
+    calls: Mutex<Vec<ScopeLifecycleAction>>,
+}
+
+#[derive(Clone)]
+struct InstallInFlightBackend(Arc<InstallInFlight>);
+
+impl DaemonBackend for InstallInFlightBackend {
+    fn auto_update_kits(&self, _store: &DaemonStore) {
+        if !self.0.review_background {
+            return;
+        }
+        self.0
+            .review_background_entered
+            .store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.0.review_background_released.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "review background never released"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn registered_commands(&self) -> Result<Vec<String>, DaemonError> {
+        Ok(Vec::new())
+    }
+
+    fn install_kit(
+        &self,
+        _command: String,
+        _reference: String,
+        _store: DaemonStore,
+    ) -> Result<String, DaemonError> {
+        self.0.entered.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if self.0.released.load(Ordering::Acquire)
+                || (!self.0.ignores_cancel && self.0.cancelled.load(Ordering::Acquire))
+            {
+                return Err(DaemonError::InvalidState(
+                    "its VM create was cancelled".into(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the install's create was never cancelled");
+    }
+
+    fn cancel_creates(&self) {
+        self.0.cancelled.store(true, Ordering::Release);
+    }
+
+    fn resume_background_creates(&self) {
+        self.0.background_resumed.store(true, Ordering::Release);
+    }
+
+    fn cancel_background_creates(&self) {
+        self.0.background_cancelled.store(true, Ordering::Release);
+        if !self.0.background_ignores_cancel {
+            self.0
+                .review_background_released
+                .store(true, Ordering::Release);
+        }
+    }
+
+    fn resume_creates(&self) {
+        self.0.resumed.store(true, Ordering::Release);
+    }
+
+    fn teardown_scope(
+        &self,
+        action: ScopeLifecycleAction,
+        _store: DaemonStore,
+        _deadline: Instant,
+    ) -> ScopeLifecycleReport {
+        if self.0.review_background_entered.load(Ordering::Acquire)
+            && !self.0.review_background_released.load(Ordering::Acquire)
+        {
+            self.0
+                .review_teardown_overlapped_background
+                .store(true, Ordering::Release);
+        }
+        self.0.calls.lock().unwrap().push(action);
+        ScopeLifecycleReport {
+            action,
+            cleanup_complete: !self.0.cleanup_uncertain,
+            components: Vec::new(),
+        }
+    }
+
+    fn prepare(
+        &self,
+        _selection: &LoadSelection,
+        _session: &SessionSpec,
+        _progress: PreparationProgress,
+        _store: DaemonStore,
+    ) -> Result<PreparationResult, DaemonError> {
+        unreachable!()
+    }
+
+    fn execute(
+        &self,
+        _request: ExecuteSpec,
+        _attachment: ServerAttachment,
+        _store: DaemonStore,
+    ) -> Result<(), DaemonError> {
+        unreachable!()
+    }
+
+    fn open_shell(
+        &self,
+        _request: ShellSpec,
+        _attachment: ServerAttachment,
+        _store: DaemonStore,
+    ) -> Result<(), DaemonError> {
+        unreachable!()
+    }
+}
+
+fn install_in_flight(
+    backend: &InstallInFlightBackend,
+    home: &Path,
+) -> thread::JoinHandle<Result<String, DaemonError>> {
+    let client = Client::connect(home).unwrap();
+    let install = thread::spawn(move || client.install_kit("hf", "example/hf@sha256:0"));
+    while !backend.0.entered.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    install
+}
+
+/// `marsh stop --force` (`KitInstall.tla` `StopBegin`/`StopEnd`): plain
+/// `marsh stop` stays refused while a `kit install` is in flight; the forced
+/// stop cancels its create, waits for the install to end, tears the scope
+/// down and stops the daemon. Fails when the forced stop does not cancel
+/// creates (it waits out its drain bound and refuses).
+#[test]
+fn a_forced_stop_cancels_an_install_in_flight_then_stops() {
+    let home = home();
+    let backend = InstallInFlightBackend(Arc::default());
+    let server = Server::bind(home.path())
+        .unwrap()
+        .with_backend(Arc::new(backend.clone()))
+        .with_forced_stop_drain(Duration::from_secs(5));
+    let task = thread::spawn(move || server.serve_until(|| false).unwrap());
+    let install = install_in_flight(&backend, home.path());
+    let client = Client::connect(home.path()).unwrap();
+
+    let refused = client
+        .scope_lifecycle_with_timeout(PublicRequest::StopScope, PATIENCE)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("a request was still being served"),
+        "{refused}"
+    );
+    assert!(!backend.0.cancelled.load(Ordering::Acquire));
+
+    let report = client.force_stop_scope().unwrap();
+    assert!(report.cleanup_complete, "{report:?}");
+    assert!(backend.0.cancelled.load(Ordering::Acquire));
+    let installed = install.join().unwrap().unwrap_err().to_string();
+    assert!(installed.contains("cancelled"), "{installed}");
+    assert_eq!(
+        *backend.0.calls.lock().unwrap(),
+        [ScopeLifecycleAction::Stop]
+    );
+    task.join().unwrap();
+    assert!(Client::connect_if_running(home.path()).unwrap().is_none());
+}
+
+/// The forced stop's wait is bounded: a request that does not end in time
+/// leaves everything in place (nothing torn down, creates resumed, the
+/// daemon serving), and says what is still running.
+#[test]
+fn a_forced_stop_whose_requests_do_not_end_tears_nothing_down() {
+    let home = home();
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        ignores_cancel: true,
+        ..InstallInFlight::default()
+    }));
+    let server = Arc::new(
+        Server::bind(home.path())
+            .unwrap()
+            .with_backend(Arc::new(backend.clone()))
+            .with_forced_stop_drain(Duration::from_millis(300)),
+    );
+    let serving = Arc::clone(&server);
+    let task = thread::spawn(move || serving.serve_until(|| false).unwrap());
+    let install = install_in_flight(&backend, home.path());
+    let client = Client::connect(home.path()).unwrap();
+
+    let refused = client.force_stop_scope().unwrap_err().to_string();
+    assert!(
+        refused.contains("still running after 300ms") && refused.contains("nothing was stopped"),
+        "{refused}"
+    );
+    assert!(backend.0.resumed.load(Ordering::Acquire));
+    assert!(backend.0.calls.lock().unwrap().is_empty());
+    assert!(!server.shutdown_requested.load(Ordering::Acquire));
+
+    // Admission really reopened while the old request is still in flight.
+    assert_eq!(client.registered_commands().unwrap(), Vec::<String>::new());
+
+    backend.0.released.store(true, Ordering::Release);
+    install.join().unwrap().unwrap_err();
+    client.stop_scope().unwrap();
+    task.join().unwrap();
+}
+
+/// A forced stop whose teardown could not be verified keeps the daemon, as
+/// `marsh stop` does, and lets it create VMs again. Fails when the creates
+/// stay cancelled.
+#[test]
+fn a_forced_stop_that_keeps_the_daemon_resumes_creates() {
+    let home = home();
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        cleanup_uncertain: true,
+        ..InstallInFlight::default()
+    }));
+    let server = Arc::new(
+        Server::bind(home.path())
+            .unwrap()
+            .with_backend(Arc::new(backend.clone())),
+    );
+    let serving = Arc::clone(&server);
+    let task = thread::spawn(move || serving.serve_one().unwrap());
+    let report = Client::connect(home.path())
+        .unwrap()
+        .force_stop_scope()
+        .unwrap();
+    task.join().unwrap();
+    assert!(!report.cleanup_complete);
+    assert!(backend.0.cancelled.load(Ordering::Acquire));
+    assert!(backend.0.resumed.load(Ordering::Acquire));
+    assert!(!server.shutdown_requested.load(Ordering::Acquire));
+}
+
+#[test]
+fn review_forced_stop_must_drain_background_kit_work_before_teardown() {
+    let home = home();
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        review_background: true,
+        ..InstallInFlight::default()
+    }));
+    let server = Server::bind(home.path())
+        .unwrap()
+        .with_backend(Arc::new(backend.clone()))
+        .with_forced_stop_drain(Duration::from_millis(200));
+    let end = Arc::new(AtomicBool::new(false));
+    let ending = end.clone();
+    let task = thread::spawn(move || {
+        server
+            .serve_until(|| ending.load(Ordering::Acquire))
+            .unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !backend.0.review_background_entered.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let result = Client::connect(home.path())
+        .unwrap()
+        .scope_lifecycle_with_timeout(PublicRequest::ForceStopScope, PATIENCE);
+    backend
+        .0
+        .review_background_released
+        .store(true, Ordering::Release);
+    end.store(true, Ordering::Release);
+    task.join().unwrap();
+    assert!(
+        !backend
+            .0
+            .review_teardown_overlapped_background
+            .load(Ordering::Acquire),
+        "teardown ran during background Kit work: {result:?}"
+    );
+}
+
+/// A server whose background pass is held, with `backend`.
+fn serve_with_held_background_pass(
+    backend: &InstallInFlightBackend,
+    drain: Duration,
+) -> (tempfile::TempDir, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let home = home();
+    let server = Server::bind(home.path())
+        .unwrap()
+        .with_backend(Arc::new(backend.clone()))
+        .with_forced_stop_drain(drain);
+    let end = Arc::new(AtomicBool::new(false));
+    let ending = end.clone();
+    let task = thread::spawn(move || {
+        server
+            .serve_until(|| ending.load(Ordering::Acquire))
+            .unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !backend.0.review_background_entered.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    (home, end, task)
+}
+
+/// Claude's round 2 (`KitInstall.tla` `TdCancelBg`): while the background
+/// Kit pass runs (a Kit update's create can take an hour), ordinary requests
+/// are served, and a plain stop cancels the pass's creates, waits for it,
+/// and stops; its teardown does not overlap the pass. GPT's probe, which
+/// showed the stop refused for the pass's whole run. Fails when a plain stop
+/// does not cancel background creates.
+#[test]
+fn a_plain_stop_cancels_the_background_pass_and_stops() {
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        review_background: true,
+        ..InstallInFlight::default()
+    }));
+    let (home, end, task) = serve_with_held_background_pass(&backend, Duration::from_secs(5));
+    let client = Client::connect(home.path()).unwrap();
+    assert_eq!(client.registered_commands().unwrap(), Vec::<String>::new());
+    let report = client.stop_scope().unwrap();
+    end.store(true, Ordering::Release);
+    task.join().unwrap();
+    assert!(report.cleanup_complete, "{report:?}");
+    assert!(backend.0.background_cancelled.load(Ordering::Acquire));
+    assert!(
+        backend.0.background_resumed.load(Ordering::Acquire),
+        "the drain left background creates disabled"
+    );
+    assert!(
+        !backend.0.cancelled.load(Ordering::Acquire),
+        "user creates were cancelled"
+    );
+    assert_eq!(
+        *backend.0.calls.lock().unwrap(),
+        [ScopeLifecycleAction::Stop]
+    );
+    assert!(
+        !backend
+            .0
+            .review_teardown_overlapped_background
+            .load(Ordering::Acquire)
+    );
+}
+
+#[test]
+fn review_v2c_plain_stop_with_background_and_user_install_cancels_neither() {
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        review_background: true,
+        ..InstallInFlight::default()
+    }));
+    let (home, end, task) = serve_with_held_background_pass(&backend, Duration::from_millis(200));
+    let install = install_in_flight(&backend, home.path());
+    let refused = Client::connect(home.path())
+        .unwrap()
+        .scope_lifecycle_with_timeout(PublicRequest::StopScope, PATIENCE);
+    let user_cancelled = backend.0.cancelled.load(Ordering::Acquire);
+    let background_cancelled = backend.0.background_cancelled.load(Ordering::Acquire);
+    let install_ended = install.is_finished();
+    let teardown = backend.0.calls.lock().unwrap().clone();
+    backend.0.released.store(true, Ordering::Release);
+    backend
+        .0
+        .review_background_released
+        .store(true, Ordering::Release);
+    install.join().unwrap().unwrap_err();
+    end.store(true, Ordering::Release);
+    task.join().unwrap();
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(!user_cancelled && !background_cancelled);
+    assert!(!install_ended);
+    assert_eq!(teardown, Vec::new());
+}
+
+#[test]
+fn review_v2c_plain_stop_preserves_running_job_when_it_cancels_background() {
+    let home = home();
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        review_background: true,
+        ..InstallInFlight::default()
+    }));
+    let server = Server::bind(home.path())
+        .unwrap()
+        .with_backend(Arc::new(backend.clone()))
+        .with_forced_stop_drain(Duration::from_millis(200));
+    let store = server.store();
+    let session = store.attach_shell(std::process::id(), authority("/", home.path()));
+    store
+        .register_worker(WorkerStatus {
+            worker_id: "worker".into(),
+            vm_id: "vm".into(),
+            scope_id: store.status(None).scope_id,
+            kit_ref: "kit:test".into(),
+            kits: vec!["hf".into()],
+            warm: true,
+            health: WorkerHealth::Ready,
+            container_capacity: 8,
+            active_container_ids: vec![],
+            quarantine: None,
+        })
+        .unwrap();
+    let (job, _) = store
+        .begin_job(NewJob {
+            label: None,
+            session_id: session,
+            command: "hf".into(),
+            kit_ref: "kit:test".into(),
+            workload_image: "kit:test".into(),
+            mounts: vec![],
+        })
+        .unwrap();
+    store.reserve_worker(&job, "worker", "vm").unwrap();
+    store
+        .mark_running(&job, "worker", "vm", &"a".repeat(64))
+        .unwrap();
+    let end = Arc::new(AtomicBool::new(false));
+    let ending = end.clone();
+    let task = thread::spawn(move || {
+        server
+            .serve_until(|| ending.load(Ordering::Acquire))
+            .unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !backend.0.review_background_entered.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let refused = Client::connect(home.path())
+        .unwrap()
+        .scope_lifecycle_with_timeout(PublicRequest::StopScope, PATIENCE);
+    let running = store.job(&job).unwrap().state;
+    let cancel_requested = store.cancel_requested(&job);
+    end.store(true, Ordering::Release);
+    backend
+        .0
+        .review_background_released
+        .store(true, Ordering::Release);
+    task.join().unwrap();
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(running, JobState::Running);
+    assert!(!cancel_requested);
+    assert!(backend.0.background_cancelled.load(Ordering::Acquire));
+    assert!(!backend.0.cancelled.load(Ordering::Acquire));
+    assert!(backend.0.calls.lock().unwrap().is_empty());
+}
+
+/// A background pass that does not end within the bound keeps a plain reset
+/// refused (nothing torn down), and the refusal says what `--force` does.
+#[test]
+fn a_background_pass_that_does_not_end_refuses_a_plain_reset_with_the_force_hint() {
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        review_background: true,
+        background_ignores_cancel: true,
+        ..InstallInFlight::default()
+    }));
+    let (home, end, task) = serve_with_held_background_pass(&backend, Duration::from_millis(200));
+    let client = Client::connect(home.path()).unwrap();
+    let refused = client
+        .scope_lifecycle_with_timeout(PublicRequest::ResetScope, Duration::from_secs(5))
+        .unwrap_err()
+        .to_string();
+    backend
+        .0
+        .review_background_released
+        .store(true, Ordering::Release);
+    end.store(true, Ordering::Release);
+    task.join().unwrap();
+    assert!(
+        refused.contains("the background Kit pass") && refused.contains("marsh stop --force"),
+        "{refused}"
+    );
+    // The refused reset lets the background pass create again.
+    assert!(backend.0.background_resumed.load(Ordering::Acquire));
+    assert!(backend.0.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn claude_v2c_probe_shutdown_during_uncancellable_background_pass() {
+    let backend = InstallInFlightBackend(Arc::new(InstallInFlight {
+        review_background: true,
+        background_ignores_cancel: true,
+        ..InstallInFlight::default()
+    }));
+    let (home, end, task) = serve_with_held_background_pass(&backend, Duration::from_secs(8));
+    let client = Client::connect(home.path()).unwrap();
+    let started = Instant::now();
+    // The probe as the upgrade check runs it, with its busy wait shortened
+    // (30 s in production) below the held pass.
+    let result =
+        client.shutdown_resident_waiting(Duration::from_millis(250), Duration::from_secs(1));
+    let took = started.elapsed();
+    backend
+        .0
+        .review_background_released
+        .store(true, Ordering::Release);
+    thread::sleep(Duration::from_millis(500));
+    end.store(true, Ordering::Release);
+    task.join().unwrap();
+    match result {
+        Err(DaemonError::Remote(message)) if message.starts_with(BUSY_BLOCKED) => {}
+        other => panic!("after {took:?}: not a busy refusal: {other:?}"),
+    }
+    // A restart never stops running work: the pass's create was not cancelled.
+    assert!(!backend.0.background_cancelled.load(Ordering::Acquire));
 }

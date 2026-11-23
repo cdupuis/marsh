@@ -10,6 +10,7 @@ mod endpoint;
 mod ephemeral;
 mod kit_auto_update;
 mod kit_descriptors;
+mod kit_install;
 mod kit_lifecycle;
 mod sbxenv;
 mod services;
@@ -155,6 +156,19 @@ pub struct StockDaemonBackend {
     configured_mcp_vms: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
     /// Why automatic recovery last left a quarantined Kit VM in place.
     quarantine_recovery: Mutex<BTreeMap<String, String>>,
+    /// The ids of `kit install` attempts that have not published their
+    /// command (`kit_install.rs`); their records are persisted in the map.
+    running_installs: Mutex<BTreeMap<String, (String, String)>>,
+    /// How long a reset waits for Kit locks held elsewhere (milliseconds;
+    /// `kit_install::RESET_LOCK_WAIT_MS`, shortened by tests).
+    reset_lock_wait: std::sync::atomic::AtomicU64,
+    /// Runs once between a reset's first plan and its Kit locks (tests that
+    /// interleave another operation there).
+    #[cfg(test)]
+    reset_before_locks: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Called at named points of `install_command` (tests).
+    #[cfg(test)]
+    install_hook: Mutex<Option<InstallHook>>,
     /// Session-origin cloud placement (`docs/design/cloud-placement.md`).
     cloud: cloud::CloudPlacement,
     /// Automatic Kit updates; off unless [`Self::with_auto_update`].
@@ -494,6 +508,12 @@ impl StockDaemonBackend {
             sbxenv_sweep: Mutex::new(sbxenv::Sweep::default()),
             configured_mcp_vms: Mutex::new(BTreeMap::new()),
             quarantine_recovery: Mutex::new(BTreeMap::new()),
+            running_installs: Mutex::new(BTreeMap::new()),
+            reset_lock_wait: std::sync::atomic::AtomicU64::new(kit_install::RESET_LOCK_WAIT_MS),
+            #[cfg(test)]
+            reset_before_locks: Mutex::new(None),
+            #[cfg(test)]
+            install_hook: Mutex::new(None),
             cloud: cloud::CloudPlacement::default(),
             auto_update: None,
             kit_updates: Mutex::new(()),
@@ -613,6 +633,21 @@ impl StockDaemonBackend {
     #[must_use]
     pub fn protected_guest_roots(&self) -> &[PathBuf] {
         &self.config.protected_guest_roots
+    }
+
+    /// The spec of `command`'s Kit VM under the name the ownership map
+    /// records for it, never assigning one: `None` when it has none.
+    fn kit_spec_lookup(&self, command: &str) -> Option<KitVmSpec> {
+        let workload = self
+            .registered_kit(command)
+            .ok()?
+            .workload
+            .capture_generation()
+            .ok()?;
+        let name = self
+            .sbx
+            .recorded_vm_name(VmPurpose::Kit, workload.identity())?;
+        self.kit_spec_for_workload_named(workload, name).ok()
     }
 
     fn kit_spec(&self, command: &str) -> Result<KitVmSpec, DaemonError> {
@@ -950,6 +985,19 @@ impl StockDaemonBackend {
     /// The VM does not depend on the environment files: they change while it
     /// runs, and servers are loaded into it (`sbxenv.rs`).
     fn kit_spec_for_workload(&self, workload: NativeKitRef) -> Result<KitVmSpec, DaemonError> {
+        let name = self
+            .sbx
+            .vm_name(VmPurpose::Kit, workload.identity())
+            .map_err(backend_error)?;
+        self.kit_spec_for_workload_named(workload, name)
+    }
+
+    /// The spec of `workload`'s VM under a given name, never assigning one.
+    fn kit_spec_for_workload_named(
+        &self,
+        workload: NativeKitRef,
+        name: String,
+    ) -> Result<KitVmSpec, DaemonError> {
         let kit_digest = identity_digest(workload.identity());
         let lifecycle_root = self.config.control_home.join("kit-lifecycle");
         fs::create_dir_all(&lifecycle_root)?;
@@ -960,10 +1008,7 @@ impl StockDaemonBackend {
         fs::set_permissions(&lifecycle_workspace, fs::Permissions::from_mode(0o700))?;
         selected_home_identity(&lifecycle_workspace).map_err(backend_error)?;
         Ok(KitVmSpec {
-            name: self
-                .sbx
-                .vm_name(VmPurpose::Kit, workload.identity())
-                .map_err(backend_error)?,
+            name,
             worker_binary: self.config.worker_binary.clone(),
             workload_kit: workload,
             lifecycle_workspace,
@@ -1002,7 +1047,11 @@ impl StockDaemonBackend {
         failed
     }
 
-    fn reset_stale_scope_components(&self, deadline: Instant) -> Vec<ScopeCleanupComponent> {
+    fn reset_stale_scope_components(
+        &self,
+        deadline: Instant,
+        keep: &BTreeSet<String>,
+    ) -> Vec<ScopeCleanupComponent> {
         let component = |state, vm, detail| ScopeCleanupComponent {
             kind: "kit".into(),
             label: "stale-generations".into(),
@@ -1010,7 +1059,10 @@ impl StockDaemonBackend {
             vm,
             detail,
         };
-        match self.sbx.reset_stale_scope_kit_vms_before(deadline) {
+        match self
+            .sbx
+            .reset_stale_scope_kit_vms_keeping_before(deadline, keep)
+        {
             Ok(removed) if removed.is_empty() => {
                 vec![component(ScopeCleanupState::Absent, None, None)]
             }
@@ -1028,6 +1080,37 @@ impl StockDaemonBackend {
         }
     }
 
+    /// Prepare the Kit VM of `owner` for a caller that holds its Kit lock
+    /// (an install, a Kit switch), as [`Self::prepare_one_authorized`] does
+    /// for one that does not.
+    fn prepare_held(
+        &self,
+        spec: &KitVmSpec,
+        store: &DaemonStore,
+        owner: &str,
+        observed_validation: u64,
+        install: Option<&marsh_sbx::InstallRecord>,
+    ) -> Result<ReadyKitVm, DaemonError> {
+        self.sbx.set_kit_job_memory(
+            store
+                .job_limits_over(self.config.resources)
+                .resources
+                .memory_bytes,
+            marsh_daemon::limits::host_size().1,
+        );
+        let vm = self.prepare_locked(
+            spec,
+            store,
+            None,
+            |_| Ok(()),
+            owner,
+            observed_validation,
+            install,
+        )?;
+        self.note_vm_used(&vm.name);
+        Ok(vm)
+    }
+
     fn prepare_one_with_progress(
         &self,
         spec: &KitVmSpec,
@@ -1037,18 +1120,62 @@ impl StockDaemonBackend {
         self.prepare_one_authorized(spec, store, None, cold_boot)
     }
 
-    fn kit_flight_key(&self, spec: &KitVmSpec, ephemeral: bool) -> Result<String, DaemonError> {
+    /// The Kit lock key of a Kit VM's ownership key (its Kit identity, or
+    /// `IDENTITY:ephemeral:SESSION`): the one function every path that
+    /// chooses, creates or retires a Kit VM name, or touches the install
+    /// records, keys its Kit lock by (`docs/model/KitInstall.tla`, rule 1).
+    /// The validation flight and Ready cache of the Kit use the same key.
+    fn kit_lock_key(&self, ownership_key: &str) -> Result<String, DaemonError> {
         let scope_identity =
             selected_home_identity(&self.config.daemon_home).map_err(backend_error)?;
-        Ok(if ephemeral {
-            format!(
-                "{scope_identity}:{}:{}",
-                spec.workload_kit.identity(),
-                spec.name
-            )
+        Ok(format!("{scope_identity}:{ownership_key}"))
+    }
+
+    /// The Kit lock of an ownership key ([`Self::kit_lock_key`]).
+    fn kit_lock_for_key(&self, ownership_key: &str) -> Result<Arc<Mutex<()>>, DaemonError> {
+        let key = self.kit_lock_key(ownership_key)?;
+        Ok(self
+            .kit_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone())
+    }
+
+    /// The Kit locks of several ownership keys, in lock-key order, one per
+    /// Kit. Take them all at once with [`lock_in_order`]: nobody waits for a
+    /// Kit lock while holding a later one, so a reset, a Kit switch and a
+    /// preparation never deadlock (`switchAbba`, `lockPerVm`).
+    fn kit_locks_in_order(
+        &self,
+        ownership_keys: &BTreeSet<String>,
+    ) -> Result<Vec<Arc<Mutex<()>>>, DaemonError> {
+        Ok(ownership_keys
+            .iter()
+            .map(|key| Ok((self.kit_lock_key(key)?, self.kit_lock_for_key(key)?)))
+            .collect::<Result<BTreeMap<_, _>, DaemonError>>()?
+            .into_values()
+            .collect())
+    }
+
+    /// The ownership key of `spec`'s VM: the Kit identity, or for an
+    /// ephemeral Kit VM the key its name was assigned for.
+    fn spec_ownership_key(&self, spec: &KitVmSpec, ephemeral: bool) -> Result<String, DaemonError> {
+        if ephemeral {
+            self.sbx.vm_ownership_key(&spec.name).ok_or_else(|| {
+                DaemonError::InvalidState(format!(
+                    "ephemeral Kit VM {} is not in the VM ownership map",
+                    spec.name
+                ))
+            })
         } else {
-            format!("{scope_identity}:{}", spec.workload_kit.identity())
-        })
+            Ok(spec.workload_kit.identity().to_owned())
+        }
+    }
+
+    fn kit_flight_key(&self, spec: &KitVmSpec, ephemeral: bool) -> Result<String, DaemonError> {
+        self.kit_lock_key(&self.spec_ownership_key(spec, ephemeral)?)
     }
 
     /// Every job's (and `--load`'s) preparation of its Kit VM; a VM it
@@ -1072,7 +1199,6 @@ impl StockDaemonBackend {
         Ok(vm)
     }
 
-    #[allow(clippy::too_many_lines)] // One fenced validation/preparation flight.
     fn prepare_one_unnoted(
         &self,
         spec: &KitVmSpec,
@@ -1080,36 +1206,126 @@ impl StockDaemonBackend {
         ephemeral: Option<&marsh_sbx::EphemeralHomeToken>,
         cold_boot: impl FnOnce(bool) -> Result<(), DaemonError>,
     ) -> Result<ReadyKitVm, DaemonError> {
-        let key = self.kit_flight_key(spec, ephemeral.is_some())?;
+        let owner = self.spec_ownership_key(spec, ephemeral.is_some())?;
+        let kit_lock = self.kit_lock_for_key(&owner)?;
+        // Callers that arrive during one live validation share its result.
+        // A later, nonoverlapping caller observes the new epoch and performs
+        // its own exact liveness validation.
+        let observed_validation = self.observed_validation(&owner)?;
+        let _initializing = kit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prepare_locked(
+            spec,
+            store,
+            ephemeral,
+            cold_boot,
+            &owner,
+            observed_validation,
+            None,
+        )
+    }
+
+    /// The validation epoch of the Kit `owner` a caller saw before waiting
+    /// for its Kit lock.
+    fn observed_validation(&self, owner: &str) -> Result<u64, DaemonError> {
+        let key = self.kit_lock_key(owner)?;
+        Ok(self
+            .kit_validation_flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .map_or(0, |completion| completion.epoch))
+    }
+
+    /// Prepare the Kit VM of the ownership key `owner`, whose Kit lock the
+    /// caller holds (`docs/model/KitInstall.tla`, rules 2-4): recover the
+    /// Kit's quarantined VM, then choose its name from the map, then (an
+    /// install) persist the install record under that name, then create.
+    /// The name `spec` carries is only a hint: nothing chosen before the lock
+    /// is used. A create refused because the name was retired meanwhile
+    /// (the create-time check) chooses again, once, and re-points the record.
+    #[allow(clippy::too_many_arguments)] // The locked half of one preparation.
+    fn prepare_locked(
+        &self,
+        spec: &KitVmSpec,
+        store: &DaemonStore,
+        ephemeral: Option<&marsh_sbx::EphemeralHomeToken>,
+        cold_boot: impl FnOnce(bool) -> Result<(), DaemonError>,
+        owner: &str,
+        observed_validation: u64,
+        install: Option<&marsh_sbx::InstallRecord>,
+    ) -> Result<ReadyKitVm, DaemonError> {
+        let key = self.kit_lock_key(owner)?;
         if let Some(token) = ephemeral {
             self.sbx
                 .ephemeral_home_grant(token, &spec.lifecycle_workspace, &spec.lifecycle_workspace)
                 .map_err(backend_error)?;
         }
+        let mut cold_boot = Some(cold_boot);
+        let mut spec = spec.clone();
+        let mut observed = observed_validation;
+        let mut chosen_again = false;
+        loop {
+            self.recover_then_choose(&mut spec, store, owner, install)?;
+            match self.prepare_flight(&spec, store, ephemeral, &mut cold_boot, &key, observed) {
+                Err(_) if !chosen_again && !self.sbx.is_live_vm_name(&spec.name) => {
+                    // The failed flight is this caller's own: not a result
+                    // to share with its second choice.
+                    observed = self.observed_validation(owner)?;
+                    chosen_again = true;
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    /// Under `owner`'s Kit lock: recover the Kit's quarantined VM when that
+    /// is verifiably safe, then choose its name (the recorded one, else a
+    /// fresh persisted intent), then persist an install's record under it.
+    fn recover_then_choose(
+        &self,
+        spec: &mut KitVmSpec,
+        store: &DaemonStore,
+        owner: &str,
+        install: Option<&marsh_sbx::InstallRecord>,
+    ) -> Result<(), DaemonError> {
         // A quarantined VM is replaced here once that is verifiably safe;
         // otherwise preparation reports the quarantine and why it stays.
-        if self.vm_quarantined(store, &spec.name) {
-            let _ = self.recover_quarantined_vm(store, &spec.name);
+        let mut current = BTreeSet::from([spec.name.clone()]);
+        current.extend(self.sbx.recorded_vm_name(VmPurpose::Kit, owner));
+        for name in current {
+            if self.sbx.vm_ownership_key(&name).as_deref() == Some(owner)
+                && self.vm_quarantined(store, &name)
+            {
+                let _ = self.recover_quarantined_vm_locked(store, &name);
+            }
         }
-        let kit_lock = self
-            .kit_locks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        // Callers that arrive during one live validation share its result.
-        // A later, nonoverlapping caller observes the new epoch and performs
-        // its own exact liveness validation.
-        let observed_validation = self
-            .kit_validation_flights
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .map_or(0, |completion| completion.epoch);
-        let _initializing = kit_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        spec.name = self
+            .sbx
+            .vm_name(VmPurpose::Kit, owner)
+            .map_err(backend_error)?;
+        if let Some(record) = install {
+            self.sbx
+                .begin_install_record(&spec.name, record.clone())
+                .map_err(backend_error)?;
+        }
+        Ok(())
+    }
+
+    /// One fenced validation/preparation flight of `spec`'s VM, under its
+    /// Kit lock.
+    #[allow(clippy::too_many_lines)] // One fenced validation/preparation flight.
+    fn prepare_flight(
+        &self,
+        spec: &KitVmSpec,
+        store: &DaemonStore,
+        ephemeral: Option<&marsh_sbx::EphemeralHomeToken>,
+        cold_boot: &mut Option<impl FnOnce(bool) -> Result<(), DaemonError>>,
+        key: &str,
+        observed_validation: u64,
+    ) -> Result<ReadyKitVm, DaemonError> {
+        let key = key.to_owned();
         let cached = self
             .ready_kits
             .lock()
@@ -1149,7 +1365,6 @@ impl StockDaemonBackend {
                 // here; one that does not come back healthy is replaced.
                 let resuming =
                     ephemeral.is_none() && self.sbx.kit_vm_stopped(spec).map_err(backend_error)?;
-                let mut cold_boot = Some(cold_boot);
                 let mut start = || -> Result<ReadyKitVm, (DaemonError, Replace)> {
                     let sbx = |error: marsh_sbx::SbxError| {
                         let replace = replace_after(&error);
@@ -1367,12 +1582,28 @@ enum Replace {
     Always,
 }
 
+/// A test's probe at a named point of `install_command`.
+#[cfg(test)]
+type InstallHook = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Lock every Kit lock of [`StockDaemonBackend::kit_locks_in_order`].
+fn lock_in_order(locks: &[Arc<Mutex<()>>]) -> Vec<std::sync::MutexGuard<'_, ()>> {
+    locks
+        .iter()
+        .map(|lock| {
+            lock.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+        .collect()
+}
+
 /// Never quarantine, foreign ownership, or work in progress.
 const fn replace_after(error: &marsh_sbx::SbxError) -> Replace {
     match error {
         marsh_sbx::SbxError::WorkerNotReady(_) => Replace::Always,
         marsh_sbx::SbxError::CommandFailed { .. }
         | marsh_sbx::SbxError::PreparationTimeout { .. }
+        | marsh_sbx::SbxError::OutputDrain { .. }
         | marsh_sbx::SbxError::IncompatibleVm { .. }
         | marsh_sbx::SbxError::UnreadableVm { .. }
         | marsh_sbx::SbxError::WorkerLeaseLost(_) => Replace::IfResumed,
@@ -1569,14 +1800,26 @@ impl DaemonBackend for StockDaemonBackend {
     }
 
     fn auto_update_kits(&self, store: &DaemonStore) {
-        self.remove_retired_vms();
-        self.retire_drained(store);
-        self.sbx.release_deferred_session_pins();
-        self.recover_quarantined(store);
-        self.bring_shipped_kits(store, unix_millis(SystemTime::now()));
-        self.move_retired_kits(store, unix_millis(SystemTime::now()));
-        self.auto_update_pass(store, unix_millis(SystemTime::now()));
-        self.gc_pass(store, unix_millis(SystemTime::now()));
+        // Its Kit VM creates (shipped and automatic updates) run under the
+        // background cancellation (`StockSbx::in_background`).
+        self.sbx.in_background(|| {
+            self.remove_retired_vms();
+            self.retire_drained(store);
+            self.sbx.release_deferred_session_pins();
+            self.recover_quarantined(store);
+            self.bring_shipped_kits(store, unix_millis(SystemTime::now()));
+            self.move_retired_kits(store, unix_millis(SystemTime::now()));
+            self.auto_update_pass(store, unix_millis(SystemTime::now()));
+            self.gc_pass(store, unix_millis(SystemTime::now()));
+        });
+    }
+
+    fn cancel_background_creates(&self) {
+        self.sbx.cancel_background_creates();
+    }
+
+    fn resume_background_creates(&self) {
+        self.sbx.resume_background_creates();
     }
 
     fn gc_vms(
@@ -1801,6 +2044,14 @@ impl DaemonBackend for StockDaemonBackend {
         self.cloud.forget(self, name)
     }
 
+    fn cancel_creates(&self) {
+        self.sbx.cancel_creates();
+    }
+
+    fn resume_creates(&self) {
+        self.sbx.resume_creates();
+    }
+
     fn reset_workers(
         &self,
         selection: &LoadSelection,
@@ -1809,51 +2060,7 @@ impl DaemonBackend for StockDaemonBackend {
         if let Some(done) = self.reset_cloud_selection(selection, &store)? {
             return Ok(done);
         }
-        let mut selected = match selection {
-            LoadSelection::All => self.command_names(),
-            LoadSelection::Kits(commands) => commands.clone(),
-        };
-        selected.sort();
-        selected.dedup();
-        if selected.is_empty() {
-            return Err(DaemonError::InvalidState(
-                "worker reset selection cannot be empty".into(),
-            ));
-        }
-
-        // Resolve every command before making any lifecycle change. Aliases
-        // that name the same exact Kit identity collapse to one owned VM.
-        let mut specs = BTreeMap::new();
-        for command in &selected {
-            let spec = self.kit_spec(command)?;
-            specs.entry(spec.name.clone()).or_insert(spec);
-        }
-        let locks = specs
-            .values()
-            .map(|spec| {
-                let key = self.kit_flight_key(spec, false)?;
-                Ok(self
-                    .kit_locks
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .entry(key)
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone())
-            })
-            .collect::<Result<Vec<_>, DaemonError>>()?;
-        let _guards = locks
-            .iter()
-            .map(|lock| {
-                lock.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-            })
-            .collect::<Vec<_>>();
-        let claim = Self::claim_retirement(&store, specs.keys().cloned().collect())?;
-        self.retire_claimed(&store, &specs, &claim)?;
-        if matches!(selection, LoadSelection::All) {
-            self.retire_unnamed_quarantined(&store)?;
-        }
-        Ok(selected)
+        self.reset_kit_vms(selection, &store)
     }
 
     #[allow(clippy::too_many_lines)] // Reports each local cleanup independently.
@@ -1884,8 +2091,28 @@ impl DaemonBackend for StockDaemonBackend {
         let mut by_vm = BTreeMap::<String, (KitVmSpec, Vec<String>)>::new();
         let mut components = Vec::new();
         let resolution_failed = self.resolve_scope_kits(&mut by_vm, &mut components);
+        let planned = by_vm.keys().cloned().collect::<BTreeSet<_>>();
+        let forced = store.forced_stop_active();
+        let verified = self.verify_unknown_executions_for_teardown(
+            &store,
+            &mut by_vm,
+            &mut components,
+            forced,
+        );
+        let mut kept = planned
+            .iter()
+            .filter(|vm| !by_vm.contains_key(*vm))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        // The stale-generation sweep below removes every other owned Kit VM
+        // (one a Kit switch, update or uninstall left draining): it gets the
+        // same check (`KitInstall.tla` `sweepUnchecked`).
+        kept.extend(self.keep_unverified_generations(&store, &planned, &mut components, forced));
         let worker_ids = by_vm.keys().cloned().collect::<Vec<_>>();
-        if store.begin_workers_reset(&worker_ids).is_err() {
+        if store
+            .begin_verified_workers_reset(&worker_ids, &verified)
+            .is_err()
+        {
             return ScopeLifecycleReport {
                 action,
                 cleanup_complete: false,
@@ -1963,7 +2190,7 @@ impl DaemonBackend for StockDaemonBackend {
                 detail,
             });
         }
-        components.extend(self.reset_stale_scope_components(deadline));
+        components.extend(self.reset_stale_scope_components(deadline, &kept));
         components.extend(self.services_scope_teardown(action, deadline));
         self.finish_shell_warmup();
         for shell in self.sbx.shell_recovery_specs(&self.config.shell) {
@@ -2679,16 +2906,33 @@ impl DaemonBackend for StockDaemonBackend {
                         // A start the store refuses ends the attempt as lost
                         // (the container is cancelled; grants are revoked and
                         // the container reconciled below like any loss).
-                        if let Err((detail, lost)) =
-                            record_start(&store, &job_id, &vm.name, container_id, || {
+                        if let Err((detail, lost)) = record_start(
+                            &store,
+                            &job_id,
+                            &vm.name,
+                            container_id,
+                            || {
                                 let _ = control.send_bounded(
                                     &WorkerRequest::Cancel {
                                         attempt: attempt_id.clone(),
                                     },
                                     WORKER_CANCEL_WRITE_TIMEOUT,
                                 );
-                            })
-                        {
+                            },
+                            // Journaled (synced) with its VM and container:
+                            // the worker may start it now. The send's result
+                            // is ignored on purpose: a lost write shows up as
+                            // the worker's lost route, or as its own ack
+                            // timeout, which deletes the container unstarted.
+                            || {
+                                let _ = control.send_bounded(
+                                    &WorkerRequest::StartedAck {
+                                        attempt: attempt_id.clone(),
+                                    },
+                                    WORKER_CANCEL_WRITE_TIMEOUT,
+                                );
+                            },
+                        ) {
                             transport_lost = true;
                             output_complete = false;
                             transport_detail = Some(detail);
@@ -3921,20 +4165,25 @@ fn cleanup_diagnostic(message: &str, output_budget: u64, output_used: u64) -> Ve
 
 /// Record the worker's `Started` on the receipt. When the store refuses it
 /// the container may be running: `cancel` is called, and the loss is returned
-/// for the response loop to break out with, never an early return.
+/// for the response loop to break out with, never an early return. Once the
+/// store journaled it, `acknowledge` is called (the worker's launch fence),
+/// and only then.
 fn record_start(
     store: &DaemonStore,
     job_id: &str,
     vm: &str,
     container_id: marsh_contracts::ContainerId,
     cancel: impl FnOnce(),
+    acknowledge: impl FnOnce(),
 ) -> Result<(), (String, WorkerReport)> {
     store
         .mark_running(job_id, vm, vm, container_id.as_str())
         .map_err(|error| {
             cancel();
             unrecorded_start(Some(container_id), &error)
-        })
+        })?;
+    acknowledge();
+    Ok(())
 }
 
 /// The worker reported a started container that the store refused to record
@@ -5221,11 +5470,104 @@ struct RetirementClaim {
 }
 
 impl StockDaemonBackend {
+    /// For a teardown: the VMs of `by_vm` a job whose execution is unknown
+    /// (a restart lost it) is recorded on and that may go, because nothing
+    /// is verified to run there or this is `marsh stop --force` (`forced`,
+    /// the explicit override). Any other such VM leaves `by_vm` and is
+    /// reported kept (`KitInstall.tla` `Teardown`, `StopEnd`).
+    fn verify_unknown_executions_for_teardown(
+        &self,
+        store: &DaemonStore,
+        by_vm: &mut BTreeMap<String, (KitVmSpec, Vec<String>)>,
+        components: &mut Vec<ScopeCleanupComponent>,
+        forced: bool,
+    ) -> BTreeSet<String> {
+        let mut verified = BTreeSet::new();
+        by_vm.retain(|vm, (_, labels)| {
+            let jobs = store.jobs_whose_execution_may_run(vm);
+            if jobs.is_empty() {
+                return true;
+            }
+            let checked = if forced {
+                Ok(String::new())
+            } else {
+                self.sbx.verify_no_running_containers(vm)
+            };
+            match checked {
+                Ok(_) => {
+                    verified.insert(vm.clone());
+                    true
+                }
+                Err(why) => {
+                    labels.sort();
+                    components.push(ScopeCleanupComponent {
+                        kind: "kit".into(),
+                        label: labels.join(","),
+                        state: ScopeCleanupState::CleanupUncertain,
+                        vm: Some(vm.clone()),
+                        detail: Some(format!(
+                            "kept: job {} may still be running there (marsh lost track of its execution), and marsh could not verify that nothing runs: {why}; `marsh stop --force` removes it, ending whatever still runs",
+                            jobs.join(", ")
+                        )),
+                    });
+                    false
+                }
+            }
+        });
+        verified
+    }
+
+    /// The owned Kit VMs outside `planned` (older generations, which the
+    /// stale-generation sweep removes) that a job whose execution is unknown
+    /// is recorded on and that nothing verifies to run no container: kept
+    /// and reported, unless this is the forced stop (`forced`).
+    fn keep_unverified_generations(
+        &self,
+        store: &DaemonStore,
+        planned: &BTreeSet<String>,
+        components: &mut Vec<ScopeCleanupComponent>,
+        forced: bool,
+    ) -> BTreeSet<String> {
+        let mut kept = BTreeSet::new();
+        if forced {
+            return kept;
+        }
+        let owned = self
+            .sbx
+            .owned_kit_vm_names()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for (vm, jobs) in store.vms_whose_execution_may_run() {
+            if planned.contains(&vm) || !owned.contains(&vm) {
+                continue;
+            }
+            if let Err(why) = self.sbx.verify_no_running_containers(&vm) {
+                components.push(ScopeCleanupComponent {
+                    kind: "kit".into(),
+                    label: "stale-generations".into(),
+                    state: ScopeCleanupState::CleanupUncertain,
+                    vm: Some(vm.clone()),
+                    detail: Some(format!(
+                        "kept: job {} may still be running there (marsh lost track of its execution), and marsh could not verify that nothing runs: {why}; `marsh stop --force` removes it, ending whatever still runs",
+                        jobs.join(", ")
+                    )),
+                });
+                kept.insert(vm);
+            }
+        }
+        kept
+    }
+
     /// Marks workers as being reset, refusing any with running jobs. Release an
     /// unused claim with [`DaemonStore::cancel_workers_reset`].
+    ///
+    /// A VM of `verified` was verified to run no container (or this is the
+    /// forced stop): a job on it whose execution is unknown does not refuse
+    /// it ([`DaemonStore::begin_verified_workers_reset`]).
     fn claim_retirement(
         store: &DaemonStore,
         worker_ids: Vec<String>,
+        verified: &BTreeSet<String>,
     ) -> Result<RetirementClaim, DaemonError> {
         // An owned quarantined VM is always retirable; pins held by shells
         // that are no longer attached are leftovers of ended sessions.
@@ -5237,11 +5579,27 @@ impl StockDaemonBackend {
             .map(|worker| worker.worker_id)
             .collect::<BTreeSet<_>>();
         let live = store.attached_session_ids();
-        store.begin_workers_reset(&worker_ids)?;
+        store.begin_verified_workers_reset(&worker_ids, verified)?;
         Ok(RetirementClaim {
             worker_ids,
             live,
             quarantined,
+        })
+    }
+
+    /// [`Self::claim_retirement`] for `marsh workers reset all`: refused for
+    /// a VM with an unfinished job or one whose cleanup is not verified
+    /// (`DaemonStore::begin_settled_workers_reset`).
+    fn claim_settled_retirement(
+        store: &DaemonStore,
+        worker_ids: Vec<String>,
+    ) -> Result<RetirementClaim, DaemonError> {
+        let live = store.attached_session_ids();
+        store.begin_settled_workers_reset(&worker_ids)?;
+        Ok(RetirementClaim {
+            worker_ids,
+            live,
+            quarantined: BTreeSet::new(),
         })
     }
 
@@ -5260,7 +5618,16 @@ impl StockDaemonBackend {
         change: &'static str,
     ) -> Result<Option<String>, DaemonError> {
         let current = self.registered_kit(command)?;
-        let old_spec = self.kit_spec(command)?;
+        let old_workload = current
+            .workload
+            .capture_generation()
+            .map_err(backend_error)?;
+        let lock = self.kit_lock_for_key(old_workload.identity())?;
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The old VM's name is read under its Kit lock.
+        let old_spec = self.kit_spec_for_workload(old_workload)?;
         let still_used = self
             .kit_names_for_workload(current.workload.identity())
             .iter()
@@ -5268,10 +5635,6 @@ impl StockDaemonBackend {
             || replacement
                 .as_ref()
                 .is_some_and(|kit| kit.workload.identity() == current.workload.identity());
-        let lock = self.kit_lock(&old_spec)?;
-        let _guard = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let old = self.claim_old_vm(store, &old_spec, still_used);
         if let Err(error) = self.persist_installed_command(overlay, &overlay.without(command)) {
             if let OldVm::Retire(claim) = &old {
@@ -5406,14 +5769,44 @@ impl StockDaemonBackend {
     }
 
     fn kit_lock(&self, spec: &KitVmSpec) -> Result<Arc<Mutex<()>>, DaemonError> {
-        let key = self.kit_flight_key(spec, false)?;
-        Ok(self
-            .kit_locks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone())
+        self.kit_lock_for_key(spec.workload_kit.identity())
+    }
+
+    /// The digest reference `marsh kit install` records: a tag resolved
+    /// (once) and its Kit contract checked; any other reference as given.
+    fn resolve_install_reference(
+        &self,
+        source: Option<&KitTag>,
+        reference: String,
+    ) -> Result<String, DaemonError> {
+        Ok(match source {
+            Some(tag) => {
+                let image = self.sbx.resolve_kit_tag(tag).map_err(backend_error)?;
+                let contract = self.sbx.kit_contract(&image).map_err(backend_error)?;
+                check_contract(contract, false).map_err(DaemonError::InvalidState)?;
+                image.as_str().to_owned()
+            }
+            None => reference,
+        })
+    }
+
+    /// Refuses `command` as an alias of a registered command's Kit with a
+    /// different environment.
+    fn check_alias_environments(
+        &self,
+        command: &str,
+        current_names: &[String],
+        workload: &NativeKitRef,
+    ) -> Result<(), DaemonError> {
+        let environment = self.environment(command);
+        for name in current_names {
+            if self.registered_kit(name)?.workload.identity() == workload.identity()
+                && self.environment(name).fingerprint() != environment.fingerprint()
+            {
+                return Err(DaemonError::InvalidState("aliases of the same Kit must have identical environments; add the matching sbxenvs file".into()));
+            }
+        }
+        Ok(())
     }
 
     /// `marsh kit install`: resolve a tag once, record only its digest (and
@@ -5441,15 +5834,7 @@ impl StockDaemonBackend {
         // A tag is resolved once, here; the registry records only the digest.
         let mut sources = kit_lifecycle::read_sources(&self.config.control_home)?;
         let source = KitTag::parse(&reference).ok();
-        let reference = match &source {
-            Some(tag) => {
-                let image = self.sbx.resolve_kit_tag(tag).map_err(backend_error)?;
-                let contract = self.sbx.kit_contract(&image).map_err(backend_error)?;
-                check_contract(contract, false).map_err(DaemonError::InvalidState)?;
-                image.as_str().to_owned()
-            }
-            None => reference,
-        };
+        let reference = self.resolve_install_reference(source.as_ref(), reference)?;
         let path = self.config.control_home.join("commands.json");
         let previous = command_registry::read_declaration(&path).map_err(backend_error)?;
         let updated = previous
@@ -5463,24 +5848,67 @@ impl StockDaemonBackend {
         validate_count(prospective_names.len()).map_err(backend_error)?;
         command_registry::validate_references(&path, &updated).map_err(backend_error)?;
         let workload = NativeKitRef::immutable_oci(reference.clone()).map_err(backend_error)?;
-        let environment = self.environment(&command);
-        for name in &current_names {
-            if self.registered_kit(name)?.workload.identity() == workload.identity()
-                && self.environment(name).fingerprint() != environment.fingerprint()
+        self.check_alias_environments(&command, &current_names, &workload)?;
+        // With a store, the Kit VM is prepared under the Kit lock, which is
+        // held until the command is registered (`docs/model/KitInstall.tla`,
+        // rule 2): no recovery, GC or reset of the Kit sees the VM between
+        // its preparation and the registry write. The attempt's persisted
+        // record names the VM until then, and stays if the install fails.
+        let owner = workload.identity().to_owned();
+        let kit_lock = store.map(|_| self.kit_lock_for_key(&owner)).transpose()?;
+        let observed_validation = self.observed_validation(&owner)?;
+        // Running before it waits for the Kit lock: a reset refuses or skips
+        // it rather than waiting out its create.
+        let mut attempt = store.map(|_| self.begin_install_attempt(&command, &owner));
+        #[cfg(test)]
+        self.install_hook_at("observed");
+        let _kit = kit_lock.as_ref().map(|lock| {
+            lock.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        let mut published_vm = None;
+        if let Some(store) = store
+            && let Some(started) = attempt.as_ref()
+        {
+            let hint = self
+                .sbx
+                .recorded_vm_name(VmPurpose::Kit, &owner)
+                .unwrap_or_default();
+            let spec = self.kit_spec_for_workload_named(workload.clone(), hint)?;
+            let prepared = self.prepare_held(
+                &spec,
+                store,
+                &owner,
+                observed_validation,
+                Some(started.record()),
+            );
+            if let Err(error) = &prepared
+                && error
+                    .to_string()
+                    .contains(&marsh_sbx::SbxError::Stopping.to_string())
+                && let Some(stopped) = attempt.take()
             {
-                return Err(DaemonError::InvalidState("aliases of the same Kit must have identical environments; add the matching sbxenvs file".into()));
+                // Refused before its submit: nothing of it may land.
+                stopped.abandoned()?;
             }
-        }
-        if let Some(store) = store {
-            let spec = self.kit_spec_for_workload(workload.clone())?;
-            let vm = self.prepare_one_with_progress(&spec, store, |_| Ok(()))?;
+            let vm = prepared.map_err(|error| {
+                let vm = self.sbx.recorded_vm_name(VmPurpose::Kit, &owner);
+                quarantine_hint(
+                    error,
+                    &command,
+                    vm.and_then(|vm| self.recovery_note(&vm)).as_deref(),
+                )
+            })?;
             self.register_worker(store, &vm)?;
+            published_vm = Some(vm.name);
         }
         self.persist_installed_command(&previous, &updated)?;
         if let Some(tag) = source {
             sources.insert(command.clone(), tag);
             kit_lifecycle::write_sources(&self.config.control_home, &sources)?;
         }
+        #[cfg(test)]
+        self.install_hook_at("publish");
         self.removed_commands
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5489,7 +5917,22 @@ impl StockDaemonBackend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(command, RegisteredKit { workload });
+        if let (Some(attempt), Some(vm)) = (attempt, published_vm) {
+            attempt.published(&vm)?;
+        }
         Ok(reference)
+    }
+
+    #[cfg(test)]
+    fn install_hook_at(&self, point: &str) {
+        if let Some(hook) = self
+            .install_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(point);
+        }
     }
 
     /// Packaged commands that an automatic update moved to a published image
@@ -6069,7 +6512,9 @@ impl StockDaemonBackend {
 
     /// One automatic update of one Kit: the new image is prepared before the
     /// old Kit is locked, so its jobs keep starting meanwhile; then the switch
-    /// is the upgrade's own, under an ordinary request admission. Running jobs
+    /// is the upgrade's own. The whole background pass runs under one
+    /// admission (`spawn_kit_updater`), and its creates under the background
+    /// cancellation, which a plain stop or reset cancels. Running jobs
     /// do not hold it back: they finish on the old VM (see `apply_upgrade`).
     fn auto_update_one(
         &self,
@@ -6267,15 +6712,27 @@ impl StockDaemonBackend {
                 return Err(DaemonError::InvalidState("aliases of the same Kit must have identical environments; add the matching sbxenvs file".into()).into());
             }
         }
-        let old_spec = self.kit_spec(command)?;
+        let old_workload = self
+            .registered_kit(command)?
+            .workload
+            .capture_generation()
+            .map_err(backend_error)?;
         let still_used = self
             .kit_names_for_workload(current.workload.identity())
             .iter()
             .any(|name| name != command);
-        let lock = self.kit_lock(&old_spec)?;
-        let _guard = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The old Kit's and the new Kit's locks together, in key order,
+        // before the old VM is claimed or the new one prepared: a switch
+        // that held one and waited for the other would deadlock with a
+        // key-ordered reset (`switchAbba`).
+        let new_owner = workload.identity().to_owned();
+        let observed_validation = self.observed_validation(&new_owner)?;
+        let locks = self.kit_locks_in_order(&BTreeSet::from([
+            old_workload.identity().to_owned(),
+            new_owner.clone(),
+        ]))?;
+        let _guards = lock_in_order(&locks);
+        let old_spec = self.kit_spec_for_workload(old_workload)?;
         // Running jobs keep the old VM; the Kit still switches. A limit that
         // counts VMs does not apply to this transition.
         let (claim, drain) = match self.claim_old_vm(store, &old_spec, still_used) {
@@ -6290,8 +6747,8 @@ impl StockDaemonBackend {
         };
         let path = self.config.control_home.join("commands.json");
         let switched = (|| {
-            let spec = self.kit_spec_for_workload(workload.clone())?;
-            let vm = self.prepare_one_with_progress(&spec, store, |_| Ok(()))?;
+            let spec = self.kit_spec_for_workload_named(workload.clone(), String::new())?;
+            let vm = self.prepare_held(&spec, store, &new_owner, observed_validation, None)?;
             self.register_worker(store, &vm)?;
             let previous = command_registry::read_declaration(&path).map_err(backend_error)?;
             let updated = previous
@@ -6395,31 +6852,62 @@ impl StockDaemonBackend {
         specs: &BTreeMap<String, KitVmSpec>,
         claim: &RetirementClaim,
     ) -> Result<(), DaemonError> {
+        self.retire_claimed_named(
+            store,
+            &specs
+                .iter()
+                .map(|(name, spec)| (name.clone(), spec.workload_kit.identity().to_owned()))
+                .collect(),
+            claim,
+        )
+        .map(drop)
+    }
+
+    /// [`Self::retire_claimed`] by VM name and ownership key, under the Kit
+    /// lock of each key. A VM is removed by its recorded UUID and its name
+    /// forgotten, which ends the install records naming it. A name nothing
+    /// is listed under keeps its intent and records (a create that may still
+    /// land) and loses its quarantine. Returns those names.
+    fn retire_claimed_named(
+        &self,
+        store: &DaemonStore,
+        targets: &BTreeMap<String, String>,
+        claim: &RetirementClaim,
+    ) -> Result<Vec<String>, DaemonError> {
         let RetirementClaim {
             worker_ids,
             live,
             quarantined,
         } = claim;
-        for (index, (worker_id, spec)) in specs.iter().enumerate() {
-            let retired = self.sbx.retire_kit_vm_before(
-                spec,
+        let mut may_land = Vec::new();
+        for (index, (worker_id, owner)) in targets.iter().enumerate() {
+            let retired = self.sbx.retire_kit_vm_named_before(
+                worker_id,
+                owner,
                 Instant::now() + Duration::from_hours(24),
                 Some((live, quarantined.contains(worker_id))),
             );
-            if let Err(error) = retired {
-                // Only claimed workers are settled; a target this daemon never
-                // registered (an automatic claim of an unserved VM) has none.
-                if worker_ids.contains(worker_id) {
-                    store.finish_worker_reset(worker_id, false)?;
+            match retired {
+                Ok(false) if self.sbx.is_live_vm_name(worker_id) => {
+                    may_land.push(worker_id.clone());
                 }
-                let rest = specs
-                    .keys()
-                    .skip(index + 1)
-                    .filter(|id| worker_ids.contains(id))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                store.cancel_workers_reset(&rest);
-                return Err(backend_error(error));
+                Ok(_) => {}
+                Err(error) => {
+                    // Only claimed workers are settled; a target this daemon
+                    // never registered (an automatic claim of an unserved VM)
+                    // has none.
+                    if worker_ids.contains(worker_id) {
+                        store.finish_worker_reset(worker_id, false)?;
+                    }
+                    let rest = targets
+                        .keys()
+                        .skip(index + 1)
+                        .filter(|id| worker_ids.contains(id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    store.cancel_workers_reset(&rest);
+                    return Err(backend_error(error));
+                }
             }
             self.ready_kits
                 .lock()
@@ -6428,7 +6916,7 @@ impl StockDaemonBackend {
             self.kit_validation_flights
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(self.kit_flight_key(spec, false)?)
+                .entry(self.kit_lock_key(owner)?)
                 .and_modify(|completion| {
                     completion.epoch = completion.epoch.saturating_add(1);
                     completion.error = None;
@@ -6447,7 +6935,7 @@ impl StockDaemonBackend {
                 .remove(worker_id);
             store.finish_worker_reset(worker_id, true)?;
         }
-        Ok(())
+        Ok(may_land)
     }
 }
 
@@ -8611,9 +9099,14 @@ mod tests {
         let container = marsh_contracts::ContainerId::parse("a".repeat(64)).unwrap();
         let (store, job) = reserved_cleanup_job(home.path(), &vm, &container);
         let cancelled = std::cell::Cell::new(false);
-        let (detail, report) = record_start(&store, &job, &vm.name, container.clone(), || {
-            cancelled.set(true);
-        })
+        let (detail, report) = record_start(
+            &store,
+            &job,
+            &vm.name,
+            container.clone(),
+            || cancelled.set(true),
+            || panic!("review v2g: a refused start must not be acknowledged"),
+        )
         .unwrap_err();
         assert!(cancelled.get(), "the container was not cancelled");
         assert!(detail.contains("could not be recorded"), "{detail}");
@@ -8645,6 +9138,9 @@ mod tests {
         let arm = &arm[..arm.find("Ok(WorkerResponse::Stdout {").unwrap()];
         assert!(arm.contains("record_start("), "{arm}");
         assert!(arm.contains("break lost;"), "{arm}");
+        // The launch fence: the acknowledgement is record_start's (tested
+        // behaviourally above); the arm sends it nowhere else.
+        assert_eq!(arm.matches("WorkerRequest::StartedAck").count(), 1, "{arm}");
         assert!(!arm.contains('?'), "the arm must not return early: {arm}");
     }
 
@@ -8681,10 +9177,28 @@ mod tests {
             })
             .unwrap();
         store.reserve_worker(&job, &vm.name, &vm.name).unwrap();
-        record_start(&store, &job, &vm.name, container, || {
-            panic!("a recorded start must not cancel")
-        })
+        let acknowledged = std::cell::Cell::new(false);
+        record_start(
+            &store,
+            &job,
+            &vm.name,
+            container.clone(),
+            || panic!("a recorded start must not cancel"),
+            || {
+                // review v2g: acknowledged only once the store holds Running
+                // with the VM and container.
+                let receipt = store.job(&job).unwrap();
+                assert_eq!(receipt.state, marsh_daemon::JobState::Running);
+                assert_eq!(receipt.vm_id.as_deref(), Some(vm.name.as_str()));
+                assert_eq!(receipt.container_id.as_deref(), Some(container.as_str()));
+                acknowledged.set(true);
+            },
+        )
         .unwrap();
+        assert!(
+            acknowledged.get(),
+            "review v2g: a recorded start is acknowledged"
+        );
         assert_eq!(
             store.job(&job).unwrap().state,
             marsh_daemon::JobState::Running
@@ -9018,14 +9532,17 @@ mod tests {
                 .unwrap(),
             vec!["second".to_string()]
         );
-        assert_eq!(runner.runs.lock().unwrap().len(), 1);
+        // Neither Kit has a VM name in the ownership map: a reset looks the
+        // name up and never assigns one, so it has nothing to list or remove.
+        assert_eq!(runner.runs.lock().unwrap().len(), 0);
+        assert_eq!(backend.sbx.live_kit_entries(), Vec::new());
         assert_eq!(
             backend
                 .reset_workers(&LoadSelection::All, store.clone())
                 .unwrap(),
             vec!["first".to_string(), "second".to_string()]
         );
-        assert_eq!(runner.runs.lock().unwrap().len(), 3);
+        assert_eq!(runner.runs.lock().unwrap().len(), 0);
         let before = runner.runs.lock().unwrap().len();
         assert!(matches!(
             backend.reset_workers(&LoadSelection::Kits(vec!["unknown".into()]), store,),

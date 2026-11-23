@@ -232,8 +232,18 @@ fn reset_removes_only_the_exact_owned_kit_vm_and_releases_its_quarantine() {
     assert!(adapter.reset_kit_vm(&kit.spec).unwrap());
     assert_eq!(model.vm_names(), ["user-vm"]);
     assert_eq!(adapter.ownership.uuid(KIT), None);
-    // `marsh workers reset KIT` retires the quarantined VM; the Kit is usable.
-    assert!(adapter.ensure_kit_vm(&kit.spec).unwrap().cold_started);
+    // The retired name is never created under again (a VM landing under it
+    // would be nobody's) ...
+    assert!(matches!(
+        adapter.ensure_kit_vm(&kit.spec),
+        Err(SbxError::StaleVmName(name)) if name == KIT
+    ));
+    assert_eq!(model.count("create"), 1);
+    // ... `marsh workers reset KIT` retired the quarantined VM; the Kit is
+    // usable under the name the map gives it now.
+    let mut spec = kit.spec.clone();
+    spec.name = adapter.vm_name(VmPurpose::Kit, "kit-a").unwrap();
+    assert!(adapter.ensure_kit_vm(&spec).unwrap().cold_started);
 }
 
 #[test]
@@ -369,6 +379,8 @@ fn quarantine_stop_waits_for_an_inflight_retained_start() {
     launching.join().unwrap().unwrap();
     stop_receive.recv_timeout(WAIT_LIMIT).unwrap().unwrap();
     assert_eq!(model.written_worker_starts(KIT), ["attempt-start-fence"]);
+    // Round 6's launch fence: every Start asks for the acknowledgement.
+    assert_eq!(model.written_worker_starts_ask_ack(KIT), [true]);
     assert!(!model.vm(KIT).unwrap().running);
     assert!(matches!(
         adapter.ensure_kit_vm(&kit.spec),
@@ -914,6 +926,27 @@ fn a_kit_vm_is_sized_to_fit_one_job_when_the_job_limit_exceeds_stock_default() {
         model.calls_of("create")[0].value("--memory"),
         Some("24576m")
     );
+}
+
+#[test]
+fn published_kit_create_drain_failure_keeps_its_own_message_and_quarantines() {
+    let model = StockModel::new();
+    model.fault(verb("create"), Fault::OutputDrain { applied: false });
+    let adapter = model.adapter();
+    let kit = KitFixture::published(KIT);
+    let error = adapter.ensure_kit_vm(&kit.spec).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        matches!(error, SbxError::OutputDrain { .. })
+            && message.contains("stock SBX create kit VM: the command exited")
+            && message.contains("pulling image")
+            && !message.contains("timed out after"),
+        "{message}"
+    );
+    assert!(matches!(
+        adapter.ensure_kit_vm(&kit.spec),
+        Err(SbxError::QuarantinedVm(_))
+    ));
 }
 
 #[test]
@@ -1470,4 +1503,145 @@ fn closes_queued_for_a_stalled_worker_are_bounded() {
     }
     assert!(queued() <= 1024, "{} closes queued", queued());
     input.release();
+}
+
+/// `marsh stop --force` (`KitInstall.tla` `StopBegin`): a Kit VM create in
+/// flight is cancelled at once; it may still land, so its name is
+/// quarantined as may-still-land and its intent kept; no other create is
+/// submitted afterwards. Fails when creates are not run cancellable.
+#[test]
+fn a_forced_stop_cancels_the_kit_create_in_flight_and_submits_no_other() {
+    let model = StockModel::new();
+    model.hold_creates_until_cancelled();
+    let adapter = Arc::new(model.adapter());
+    let kit = KitFixture::published(KIT);
+    let (creating, spec) = (Arc::clone(&adapter), kit.spec.clone());
+    let create = std::thread::spawn(move || creating.ensure_kit_vm(&spec));
+    model.wait_for_held_create();
+    adapter.cancel_creates();
+    let error = create.join().unwrap().unwrap_err();
+    assert!(matches!(error, SbxError::Io(_)), "{error}");
+    let quarantine = adapter.quarantined_vms()[KIT].clone();
+    assert!(quarantine.create_pending, "{quarantine:?}");
+    assert!(adapter.is_live_vm_name(KIT));
+
+    let other = KitFixture::local("marsh-kit-other");
+    assert!(matches!(
+        adapter.ensure_kit_vm(&other.spec),
+        Err(SbxError::Stopping)
+    ));
+    assert_eq!(model.count("create"), 1);
+}
+
+/// Claude's round 2 (`KitInstall.tla` `TdCancelBg`): a plain stop or reset
+/// cancels the background pass's Kit VM create in flight, and no other
+/// create; the cancelled one may still land (its name quarantined as
+/// may-still-land). Fails when background creates run under the shared
+/// cancellation (the user's create is cancelled too) or under none.
+#[test]
+fn a_plain_stop_cancels_only_the_background_passs_create() {
+    let model = StockModel::new();
+    model.hold_creates_until_cancelled();
+    let adapter = Arc::new(model.adapter());
+    let background = KitFixture::published(KIT);
+    let (creating, spec) = (Arc::clone(&adapter), background.spec.clone());
+    let pass = std::thread::spawn(move || creating.in_background(|| creating.ensure_kit_vm(&spec)));
+    model.wait_for_held_create();
+    let user = KitFixture::local("marsh-kit-user");
+    let (creating, spec) = (Arc::clone(&adapter), user.spec.clone());
+    let install = std::thread::spawn(move || creating.ensure_kit_vm(&spec));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while model.count("create") < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the user's create never ran"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    adapter.cancel_background_creates();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !pass.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background create was not cancelled"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let error = pass.join().unwrap().unwrap_err();
+    assert!(matches!(error, SbxError::Io(_)), "{error}");
+    assert!(adapter.quarantined_vms()[KIT].create_pending);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !install.is_finished(),
+        "the user's create was cancelled too"
+    );
+
+    // A forced stop ends that one as well.
+    adapter.cancel_creates();
+    assert!(matches!(install.join().unwrap(), Err(SbxError::Io(_))));
+}
+
+/// Claude's round 3 (N1): `marsh stop --force` cancels the background pass's
+/// Kit VM create too, and a plain stop's resumption of background creates
+/// does not undo a forced stop that is under way. Fails when the forced stop
+/// leaves the background cancellation alone, or the resumption ignores it.
+#[test]
+fn a_forced_stop_cancels_the_background_create_too() {
+    let model = StockModel::new();
+    model.hold_creates_until_cancelled();
+    let adapter = Arc::new(model.adapter());
+    let kit = KitFixture::published(KIT);
+    let (creating, spec) = (Arc::clone(&adapter), kit.spec.clone());
+    let pass = std::thread::spawn(move || creating.in_background(|| creating.ensure_kit_vm(&spec)));
+    model.wait_for_held_create();
+    adapter.cancel_creates();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !pass.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the forced stop did not cancel the background create"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(pass.join().unwrap(), Err(SbxError::Io(_))));
+    adapter.resume_background_creates();
+    let other = KitFixture::published("marsh-kit-other");
+    let (creating, spec) = (Arc::clone(&adapter), other.spec.clone());
+    let refused =
+        std::thread::spawn(move || creating.in_background(|| creating.ensure_kit_vm(&spec)));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !refused.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a background create was submitted during a forced stop"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(refused.join().unwrap(), Err(SbxError::Stopping)));
+}
+
+/// A local Kit's create runs on a thread of its own: in the background pass
+/// it still runs under the background cancellation, so a plain stop cancels
+/// it. Fails when that thread loses the pass's mark.
+#[test]
+fn a_plain_stop_cancels_a_background_local_kit_create() {
+    let model = StockModel::new();
+    model.hold_creates_until_cancelled();
+    let adapter = Arc::new(model.adapter());
+    let kit = KitFixture::local("marsh-kit-local");
+    let (creating, spec) = (Arc::clone(&adapter), kit.spec.clone());
+    let pass = std::thread::spawn(move || creating.in_background(|| creating.ensure_kit_vm(&spec)));
+    model.wait_for_held_create();
+    adapter.cancel_background_creates();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !pass.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            // Let the stuck create go before failing.
+            adapter.cancel_creates();
+            panic!("the background local Kit create was not cancelled");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(pass.join().unwrap().is_err());
 }

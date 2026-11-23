@@ -14,6 +14,11 @@
 CloudOwnership.cfg 6900
 CloudOwnership_concurrent_pass.cfg 5300000
 Grants.cfg 9300
+KitInstall.cfg 580000
+KitInstall_lockOnly_pass.cfg 580000
+KitInstall_restart_pass.cfg 710000
+KitInstall_revalidateOnly_pass.cfg 360000
+KitInstall_wide_pass.cfg 4300000
 KitSwitch.cfg 10000
 Ownership.cfg 51
 Pins.cfg 560
@@ -41,3 +46,10 @@ Workspace_depth3_pass.cfg 110000000
 Workspace_lanes_pass.cfg 82000
 Workspace_live_pass.cfg 200000
 Workspace_restart_pass.cfg 10000
+KitInstall_eph_pass.cfg 410000
+KitInstall_bg_pass.cfg 170000
+KitInstall_run_pass.cfg 190000
+KitInstall_lost_pass.cfg 65000
+KitInstall_runsw_pass.cfg 1200000
+KitInstall_lostsw_pass.cfg 950000
+KitInstall_assignVolatileOnly_pass.cfg 80000

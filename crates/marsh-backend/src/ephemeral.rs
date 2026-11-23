@@ -2,6 +2,43 @@
 //! private-slot token/ledger, not this in-memory cleanup map.
 use super::*;
 
+/// The ownership key of a session's ephemeral Kit VM.
+fn ephemeral_ownership_key(identity: &str, session: &str) -> String {
+    format!("{identity}:ephemeral:{session}")
+}
+
+/// Every lock of `locks`, in order, polling each until `deadline`; refused
+/// (an ephemeral Kit preparation has not drained) when one stays held.
+fn lock_all_before(
+    locks: &[Arc<Mutex<()>>],
+    deadline: Instant,
+) -> Result<Vec<std::sync::MutexGuard<'_, ()>>, DaemonError> {
+    let mut guards = Vec::new();
+    for lock in locks {
+        loop {
+            match lock.try_lock() {
+                Ok(guard) => {
+                    guards.push(guard);
+                    break;
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    guards.push(error.into_inner());
+                    break;
+                }
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => {
+                    return Err(DaemonError::ShellCleanupUncertain(
+                        "ephemeral Kit preparation has not drained; private slot retained".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(guards)
+}
+
 impl StockDaemonBackend {
     pub(super) fn kit_spec_for_session(
         &self,
@@ -27,11 +64,7 @@ impl StockDaemonBackend {
             .sbx
             .vm_name(
                 VmPurpose::Kit,
-                &format!(
-                    "{}:ephemeral:{}",
-                    spec.workload_kit.identity(),
-                    session.session_id
-                ),
+                &ephemeral_ownership_key(spec.workload_kit.identity(), &session.session_id),
             )
             .map_err(backend_error)?;
         // Reusing the private leaf also for the implicit Kit Create workspace
@@ -61,47 +94,34 @@ impl StockDaemonBackend {
             .get(session)
             .cloned()
             .unwrap_or_default();
-        let scope = selected_home_identity(&self.config.daemon_home).map_err(backend_error)?;
-        let keys = specs
+        // One Kit lock per ownership key of the session (as its preparations
+        // take them: `kit_lock_key`), in key order.
+        let owners = specs
             .values()
-            .map(|spec| format!("{scope}:{}:{}", spec.workload_kit.identity(), spec.name))
-            .collect::<Vec<_>>();
-        let locks = {
-            let mut all = self
-                .kit_locks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            keys.iter()
-                .map(|key| {
-                    all.entry(key.clone())
-                        .or_insert_with(|| Arc::new(Mutex::new(())))
-                        .clone()
-                })
-                .collect::<Vec<_>>()
-        };
+            .map(|spec| ephemeral_ownership_key(spec.workload_kit.identity(), session))
+            .collect::<BTreeSet<_>>();
+        let keys = owners
+            .iter()
+            .map(|owner| self.kit_lock_key(owner))
+            .collect::<Result<Vec<_>, DaemonError>>()?;
+        let locks = self.kit_locks_in_order(&owners)?;
         let deadline = Instant::now() + Duration::from_secs(90);
-        let mut guards = Vec::new();
-        for lock in &locks {
-            loop {
-                match lock.try_lock() {
-                    Ok(guard) => {
-                        guards.push(guard);
-                        break;
-                    }
-                    Err(std::sync::TryLockError::Poisoned(error)) => {
-                        guards.push(error.into_inner());
-                        break;
-                    }
-                    Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => {
-                        return Err(DaemonError::ShellCleanupUncertain(
-                            "ephemeral Kit preparation has not drained; private slot retained"
-                                .into(),
-                        ));
-                    }
-                }
+        let _guards = lock_all_before(&locks, deadline)?;
+        // Under those locks: every VM the session's keys own, not only the
+        // names noted before a preparation chose (`KitInstall.tla`
+        // `ephStaleName`): a preparation may recover the noted VM and create
+        // under a new name.
+        let mut specs = specs;
+        for (name, owner) in self.sbx.live_kit_entries() {
+            if !owners.contains(&owner) || specs.contains_key(&name) {
+                continue;
+            }
+            if let Some(template) = specs.values().find(|spec| {
+                ephemeral_ownership_key(spec.workload_kit.identity(), session) == owner
+            }) {
+                let mut spec = template.clone();
+                spec.name.clone_from(&name);
+                specs.insert(name, spec);
             }
         }
         let names = specs.keys().cloned().collect::<Vec<_>>();
@@ -150,6 +170,20 @@ impl StockDaemonBackend {
         }
         store.finish_ephemeral_session(session);
         Ok(())
+    }
+
+    /// The ownership keys of the live ephemeral-home sessions' Kit VMs.
+    pub(super) fn live_ephemeral_keys(&self) -> BTreeSet<String> {
+        self.ephemeral_kits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .flat_map(|(session, specs)| {
+                specs
+                    .values()
+                    .map(|spec| ephemeral_ownership_key(spec.workload_kit.identity(), session))
+            })
+            .collect()
     }
 
     pub(super) fn remembered_ephemeral_kits(&self) -> Vec<KitVmSpec> {

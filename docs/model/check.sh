@@ -14,7 +14,8 @@
 #
 #   check.sh [--quick | --huge | --no-huge] [--list] [--cores N] [--workers N] [CONFIG...]
 #
-# CONFIG is a config name, glob, or a quoted list of them (default: every config).
+# CONFIG is a config name, glob, or a quoted list of them (default: every config); a
+# glob's .tla matches (`'KitSwitch*'`) are skipped.
 # Configs run concurrently inside a core budget; every config is a separate TLC
 # process (a separate container under Docker) with its own log, and the verdict
 # of each is independent of scheduling. A comment line in a config
@@ -159,6 +160,7 @@ by_hint() { # longest hinted config first
 set -- ${args:-*.cfg}
 huge=(); slow=(); mid=(); rest=()
 for cfg in "$@"; do
+  case "$cfg" in *.cfg) ;; *.tla) continue ;; esac # a glob such as 'KitSwitch*' also matches the module
   [ -f "$cfg" ] || { echo "check.sh: no such config $cfg" >&2; exit 2; }
   if marker "$cfg" huge; then
     [ $mode = quick ] || [ $mode = nohuge ] || huge[${#huge[@]}]=$cfg

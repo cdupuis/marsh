@@ -253,6 +253,19 @@ pub trait CommandRunner: Send + Sync {
     /// retains polling ownership and reports uncertainty.
     /// Long-lived attached jobs use [`Self::spawn_attached`] instead.
     fn run_bounded(&self, invocation: &Invocation, timeout: Duration) -> io::Result<CommandOutput>;
+    /// [`Self::run_bounded`] that also ends when `cancel` is cancelled: its
+    /// process group is signalled and the call fails with
+    /// `ConnectionAborted`. What the command started may still finish (a
+    /// stock create can land). Runners that cannot cancel run it bounded.
+    fn run_bounded_cancellable(
+        &self,
+        invocation: &Invocation,
+        timeout: Duration,
+        cancel: &Cancellation,
+    ) -> io::Result<CommandOutput> {
+        let _ = cancel;
+        self.run_bounded(invocation, timeout)
+    }
     fn spawn_attached(&self, invocation: &Invocation) -> io::Result<Attachment>;
     fn spawn_pty(&self, invocation: &Invocation) -> io::Result<Attachment> {
         self.spawn_attached(invocation)
@@ -589,21 +602,108 @@ fn run_attachment_bounded(attachment: Attachment, timeout: Duration) -> io::Resu
     run_attachment_interruptible(attachment, Some(timeout), &Cancellation::default(), false)
 }
 
-fn spawn_bounded_capture(
-    stream: Box<dyn Read + Send>,
-    label: &'static str,
-) -> thread::JoinHandle<io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        stream.take(8 * 1024 * 1024 + 1).read_to_end(&mut output)?;
-        if output.len() > 8 * 1024 * 1024 {
-            Err(io::Error::other(format!(
-                "control {label} exceeded capture bound"
-            )))
-        } else {
-            Ok(output)
+/// How long a bounded command's output pipes may stay open after its leader
+/// has exited. A descendant that outlives the leader and keeps a pipe open
+/// (an orphaned helper of a killed `sbx create`) must not hold the call until
+/// its deadline; the group is signaled and the call reports it.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// The error (kind `TimedOut`) of a bounded command whose leader exited but
+/// whose output pipes a descendant kept open for [`OUTPUT_DRAIN_GRACE`]. The
+/// leader's status is known, but its output may be incomplete, so the call
+/// is never reported as a success.
+#[derive(Debug)]
+pub struct OutputDrainTimeout {
+    pub status: Option<i32>,
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+    pub stderr_tail: String,
+}
+
+impl OutputDrainTimeout {
+    /// The grace the output pipes were given after the command exited.
+    pub const GRACE: Duration = OUTPUT_DRAIN_GRACE;
+
+    /// The drain failure inside `error`, if that is what it is.
+    #[must_use]
+    pub fn of(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref::<Self>()
+    }
+}
+
+impl std::fmt::Display for OutputDrainTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the command exited (status {:?}) but its output pipes stayed open for {:?} (a helper process holds them); captured {} bytes of stdout and {} of stderr, stderr tail: {:?}",
+            self.status,
+            Self::GRACE,
+            self.stdout_bytes,
+            self.stderr_bytes,
+            self.stderr_tail
+        )
+    }
+}
+
+impl std::error::Error for OutputDrainTimeout {}
+
+struct BoundedCapture {
+    thread: thread::JoinHandle<io::Result<()>>,
+    captured: Arc<Mutex<Vec<u8>>>,
+}
+
+impl BoundedCapture {
+    fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
+    fn captured(&self) -> Vec<u8> {
+        self.captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The bytes read so far, once the reader has stopped.
+    fn join(self) -> io::Result<Vec<u8>> {
+        self.thread
+            .join()
+            .map_err(|_| io::Error::other("output reader panicked"))??;
+        Ok(std::mem::take(
+            &mut *self
+                .captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ))
+    }
+}
+
+fn spawn_bounded_capture(mut stream: Box<dyn Read + Send>, label: &'static str) -> BoundedCapture {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+    let thread = thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let count = match stream.read(&mut buffer) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if count == 0 {
+                return Ok(());
+            }
+            let mut output = sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if output.len() + count > LIMIT {
+                return Err(io::Error::other(format!(
+                    "control {label} exceeded capture bound"
+                )));
+            }
+            output.extend_from_slice(&buffer[..count]);
         }
-    })
+    });
+    BoundedCapture { thread, captured }
 }
 
 fn run_attachment_interruptible(
@@ -633,11 +733,17 @@ fn run_attachment_interruptible(
     let stdout = spawn_bounded_capture(attachment.stdout, "stdout");
     let stderr = spawn_bounded_capture(attachment.stderr, "stderr");
     let mut exit_code = None;
+    let mut exited_at = None;
     let mut identity_uncertain = false;
     let outcome = loop {
         if exit_code.is_none() {
             match attachment.process.try_wait_unreaped() {
-                Ok(code) => exit_code = code,
+                Ok(code) => {
+                    exit_code = code;
+                    if code.is_some() {
+                        exited_at = Some(std::time::Instant::now());
+                    }
+                }
                 Err(error) => {
                     identity_uncertain = true;
                     break Err(error);
@@ -646,6 +752,18 @@ fn run_attachment_interruptible(
         }
         if exit_code.is_some() && stdout.is_finished() && stderr.is_finished() {
             break Ok(());
+        }
+        if exited_at.is_some_and(|at| at.elapsed() >= OUTPUT_DRAIN_GRACE) {
+            let (stdout_bytes, stderr) = (stdout.captured().len(), stderr.captured());
+            break Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                OutputDrainTimeout {
+                    status: exit_code,
+                    stdout_bytes,
+                    stderr_bytes: stderr.len(),
+                    stderr_tail: String::from_utf8_lossy(&tail(&stderr, 512)).into_owned(),
+                },
+            ));
         }
         if let Err(error) = cancel.check() {
             break Err(error);
@@ -682,12 +800,8 @@ fn run_attachment_interruptible(
     };
     // Only admitted cancellable implementations reach these joins; every I/O
     // operation is nonblocking and observes cancel within one 20 ms poll.
-    let stdout = stdout
-        .join()
-        .map_err(|_| io::Error::other("stdout reader panicked"))?;
-    let stderr = stderr
-        .join()
-        .map_err(|_| io::Error::other("stderr reader panicked"))?;
+    let stdout = stdout.join();
+    let stderr = stderr.join();
     if cancellation.is_err() || termination.is_err() || !reaped {
         return Err(process_owner::uncertainty(retained));
     }
@@ -697,6 +811,10 @@ fn run_attachment_interruptible(
         stdout: stdout?,
         stderr: stderr?,
     })
+}
+
+fn tail(bytes: &[u8], limit: usize) -> Vec<u8> {
+    bytes[bytes.len().saturating_sub(limit)..].to_vec()
 }
 
 fn signal_child(pid: u32, signal: JobSignal) -> io::Result<()> {
@@ -879,6 +997,21 @@ impl CommandRunner for SystemCommandRunner {
 
     fn run_bounded(&self, invocation: &Invocation, timeout: Duration) -> io::Result<CommandOutput> {
         run_attachment_bounded(self.spawn_attached(invocation)?, timeout)
+    }
+
+    fn run_bounded_cancellable(
+        &self,
+        invocation: &Invocation,
+        timeout: Duration,
+        cancel: &Cancellation,
+    ) -> io::Result<CommandOutput> {
+        cancel.check()?;
+        run_attachment_interruptible(
+            self.spawn_attached(invocation)?,
+            Some(timeout),
+            cancel,
+            false,
+        )
     }
 
     fn spawn_attached(&self, invocation: &Invocation) -> io::Result<Attachment> {
